@@ -125,20 +125,18 @@ static int run_shape(bench_state_t *bs, uint32_t N, uint32_t M, int verify,
     /* Fill activation udmabuf. AXI DMA at 32 bits beat width, so each beat
      * is 4 bytes carrying one batchSize*aWidth = 1-byte activation in the low
      * byte, padding ignored. */
-    uint8_t *act_dma = (uint8_t *)bs->act_buf.vaddr;
-    memset(act_dma, 0, N * BENCH_S_AXIS_BYTES);
+    volatile uint32_t *act_dma32 = (volatile uint32_t *)bs->act_buf.vaddr;
     for (uint32_t i = 0; i < N; i++) {
         uint8_t v = (uint8_t)(next_rand(&rng) & 0xF);
         act_int[i] = (int8_t)v;
-        act_dma[i * BENCH_S_AXIS_BYTES] = v;
+        act_dma32[i] = (uint32_t)v;   /* low byte = activation, upper 3 bytes = 0 */
     }
 
     /* Fill weight udmabuf. Layout: for each row n in 0..N-1, for each col tile
      * t in 0..numColTiles-1, one 32-bit beat packing 16 weights (one per col
      * lane in this tile). Total beats = N * numColTiles. */
     uint32_t num_col_tiles = (M + BENCH_OUT_LANES_PER_TILE - 1) / BENCH_OUT_LANES_PER_TILE;
-    uint32_t *wt_dma = (uint32_t *)bs->wt_buf.vaddr;
-    memset(wt_dma, 0, (size_t)N * num_col_tiles * BENCH_S_AXIS_BYTES);
+    volatile uint32_t *wt_dma = (volatile uint32_t *)bs->wt_buf.vaddr;
 
     uint8_t lanes[BENCH_OUT_LANES_PER_TILE];
     for (uint32_t n = 0; n < N; n++) {
