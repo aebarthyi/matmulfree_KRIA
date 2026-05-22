@@ -19,6 +19,7 @@ class PEOutputBundle(val aWidth: Int, val maxAcc: Int) extends Bundle {
   * PE accumulates activations based on ternary weights
 */
 class PE(val aWidth: Int, val maxAcc: Int) extends Module {
+  require(maxAcc >= 2, "PE requires maxAcc >= 2 (hardware counter limitation)")
   val input = IO(Flipped(Decoupled(new PEInputBundle(aWidth, maxAcc))))
   val output = IO(Decoupled(new PEOutputBundle(aWidth, maxAcc)))
   val accumReg = RegInit(VecInit(Seq.fill(aWidth/2)(0.U((log2Ceil(maxAcc) + aWidth).W))))
@@ -69,6 +70,10 @@ class PE(val aWidth: Int, val maxAcc: Int) extends Module {
         output.bits.accum := accumReg
         when(output.ready){
             stateReg := idle_state
+            // Reset counter + lane accumulators so the next op starts clean
+            // without requiring an external reset between ops.
+            accumCounter.reset()
+            accumReg.foreach(_ := 0.U)
         }
     }
   }
