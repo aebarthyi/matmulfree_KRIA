@@ -426,7 +426,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>0fe5eb43</spirit:value>
+            <spirit:value>c1785243</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -442,7 +442,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>0fe5eb43</spirit:value>
+            <spirit:value>c1785243</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -986,7 +986,7 @@
         <spirit:wire>
           <spirit:direction>in</spirit:direction>
           <spirit:vector>
-            <spirit:left spirit:format="long">31</spirit:left>
+            <spirit:left spirit:format="long">63</spirit:left>
             <spirit:right spirit:format="long">0</spirit:right>
           </spirit:vector>
           <spirit:wireTypeDefs>
@@ -1151,15 +1151,19 @@
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>actBram_0_1024x8.sv</spirit:name>
+        <spirit:name>actBram_0_1024x16.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>outBram_64x320.sv</spirit:name>
+        <spirit:name>outBram_32x896.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
         <spirit:name>CoreTop.sv</spirit:name>
+        <spirit:fileType>systemVerilogSource</spirit:fileType>
+      </spirit:file>
+      <spirit:file>
+        <spirit:name>actBram_0_1024x8.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
@@ -1178,7 +1182,11 @@
       <spirit:file>
         <spirit:name>verification/assume/layers-CoreTop-Verification-Assume.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
-        <spirit:userFileType>CHECKSUM_b4737426</spirit:userFileType>
+      </spirit:file>
+      <spirit:file>
+        <spirit:name>outBram_64x320.sv</spirit:name>
+        <spirit:fileType>systemVerilogSource</spirit:fileType>
+        <spirit:userFileType>CHECKSUM_6bd6c573</spirit:userFileType>
       </spirit:file>
     </spirit:fileSet>
     <spirit:fileSet>
@@ -1200,15 +1208,19 @@
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>actBram_0_1024x8.sv</spirit:name>
+        <spirit:name>actBram_0_1024x16.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
-        <spirit:name>outBram_64x320.sv</spirit:name>
+        <spirit:name>outBram_32x896.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
         <spirit:name>CoreTop.sv</spirit:name>
+        <spirit:fileType>systemVerilogSource</spirit:fileType>
+      </spirit:file>
+      <spirit:file>
+        <spirit:name>actBram_0_1024x8.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
       <spirit:file>
@@ -1228,6 +1240,10 @@
         <spirit:name>verification/assume/layers-CoreTop-Verification-Assume.sv</spirit:name>
         <spirit:fileType>systemVerilogSource</spirit:fileType>
       </spirit:file>
+      <spirit:file>
+        <spirit:name>outBram_64x320.sv</spirit:name>
+        <spirit:fileType>systemVerilogSource</spirit:fileType>
+      </spirit:file>
     </spirit:fileSet>
     <spirit:fileSet>
       <spirit:name>xilinx_xpgui_view_fileset</spirit:name>
@@ -1239,7 +1255,7 @@
       </spirit:file>
     </spirit:fileSet>
   </spirit:fileSets>
-  <spirit:description>CoreTop_Bench</spirit:description>
+  <spirit:description>CoreTop_v1_0</spirit:description>
   <spirit:parameters>
     <spirit:parameter>
       <spirit:name>Component_Name</spirit:name>
@@ -1257,7 +1273,7 @@
       <xilinx:taxonomies>
         <xilinx:taxonomy>/UserIP</xilinx:taxonomy>
       </xilinx:taxonomies>
-      <xilinx:displayName>CoreTop_Bench</xilinx:displayName>
+      <xilinx:displayName>CoreTop_v1_0</xilinx:displayName>
       <xilinx:definitionSource>package_project</xilinx:definitionSource>
       <xilinx:xpmLibraries>
         <xilinx:xpmLibrary>XPM_CDC</xilinx:xpmLibrary>
@@ -1265,7 +1281,7 @@
         <xilinx:xpmLibrary>XPM_MEMORY</xilinx:xpmLibrary>
       </xilinx:xpmLibraries>
       <xilinx:coreRevision>2</xilinx:coreRevision>
-      <xilinx:coreCreationDateTime>2026-05-22T02:53:06Z</xilinx:coreCreationDateTime>
+      <xilinx:coreCreationDateTime>2026-05-23T19:31:13Z</xilinx:coreCreationDateTime>
       <xilinx:tags>
         <xilinx:tag xilinx:name="nopcore"/>
       </xilinx:tags>
@@ -1274,8 +1290,8 @@
       <xilinx:xilinxVersion>2024.1</xilinx:xilinxVersion>
       <xilinx:checksum xilinx:scope="busInterfaces" xilinx:value="aec11de8"/>
       <xilinx:checksum xilinx:scope="memoryMaps" xilinx:value="de6ac3d6"/>
-      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="686a1acf"/>
-      <xilinx:checksum xilinx:scope="ports" xilinx:value="66627d77"/>
+      <xilinx:checksum xilinx:scope="fileGroups" xilinx:value="941e9988"/>
+      <xilinx:checksum xilinx:scope="ports" xilinx:value="99762192"/>
       <xilinx:checksum xilinx:scope="parameters" xilinx:value="5b81db9c"/>
     </xilinx:packagingInfo>
   </spirit:vendorExtensions>

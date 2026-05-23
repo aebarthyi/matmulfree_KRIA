@@ -107,15 +107,17 @@ uint32_t mmfree_wait_done(mmfree_ctx_t *ctx);
 
 /* LOAD activations from `buf` (paddr already populated) into Core's BRAM.
  * `n_activations` is the inner-dim length N. Bytes pushed = n_activations *
- * batchSize * (aWidth/8). For K26_Bench (batchSize=1, aWidth=8): bytes = N.
+ * s_axis_bytes (= xDim*aWidth/8 per beat). For K26_Bench (xDim=4, aWidth=16):
+ * 8 bytes/beat → bytes = 8 * N.
  *
  * Issues an AXI DMA MM2S kick first, then the LOAD_ACT instruction, then
  * waits for Core IRQ + DMA idle. */
 int mmfree_load(mmfree_ctx_t *ctx, const mmfree_buf_t *buf, uint32_t n_activations);
 
 /* COMPUTE rows x cols matmul. Weights buffer holds rows * cols * 2 bits, packed
- * as (xDim * nLanes * 2)-bit beats = 32-bit beats for K26_Bench. Total beats =
- * (rows * cols) / outLanesPerTile. */
+ * as (xDim * nLanes * 2)-bit beats = 64-bit beats for K26_Bench (aWidth=16).
+ * Total beats = (rows * cols) / outLanesPerTile, laid out col-tile-major
+ * (see bench.c — Core consumes [t=0,n=0..N-1], [t=1,n=0..N-1], ...). */
 int mmfree_compute(mmfree_ctx_t *ctx, const mmfree_buf_t *buf,
                    uint32_t rows, uint32_t cols);
 

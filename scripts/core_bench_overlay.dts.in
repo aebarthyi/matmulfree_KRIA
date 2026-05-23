@@ -1,0 +1,54 @@
+/*
+ * K26_Bench device-tree overlay template.
+ *
+ * Consumed by scripts/gen_overlay.tcl — placeholders are substituted with
+ * values extracted from the .xsa:
+ *
+ *   @CORE_ADDR@      e.g. 0xa0010000  (CoreTop AXI4 base address)
+ *   @CORE_ADDR_HEX@  e.g.   a0010000  (same, no '0x' — for the node name)
+ *   @CORE_IRQ@       e.g.         89  (GIC SPI number, level-high)
+ *
+ * What this overlay does:
+ *   1. Binds CoreTop's AXI4 register window to the generic-uio driver so
+ *      userspace mmap + IRQ wait works without a custom kernel module.
+ *   2. Declares three u-dma-buf nodes for activations / weights / outputs,
+ *      sized to K26_Bench worst-case at aWidth=16 (see BOARD_BRINGUP.md §3).
+ *
+ * udmabuf sizes:
+ *   - act : maxN * S_AXIS_BYTES = 1024 * 8  = 8 KiB
+ *   - wt  : maxN * numColTiles * S_AXIS_BYTES = 1024 * 32 * 8 = 256 KiB
+ *   - out : maxM * OUT_LANE_BYTES = 1024 * 4 = 4 KiB
+ *
+ * Sync-mode is left at the default (Device memory, non-cacheable). Do NOT
+ * call glibc memset on these regions — see memory note udmabuf_memset_gotcha.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&{/} {
+    #address-cells = <2>;
+    #size-cells    = <2>;
+
+    mmfree_core: mmfree_core@@CORE_ADDR_HEX@ {
+        compatible       = "generic-uio";
+        reg              = <0x0 @CORE_ADDR@ 0x0 0x1000>;
+        interrupts       = <0 @CORE_IRQ@ 4>;       /* SPI, num, level-high */
+        interrupt-parent = <&gic>;
+    };
+
+    udmabuf_act: udmabuf-act {
+        compatible = "ikwzm,u-dma-buf";
+        size       = <0x00002000>;   /*   8 KiB */
+    };
+
+    udmabuf_wt: udmabuf-wt {
+        compatible = "ikwzm,u-dma-buf";
+        size       = <0x00040000>;   /* 256 KiB */
+    };
+
+    udmabuf_out: udmabuf-out {
+        compatible = "ikwzm,u-dma-buf";
+        size       = <0x00001000>;   /*   4 KiB */
+    };
+};

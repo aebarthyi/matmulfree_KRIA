@@ -189,19 +189,19 @@ uint32_t mmfree_wait_done(mmfree_ctx_t *ctx) {
 
 /* K26_Bench-specific widths. For other configs these need to be passed in or
  * derived from a CoreConfig descriptor. */
-#define MMFREE_AWIDTH       8
+#define MMFREE_AWIDTH       16
 #define MMFREE_BATCH        1
 #define MMFREE_XDIM         4
-#define MMFREE_NLANES       (MMFREE_AWIDTH / 2)
-#define MMFREE_OUT_LANES_PER_TILE  (MMFREE_XDIM * MMFREE_NLANES)
-#define MMFREE_OUT_LANE_BYTES      4  /* outBeatLanes=1, padded to 32 bits */
-#define MMFREE_S_AXIS_BYTES        ((MMFREE_XDIM * MMFREE_AWIDTH) / 8)  /* 4 */
+#define MMFREE_NLANES       (MMFREE_AWIDTH / 2)                            /* 8 */
+#define MMFREE_OUT_LANES_PER_TILE  (MMFREE_XDIM * MMFREE_NLANES)            /* 32 */
+#define MMFREE_OUT_LANE_BYTES      4   /* outBeatLanes=1, outAccWidth=28 padded to 32 */
+#define MMFREE_S_AXIS_BYTES        ((MMFREE_XDIM * MMFREE_AWIDTH) / 8)      /* 8  → 64-bit MM2S */
 
 int mmfree_load(mmfree_ctx_t *ctx, const mmfree_buf_t *buf, uint32_t n_activations) {
-    /* Activation beat = batchSize * aWidth bits = 1 byte for K26_Bench.
-     * AXI DMA at 32-bit width transfers 4-byte beats — caller MUST have packed
-     * activations into the buffer as 4-byte (one per beat) entries even though
-     * only the low byte is meaningful. The bench harness does this packing. */
+    /* AXI DMA at MMFREE_S_AXIS_BYTES (= 8 bytes for K26_Bench at aWidth=16)
+     * transfers one beat per activation; only the low batchSize*aWidth bits
+     * (= 16 bits) are meaningful. Caller MUST pack activations as one
+     * beat-sized entry each (the bench harness does this packing). */
     uint32_t bytes = n_activations * MMFREE_S_AXIS_BYTES;
 
     if (mmfree_dma_mm2s_start(ctx->dma_regs, buf->paddr, bytes) < 0) return -1;
@@ -223,8 +223,9 @@ int mmfree_load(mmfree_ctx_t *ctx, const mmfree_buf_t *buf, uint32_t n_activatio
 int mmfree_compute(mmfree_ctx_t *ctx, const mmfree_buf_t *buf,
                    uint32_t rows, uint32_t cols)
 {
-    /* One beat per col-tile-cycle: each beat carries xDim*nLanes = 16 ternary weights
-     * (32 bits). Total beats = rows * (cols / outLanesPerTile). */
+    /* One beat per col-tile-cycle: each beat carries xDim*nLanes = 32 ternary
+     * weights (64 bits at aWidth=16). Total beats = rows * (cols / outLanesPerTile).
+     * Caller is responsible for col-tile-major layout (see bench.c). */
     uint32_t col_tiles = (cols + MMFREE_OUT_LANES_PER_TILE - 1) / MMFREE_OUT_LANES_PER_TILE;
     uint32_t total_beats = rows * col_tiles;
     uint32_t bytes = total_beats * MMFREE_S_AXIS_BYTES;

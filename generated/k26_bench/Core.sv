@@ -25,7 +25,7 @@ module Core(
   output         s_axi_rlast,
                  s_axi_rvalid,
   input          s_axi_rready,
-  input  [31:0]  s_axis_tdata,
+  input  [63:0]  s_axis_tdata,
   input          s_axis_tvalid,
   output         s_axis_tready,
   output [31:0]  m_axis_tdata,
@@ -36,42 +36,74 @@ module Core(
 );
 
   wire         arrLocalReset;
-  reg  [19:0]  tileAccums_0_15;
-  reg  [19:0]  tileAccums_0_14;
-  reg  [19:0]  tileAccums_0_13;
-  reg  [19:0]  tileAccums_0_12;
-  reg  [19:0]  tileAccums_0_11;
-  reg  [19:0]  tileAccums_0_10;
-  reg  [19:0]  tileAccums_0_9;
-  reg  [19:0]  tileAccums_0_8;
-  reg  [19:0]  tileAccums_0_7;
-  reg  [19:0]  tileAccums_0_6;
-  reg  [19:0]  tileAccums_0_5;
-  reg  [19:0]  tileAccums_0_4;
-  reg  [19:0]  tileAccums_0_3;
-  reg  [19:0]  tileAccums_0_2;
-  reg  [19:0]  tileAccums_0_1;
-  reg  [19:0]  tileAccums_0_0;
-  wire [319:0] _outBram_ext_R0_data;
-  wire [7:0]   _actBram_0_ext_R0_data;
+  reg  [27:0]  tileAccums_0_31;
+  reg  [27:0]  tileAccums_0_30;
+  reg  [27:0]  tileAccums_0_29;
+  reg  [27:0]  tileAccums_0_28;
+  reg  [27:0]  tileAccums_0_27;
+  reg  [27:0]  tileAccums_0_26;
+  reg  [27:0]  tileAccums_0_25;
+  reg  [27:0]  tileAccums_0_24;
+  reg  [27:0]  tileAccums_0_23;
+  reg  [27:0]  tileAccums_0_22;
+  reg  [27:0]  tileAccums_0_21;
+  reg  [27:0]  tileAccums_0_20;
+  reg  [27:0]  tileAccums_0_19;
+  reg  [27:0]  tileAccums_0_18;
+  reg  [27:0]  tileAccums_0_17;
+  reg  [27:0]  tileAccums_0_16;
+  reg  [27:0]  tileAccums_0_15;
+  reg  [27:0]  tileAccums_0_14;
+  reg  [27:0]  tileAccums_0_13;
+  reg  [27:0]  tileAccums_0_12;
+  reg  [27:0]  tileAccums_0_11;
+  reg  [27:0]  tileAccums_0_10;
+  reg  [27:0]  tileAccums_0_9;
+  reg  [27:0]  tileAccums_0_8;
+  reg  [27:0]  tileAccums_0_7;
+  reg  [27:0]  tileAccums_0_6;
+  reg  [27:0]  tileAccums_0_5;
+  reg  [27:0]  tileAccums_0_4;
+  reg  [27:0]  tileAccums_0_3;
+  reg  [27:0]  tileAccums_0_2;
+  reg  [27:0]  tileAccums_0_1;
+  reg  [27:0]  tileAccums_0_0;
+  wire [895:0] _outBram_ext_R0_data;
+  wire [15:0]  _actBram_0_ext_R0_data;
   wire         _arr_input_weights_i_ready;
   wire         _arr_output_valid;
-  wire [19:0]  _arr_output_bits_accum_0_0;
-  wire [19:0]  _arr_output_bits_accum_0_1;
-  wire [19:0]  _arr_output_bits_accum_0_2;
-  wire [19:0]  _arr_output_bits_accum_0_3;
-  wire [19:0]  _arr_output_bits_accum_0_4;
-  wire [19:0]  _arr_output_bits_accum_0_5;
-  wire [19:0]  _arr_output_bits_accum_0_6;
-  wire [19:0]  _arr_output_bits_accum_0_7;
-  wire [19:0]  _arr_output_bits_accum_0_8;
-  wire [19:0]  _arr_output_bits_accum_0_9;
-  wire [19:0]  _arr_output_bits_accum_0_10;
-  wire [19:0]  _arr_output_bits_accum_0_11;
-  wire [19:0]  _arr_output_bits_accum_0_12;
-  wire [19:0]  _arr_output_bits_accum_0_13;
-  wire [19:0]  _arr_output_bits_accum_0_14;
-  wire [19:0]  _arr_output_bits_accum_0_15;
+  wire [27:0]  _arr_output_bits_accum_0_0;
+  wire [27:0]  _arr_output_bits_accum_0_1;
+  wire [27:0]  _arr_output_bits_accum_0_2;
+  wire [27:0]  _arr_output_bits_accum_0_3;
+  wire [27:0]  _arr_output_bits_accum_0_4;
+  wire [27:0]  _arr_output_bits_accum_0_5;
+  wire [27:0]  _arr_output_bits_accum_0_6;
+  wire [27:0]  _arr_output_bits_accum_0_7;
+  wire [27:0]  _arr_output_bits_accum_0_8;
+  wire [27:0]  _arr_output_bits_accum_0_9;
+  wire [27:0]  _arr_output_bits_accum_0_10;
+  wire [27:0]  _arr_output_bits_accum_0_11;
+  wire [27:0]  _arr_output_bits_accum_0_12;
+  wire [27:0]  _arr_output_bits_accum_0_13;
+  wire [27:0]  _arr_output_bits_accum_0_14;
+  wire [27:0]  _arr_output_bits_accum_0_15;
+  wire [27:0]  _arr_output_bits_accum_0_16;
+  wire [27:0]  _arr_output_bits_accum_0_17;
+  wire [27:0]  _arr_output_bits_accum_0_18;
+  wire [27:0]  _arr_output_bits_accum_0_19;
+  wire [27:0]  _arr_output_bits_accum_0_20;
+  wire [27:0]  _arr_output_bits_accum_0_21;
+  wire [27:0]  _arr_output_bits_accum_0_22;
+  wire [27:0]  _arr_output_bits_accum_0_23;
+  wire [27:0]  _arr_output_bits_accum_0_24;
+  wire [27:0]  _arr_output_bits_accum_0_25;
+  wire [27:0]  _arr_output_bits_accum_0_26;
+  wire [27:0]  _arr_output_bits_accum_0_27;
+  wire [27:0]  _arr_output_bits_accum_0_28;
+  wire [27:0]  _arr_output_bits_accum_0_29;
+  wire [27:0]  _arr_output_bits_accum_0_30;
+  wire [27:0]  _arr_output_bits_accum_0_31;
   wire         _handler_load_valid;
   wire [31:0]  _handler_load_bits_len;
   wire         _handler_compute_valid;
@@ -84,14 +116,14 @@ module Core(
   reg  [10:0]  loadTotalBeats;
   reg  [10:0]  loadBeatCtr;
   reg  [10:0]  cmpRows;
-  reg  [6:0]   numColTiles;
-  reg  [6:0]   colTileCtr;
+  reg  [5:0]   numColTiles;
+  reg  [5:0]   colTileCtr;
   reg  [10:0]  activeIdx;
   reg          mergeBatchCtr;
   reg  [10:0]  storeTotalBeats;
   reg  [10:0]  storeBeatCtr;
-  reg  [4:0]   storeSubBeatCtr;
-  reg  [6:0]   storeColCtr;
+  reg  [5:0]   storeSubBeatCtr;
+  reg  [5:0]   storeColCtr;
   reg          storeBatchCtr;
   wire         handler_load_ready = state == 2'h0;
   wire         _GEN = state == 2'h1;
@@ -113,54 +145,86 @@ module Core(
   wire         _GEN_9 = _GEN_7 | _GEN_6;
   assign arrLocalReset = _GEN_2 & ~_GEN_9 & _GEN_8;
   wire         _GEN_10 = cState == 3'h4;
-  wire [5:0]   _currentEntryIdx_T_1 =
-    {5'h0, storeBatchCtr} * numColTiles[5:0] + storeColCtr[5:0];
-  wire         isLastSubBeat = storeSubBeatCtr == 5'hF;
-  reg  [19:0]  casez_tmp;
+  wire [4:0]   _currentEntryIdx_T_1 =
+    {4'h0, storeBatchCtr} * numColTiles[4:0] + storeColCtr[4:0];
+  wire         isLastSubBeat = storeSubBeatCtr == 6'h1F;
+  reg  [27:0]  casez_tmp;
   always_comb begin
-    casez (storeSubBeatCtr[3:0])
-      4'b0000:
-        casez_tmp = _outBram_ext_R0_data[19:0];
-      4'b0001:
-        casez_tmp = _outBram_ext_R0_data[39:20];
-      4'b0010:
-        casez_tmp = _outBram_ext_R0_data[59:40];
-      4'b0011:
-        casez_tmp = _outBram_ext_R0_data[79:60];
-      4'b0100:
-        casez_tmp = _outBram_ext_R0_data[99:80];
-      4'b0101:
-        casez_tmp = _outBram_ext_R0_data[119:100];
-      4'b0110:
-        casez_tmp = _outBram_ext_R0_data[139:120];
-      4'b0111:
-        casez_tmp = _outBram_ext_R0_data[159:140];
-      4'b1000:
-        casez_tmp = _outBram_ext_R0_data[179:160];
-      4'b1001:
-        casez_tmp = _outBram_ext_R0_data[199:180];
-      4'b1010:
-        casez_tmp = _outBram_ext_R0_data[219:200];
-      4'b1011:
-        casez_tmp = _outBram_ext_R0_data[239:220];
-      4'b1100:
-        casez_tmp = _outBram_ext_R0_data[259:240];
-      4'b1101:
-        casez_tmp = _outBram_ext_R0_data[279:260];
-      4'b1110:
-        casez_tmp = _outBram_ext_R0_data[299:280];
+    casez (storeSubBeatCtr[4:0])
+      5'b00000:
+        casez_tmp = _outBram_ext_R0_data[27:0];
+      5'b00001:
+        casez_tmp = _outBram_ext_R0_data[55:28];
+      5'b00010:
+        casez_tmp = _outBram_ext_R0_data[83:56];
+      5'b00011:
+        casez_tmp = _outBram_ext_R0_data[111:84];
+      5'b00100:
+        casez_tmp = _outBram_ext_R0_data[139:112];
+      5'b00101:
+        casez_tmp = _outBram_ext_R0_data[167:140];
+      5'b00110:
+        casez_tmp = _outBram_ext_R0_data[195:168];
+      5'b00111:
+        casez_tmp = _outBram_ext_R0_data[223:196];
+      5'b01000:
+        casez_tmp = _outBram_ext_R0_data[251:224];
+      5'b01001:
+        casez_tmp = _outBram_ext_R0_data[279:252];
+      5'b01010:
+        casez_tmp = _outBram_ext_R0_data[307:280];
+      5'b01011:
+        casez_tmp = _outBram_ext_R0_data[335:308];
+      5'b01100:
+        casez_tmp = _outBram_ext_R0_data[363:336];
+      5'b01101:
+        casez_tmp = _outBram_ext_R0_data[391:364];
+      5'b01110:
+        casez_tmp = _outBram_ext_R0_data[419:392];
+      5'b01111:
+        casez_tmp = _outBram_ext_R0_data[447:420];
+      5'b10000:
+        casez_tmp = _outBram_ext_R0_data[475:448];
+      5'b10001:
+        casez_tmp = _outBram_ext_R0_data[503:476];
+      5'b10010:
+        casez_tmp = _outBram_ext_R0_data[531:504];
+      5'b10011:
+        casez_tmp = _outBram_ext_R0_data[559:532];
+      5'b10100:
+        casez_tmp = _outBram_ext_R0_data[587:560];
+      5'b10101:
+        casez_tmp = _outBram_ext_R0_data[615:588];
+      5'b10110:
+        casez_tmp = _outBram_ext_R0_data[643:616];
+      5'b10111:
+        casez_tmp = _outBram_ext_R0_data[671:644];
+      5'b11000:
+        casez_tmp = _outBram_ext_R0_data[699:672];
+      5'b11001:
+        casez_tmp = _outBram_ext_R0_data[727:700];
+      5'b11010:
+        casez_tmp = _outBram_ext_R0_data[755:728];
+      5'b11011:
+        casez_tmp = _outBram_ext_R0_data[783:756];
+      5'b11100:
+        casez_tmp = _outBram_ext_R0_data[811:784];
+      5'b11101:
+        casez_tmp = _outBram_ext_R0_data[839:812];
+      5'b11110:
+        casez_tmp = _outBram_ext_R0_data[867:840];
       default:
-        casez_tmp = _outBram_ext_R0_data[319:300];
+        casez_tmp = _outBram_ext_R0_data[895:868];
     endcase
   end // always_comb
   wire [10:0]  _nextBeat_T = storeBeatCtr + 11'h1;
   wire         _GEN_11 = (&state) & m_axis_tready;
   wire         _GEN_12 = _nextBeat_T == storeTotalBeats;
-  wire [6:0]   _nextCol_T = colTileCtr + 7'h1;
+  wire [5:0]   _nextCol_T = colTileCtr + 6'h1;
   wire         _GEN_13 = _nextCol_T == numColTiles;
-  wire [6:0]   _nextCol_T_1 = storeColCtr + 7'h1;
+  wire [5:0]   _nextCol_T_1 = storeColCtr + 6'h1;
   wire         _GEN_14 = _nextCol_T_1 == numColTiles;
-  wire [10:0]  _numColTiles_T = _handler_compute_bits_cols[10:0] + 11'hF;
+  wire [10:0]  _numColTiles_T = _handler_compute_bits_cols[10:0] + 11'h1F;
   wire         _GEN_15 = handler_load_ready & _handler_load_valid;
   wire         _GEN_16 = handler_load_ready & _handler_compute_valid;
   wire         _GEN_17 = ~handler_load_ready | _GEN_15 | ~_GEN_16;
@@ -171,12 +235,12 @@ module Core(
       state <= 2'h0;
       cState <= 3'h0;
       loadBeatCtr <= 11'h0;
-      colTileCtr <= 7'h0;
+      colTileCtr <= 6'h0;
       activeIdx <= 11'h0;
       mergeBatchCtr <= 1'h0;
       storeBeatCtr <= 11'h0;
-      storeSubBeatCtr <= 5'h0;
-      storeColCtr <= 7'h0;
+      storeSubBeatCtr <= 6'h0;
+      storeColCtr <= 6'h0;
       storeBatchCtr <= 1'h0;
     end
     else begin
@@ -246,7 +310,7 @@ module Core(
         if (_GEN_17) begin
         end
         else
-          colTileCtr <= 7'h0;
+          colTileCtr <= 6'h0;
       end
       else
         colTileCtr <= _nextCol_T;
@@ -257,20 +321,20 @@ module Core(
           _GEN_4 ? ~_arr_output_valid & mergeBatchCtr : ~_GEN_6 & mergeBatchCtr;
       if (_GEN_11) begin
         storeBeatCtr <= _nextBeat_T;
-        storeSubBeatCtr <= isLastSubBeat ? 5'h0 : storeSubBeatCtr + 5'h1;
+        storeSubBeatCtr <= isLastSubBeat ? 6'h0 : storeSubBeatCtr + 6'h1;
       end
       else if (_GEN_19) begin
       end
       else begin
         storeBeatCtr <= 11'h0;
-        storeSubBeatCtr <= 5'h0;
+        storeSubBeatCtr <= 6'h0;
       end
       if ((&state) & m_axis_tready & isLastSubBeat)
-        storeColCtr <= _GEN_14 ? 7'h0 : _nextCol_T_1;
+        storeColCtr <= _GEN_14 ? 6'h0 : _nextCol_T_1;
       else if (_GEN_19) begin
       end
       else
-        storeColCtr <= 7'h0;
+        storeColCtr <= 6'h0;
       storeBatchCtr <=
         (&state) & m_axis_tready & isLastSubBeat & _GEN_14
           ? storeBatchCtr - 1'h1
@@ -282,7 +346,7 @@ module Core(
     end
     else begin
       cmpRows <= _handler_compute_bits_rows[10:0];
-      numColTiles <= _numColTiles_T[10:4];
+      numColTiles <= _numColTiles_T[10:5];
     end
     if (~_GEN_2 | _GEN_3 | ~(_GEN_4 & _arr_output_valid)) begin
     end
@@ -303,6 +367,22 @@ module Core(
       tileAccums_0_13 <= _arr_output_bits_accum_0_13;
       tileAccums_0_14 <= _arr_output_bits_accum_0_14;
       tileAccums_0_15 <= _arr_output_bits_accum_0_15;
+      tileAccums_0_16 <= _arr_output_bits_accum_0_16;
+      tileAccums_0_17 <= _arr_output_bits_accum_0_17;
+      tileAccums_0_18 <= _arr_output_bits_accum_0_18;
+      tileAccums_0_19 <= _arr_output_bits_accum_0_19;
+      tileAccums_0_20 <= _arr_output_bits_accum_0_20;
+      tileAccums_0_21 <= _arr_output_bits_accum_0_21;
+      tileAccums_0_22 <= _arr_output_bits_accum_0_22;
+      tileAccums_0_23 <= _arr_output_bits_accum_0_23;
+      tileAccums_0_24 <= _arr_output_bits_accum_0_24;
+      tileAccums_0_25 <= _arr_output_bits_accum_0_25;
+      tileAccums_0_26 <= _arr_output_bits_accum_0_26;
+      tileAccums_0_27 <= _arr_output_bits_accum_0_27;
+      tileAccums_0_28 <= _arr_output_bits_accum_0_28;
+      tileAccums_0_29 <= _arr_output_bits_accum_0_29;
+      tileAccums_0_30 <= _arr_output_bits_accum_0_30;
+      tileAccums_0_31 <= _arr_output_bits_accum_0_31;
     end
     if (_GEN_19) begin
     end
@@ -371,8 +451,24 @@ module Core(
     .input_weights_i_bits_13   (_GEN_5 ? 2'h0 : s_axis_tdata[27:26]),
     .input_weights_i_bits_14   (_GEN_5 ? 2'h0 : s_axis_tdata[29:28]),
     .input_weights_i_bits_15   (_GEN_5 ? 2'h0 : s_axis_tdata[31:30]),
+    .input_weights_i_bits_16   (_GEN_5 ? 2'h0 : s_axis_tdata[33:32]),
+    .input_weights_i_bits_17   (_GEN_5 ? 2'h0 : s_axis_tdata[35:34]),
+    .input_weights_i_bits_18   (_GEN_5 ? 2'h0 : s_axis_tdata[37:36]),
+    .input_weights_i_bits_19   (_GEN_5 ? 2'h0 : s_axis_tdata[39:38]),
+    .input_weights_i_bits_20   (_GEN_5 ? 2'h0 : s_axis_tdata[41:40]),
+    .input_weights_i_bits_21   (_GEN_5 ? 2'h0 : s_axis_tdata[43:42]),
+    .input_weights_i_bits_22   (_GEN_5 ? 2'h0 : s_axis_tdata[45:44]),
+    .input_weights_i_bits_23   (_GEN_5 ? 2'h0 : s_axis_tdata[47:46]),
+    .input_weights_i_bits_24   (_GEN_5 ? 2'h0 : s_axis_tdata[49:48]),
+    .input_weights_i_bits_25   (_GEN_5 ? 2'h0 : s_axis_tdata[51:50]),
+    .input_weights_i_bits_26   (_GEN_5 ? 2'h0 : s_axis_tdata[53:52]),
+    .input_weights_i_bits_27   (_GEN_5 ? 2'h0 : s_axis_tdata[55:54]),
+    .input_weights_i_bits_28   (_GEN_5 ? 2'h0 : s_axis_tdata[57:56]),
+    .input_weights_i_bits_29   (_GEN_5 ? 2'h0 : s_axis_tdata[59:58]),
+    .input_weights_i_bits_30   (_GEN_5 ? 2'h0 : s_axis_tdata[61:60]),
+    .input_weights_i_bits_31   (_GEN_5 ? 2'h0 : s_axis_tdata[63:62]),
     .input_activation_i_valid  (arr_input_nAcc_valid),
-    .input_activation_i_bits_0 (_GEN_5 ? 8'h0 : _actBram_0_ext_R0_data),
+    .input_activation_i_bits_0 (_GEN_5 ? 16'h0 : _actBram_0_ext_R0_data),
     .input_nAcc_valid          (arr_input_nAcc_valid),
     .input_nAcc_bits           (_GEN_5 ? 12'h0 : {1'h0, cmpRows}),
     .output_ready              (_GEN_2 & ~_GEN_3 & _GEN_4 & _arr_output_valid),
@@ -392,9 +488,25 @@ module Core(
     .output_bits_accum_0_12    (_arr_output_bits_accum_0_12),
     .output_bits_accum_0_13    (_arr_output_bits_accum_0_13),
     .output_bits_accum_0_14    (_arr_output_bits_accum_0_14),
-    .output_bits_accum_0_15    (_arr_output_bits_accum_0_15)
+    .output_bits_accum_0_15    (_arr_output_bits_accum_0_15),
+    .output_bits_accum_0_16    (_arr_output_bits_accum_0_16),
+    .output_bits_accum_0_17    (_arr_output_bits_accum_0_17),
+    .output_bits_accum_0_18    (_arr_output_bits_accum_0_18),
+    .output_bits_accum_0_19    (_arr_output_bits_accum_0_19),
+    .output_bits_accum_0_20    (_arr_output_bits_accum_0_20),
+    .output_bits_accum_0_21    (_arr_output_bits_accum_0_21),
+    .output_bits_accum_0_22    (_arr_output_bits_accum_0_22),
+    .output_bits_accum_0_23    (_arr_output_bits_accum_0_23),
+    .output_bits_accum_0_24    (_arr_output_bits_accum_0_24),
+    .output_bits_accum_0_25    (_arr_output_bits_accum_0_25),
+    .output_bits_accum_0_26    (_arr_output_bits_accum_0_26),
+    .output_bits_accum_0_27    (_arr_output_bits_accum_0_27),
+    .output_bits_accum_0_28    (_arr_output_bits_accum_0_28),
+    .output_bits_accum_0_29    (_arr_output_bits_accum_0_29),
+    .output_bits_accum_0_30    (_arr_output_bits_accum_0_30),
+    .output_bits_accum_0_31    (_arr_output_bits_accum_0_31)
   );
-  actBram_0_1024x8 actBram_0_ext (
+  actBram_0_1024x16 actBram_0_ext (
     .R0_addr (_GEN_5 ? 10'h0 : canStep ? _activeIdx_T[9:0] : activeIdx[9:0]),
     .R0_en   (1'h1),
     .R0_clk  (clock),
@@ -402,23 +514,39 @@ module Core(
     .W0_addr (loadBeatCtr[9:0]),
     .W0_en   (_GEN & s_axis_tvalid),
     .W0_clk  (clock),
-    .W0_data (s_axis_tdata[7:0])
+    .W0_data (s_axis_tdata[15:0])
   );
-  outBram_64x320 outBram_ext (
+  outBram_32x896 outBram_ext (
     .R0_addr
       ((&state)
          ? (m_axis_tready & isLastSubBeat
-              ? _currentEntryIdx_T_1 + 6'h1
+              ? _currentEntryIdx_T_1 + 5'h1
               : _currentEntryIdx_T_1)
-         : 6'h0),
+         : 5'h0),
     .R0_en   (1'h1),
     .R0_clk  (clock),
     .R0_data (_outBram_ext_R0_data),
-    .W0_addr ({5'h0, mergeBatchCtr} * numColTiles[5:0] + colTileCtr[5:0]),
+    .W0_addr ({4'h0, mergeBatchCtr} * numColTiles[4:0] + colTileCtr[4:0]),
     .W0_en   (_GEN_2 & ~_GEN_7 & _GEN_6),
     .W0_clk  (clock),
     .W0_data
-      ({tileAccums_0_15,
+      ({tileAccums_0_31,
+        tileAccums_0_30,
+        tileAccums_0_29,
+        tileAccums_0_28,
+        tileAccums_0_27,
+        tileAccums_0_26,
+        tileAccums_0_25,
+        tileAccums_0_24,
+        tileAccums_0_23,
+        tileAccums_0_22,
+        tileAccums_0_21,
+        tileAccums_0_20,
+        tileAccums_0_19,
+        tileAccums_0_18,
+        tileAccums_0_17,
+        tileAccums_0_16,
+        tileAccums_0_15,
         tileAccums_0_14,
         tileAccums_0_13,
         tileAccums_0_12,
@@ -436,7 +564,7 @@ module Core(
         tileAccums_0_0})
   );
   assign s_axis_tready = _GEN_5 ? _GEN : _arr_input_weights_i_ready & ~_arr_output_valid;
-  assign m_axis_tdata = (&state) ? {{12{casez_tmp[19]}}, casez_tmp} : 32'h0;
+  assign m_axis_tdata = (&state) ? {{4{casez_tmp[27]}}, casez_tmp} : 32'h0;
   assign m_axis_tvalid = &state;
   assign m_axis_tlast = (&state) & _nextBeat_T == storeTotalBeats;
 endmodule

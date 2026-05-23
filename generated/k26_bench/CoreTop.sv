@@ -31,7 +31,7 @@ module CoreTop(
   output         s_axi_rlast,
                  s_axi_rvalid,
   input          s_axi_rready,
-  input  [31:0]  s_axis_tdata,
+  input  [63:0]  s_axis_tdata,
   input          s_axis_tvalid,
   output         s_axis_tready,
   input          s_axis_tlast,

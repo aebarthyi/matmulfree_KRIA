@@ -35,18 +35,21 @@
 #include "mmfree_runtime.h"
 
 /* ---------- K26_Bench constants (must match CoreConfig) ---------- */
-#define BENCH_AWIDTH        8
+#define BENCH_AWIDTH        16
 #define BENCH_BATCH         1
 #define BENCH_XDIM          4
-#define BENCH_NLANES        (BENCH_AWIDTH / 2)         /* 4 */
-#define BENCH_OUT_LANES_PER_TILE  (BENCH_XDIM * BENCH_NLANES)  /* 16 */
-#define BENCH_S_AXIS_BYTES        ((BENCH_XDIM * BENCH_AWIDTH) / 8)  /* 4 */
-#define BENCH_OUT_LANE_BYTES      4
+#define BENCH_MAX_ACC       4096
+#define BENCH_NLANES        (BENCH_AWIDTH / 2)         /* 8 */
+#define BENCH_OUT_LANES_PER_TILE  (BENCH_XDIM * BENCH_NLANES)         /* 32 */
+#define BENCH_S_AXIS_BYTES        ((BENCH_XDIM * BENCH_AWIDTH) / 8)   /* 8  → 64-bit s_axis */
+#define BENCH_OUT_ACC_WIDTH       (12 + BENCH_AWIDTH)                 /* log2(maxAcc) + aWidth = 28 */
+#define BENCH_OUT_LANE_BYTES      4                                   /* outLaneWidth pads 28→32 */
 #define BENCH_MAX_N         1024
 #define BENCH_MAX_M         1024
 
-/* Map Core's outAccWidth (log2(maxAcc)+aWidth = 12+8 = 20) padded to 32 bits.
- * The DMA writes 32-bit beats. Each is a sign-extended 20-bit accumulator. */
+/* DMA writes BENCH_OUT_LANE_BYTES per accumulator lane (32-bit beats since
+ * outLaneWidth = nextPow2(outAccWidth) = 32). Each beat is a sign-extended
+ * BENCH_OUT_ACC_WIDTH-bit accumulator. */
 typedef int32_t bench_acc_t;
 
 /* ---------- helpers ---------- */
@@ -65,21 +68,23 @@ static uint64_t next_rand(uint64_t *s) {
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-/* Pack a 2-bit ternary weight {0, 1, 3} into the position (lane) of a uint32 beat.
- * 16 lanes per beat (xDim*nLanes for K26_Bench). */
-static inline uint32_t pack_weights(const uint8_t *lanes /* 16 vals in {0,1,3} */) {
-    uint32_t w = 0;
+/* Pack a 2-bit ternary weight {0, 1, 3} into the position (lane) of a 64-bit beat.
+ * outLanesPerTile lanes per beat (xDim*nLanes; 32 at aWidth=16). Lane 0 sits at
+ * the LSB, matching Chisel's Core.scala line ~235: weightVec(i) =
+ *   s_axis.tdata((i+1)*2-1, i*2). */
+static inline uint64_t pack_weights(const uint8_t *lanes /* outLanesPerTile vals in {0,1,3} */) {
+    uint64_t w = 0;
     for (int i = 0; i < BENCH_OUT_LANES_PER_TILE; i++) {
-        w |= ((uint32_t)(lanes[i] & 0x3u)) << (i * 2);
+        w |= ((uint64_t)(lanes[i] & 0x3u)) << (i * 2);
     }
     return w;
 }
 
 /* Cast 32-bit DMA accumulator beat to a signed value, sign-extending the
- * 20-bit accumulator that lives in the low bits. */
+ * BENCH_OUT_ACC_WIDTH-bit accumulator that lives in the low bits. */
 static inline int32_t expand_acc(uint32_t raw) {
-    /* Sign-extend from 20 bits. */
-    int32_t v = (int32_t)(raw << 12) >> 12;
+    const int sh = 32 - BENCH_OUT_ACC_WIDTH;          /* 4 at aWidth=16 */
+    int32_t v = (int32_t)(raw << sh) >> sh;
     return v;
 }
 
@@ -122,25 +127,28 @@ static int run_shape(bench_state_t *bs, uint32_t N, uint32_t M, int verify,
 
     uint64_t rng = seed;
 
-    /* Fill activation udmabuf. AXI DMA at 32 bits beat width, so each beat
-     * is 4 bytes carrying one batchSize*aWidth = 1-byte activation in the low
-     * byte, padding ignored. */
-    volatile uint32_t *act_dma32 = (volatile uint32_t *)bs->act_buf.vaddr;
+    /* Fill activation udmabuf. AXI DMA at 64 bits beat width, so each beat
+     * is 8 bytes carrying one batchSize*aWidth = 2-byte activation in the low
+     * two bytes (Chisel reads tdata(aWidth-1, 0)). Padding ignored. */
+    volatile uint64_t *act_dma = (volatile uint64_t *)bs->act_buf.vaddr;
     for (uint32_t i = 0; i < N; i++) {
-        uint8_t v = (uint8_t)(next_rand(&rng) & 0xF);
+        uint16_t v = (uint16_t)(next_rand(&rng) & 0xFu);   /* keep small (0..15) for headroom */
         act_int[i] = (int8_t)v;
-        act_dma32[i] = (uint32_t)v;   /* low byte = activation, upper 3 bytes = 0 */
+        act_dma[i] = (uint64_t)v;
     }
 
-    /* Fill weight udmabuf. Layout: for each row n in 0..N-1, for each col tile
-     * t in 0..numColTiles-1, one 32-bit beat packing 16 weights (one per col
-     * lane in this tile). Total beats = N * numColTiles. */
+    /* Fill weight udmabuf. Layout MUST match Core.scala's COMPUTE_MM consumption
+     * order: col-tile-major. Core processes one col tile at a time, streaming
+     * N s_axis beats per tile, so the buffer is laid out as
+     *   [t=0, n=0..N-1], [t=1, n=0..N-1], ..., [t=T-1, n=0..N-1]
+     * Each beat is 64 bits packing outLanesPerTile=32 ternary codes; lane l
+     * (LSBs) corresponds to output column m = t * outLanesPerTile + l. */
     uint32_t num_col_tiles = (M + BENCH_OUT_LANES_PER_TILE - 1) / BENCH_OUT_LANES_PER_TILE;
-    volatile uint32_t *wt_dma = (volatile uint32_t *)bs->wt_buf.vaddr;
+    volatile uint64_t *wt_dma = (volatile uint64_t *)bs->wt_buf.vaddr;
 
     uint8_t lanes[BENCH_OUT_LANES_PER_TILE];
-    for (uint32_t n = 0; n < N; n++) {
-        for (uint32_t t = 0; t < num_col_tiles; t++) {
+    for (uint32_t t = 0; t < num_col_tiles; t++) {
+        for (uint32_t n = 0; n < N; n++) {
             for (int lane = 0; lane < BENCH_OUT_LANES_PER_TILE; lane++) {
                 uint32_t m = t * BENCH_OUT_LANES_PER_TILE + lane;
                 uint8_t code; int8_t signed_val;
@@ -157,7 +165,7 @@ static int run_shape(bench_state_t *bs, uint32_t N, uint32_t M, int verify,
                 lanes[lane] = code;
                 if (verify) wt_int[(size_t)n * M + m] = signed_val;
             }
-            wt_dma[n * num_col_tiles + t] = pack_weights(lanes);
+            wt_dma[t * N + n] = pack_weights(lanes);
         }
     }
 

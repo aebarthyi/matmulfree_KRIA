@@ -110,7 +110,7 @@ object CoreConfig {
       * 4*8) so a single AXI DMA IP configured at 32-bit width covers both directions.
       */
     val K26_Bench: CoreConfig = CoreConfig(
-        aWidth       = 8,
+        aWidth       = 16,
         maxAcc       = 4096,
         xDim         = 4,
         batchSize    = 1,

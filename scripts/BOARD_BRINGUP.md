@@ -24,8 +24,8 @@ In Vivado GUI:
 3. Top module: `CoreTop`.
 4. On the **Ports & Interfaces** page, Vivado should auto-infer:
    - `s_axi` → AXI4 Slave (32-bit addr, 128-bit data, 6-bit ID)
-   - `s_axis` → AXI4-Stream Slave (32-bit data)
-   - `m_axis` → AXI4-Stream Master (32-bit data)
+   - `s_axis` → AXI4-Stream Slave (**64-bit data** at aWidth=16; was 32-bit at aWidth=8)
+   - `m_axis` → AXI4-Stream Master (32-bit data — outAccWidth=28 padded to 32)
    - `aclk` → clock; `aresetn` → active-low reset (associate clock with all three AXI interfaces)
    - `irq` → leave as standalone output (we'll wire to the PS later)
 5. **Save & Package**. Note the IP repo path — you'll reference it next.
@@ -40,8 +40,8 @@ In Vivado GUI:
    - **AXI Direct Memory Access** (Xilinx AXI DMA, *not* AXI CDMA / VDMA).
      - **Disable** scatter-gather (we drive simple mode).
      - **Enable** Read Channel (MM2S) and Write Channel (S2MM).
-     - Memory map data width: 32 bits (or 64/128 — must match what HP is set to).
-     - Stream data width: 32 bits **on both MM2S and S2MM** (these must match CoreTop's `s_axis` / `m_axis` = 32b).
+     - Memory map data width: 64 bits (or 128 — must match what HP is set to, and ≥ stream width).
+     - Stream data width: **MM2S = 64 bits**, **S2MM = 32 bits** (must match CoreTop's `s_axis` / `m_axis` for the aWidth=16 K26_Bench preset). MM2S and S2MM can be configured independently on the AXI DMA IP.
      - Address width: 40 bits (matches AXI HP).
      - **Buffer Length Register Width: 23 bits** (default 14 is too small — caps single transfers at 16 KiB, but the K26_Bench weights buffer reaches 256 KiB at N=M=1024). 23 → 8 MiB, plenty of headroom.
    - **AXI Interconnect** (or **SmartConnect**) to fan out the PS HPM0 master to two AXI4-Lite slaves (CoreTop's `s_axi` + DMA's `S_AXI_LITE`).
@@ -71,57 +71,56 @@ File → Export → Export Hardware → include bitstream → save as core_bench
 
 ## 3. Boot the bitstream on the KRIA
 
-The Xilinx Ubuntu image uses `xmutil` + DT overlays. Easiest path:
+The Xilinx Ubuntu image uses `xmutil` + DT overlays. Both pieces — the bitstream and the overlay — are generated from the `.xsa` by `scripts/gen_overlay.sh`.
 
-1. Copy `core_bench.bit` (extract from the `.xsa` — it's a zip) and a tiny device-tree overlay `core_bench.dtbo` (see below) to the board.
-2. `sudo cp core_bench.bit /lib/firmware/xilinx/core_bench/core_bench.bit`
-3. `sudo cp core_bench.dtbo /lib/firmware/xilinx/core_bench/core_bench.dtbo`
-4. Add a `shell.json`:
-   ```json
-   { "shell_type" : "XRT_FLAT", "num_slots": "1" }
-   ```
-   under the same dir.
-5. `sudo xmutil unloadapp` (if anything is loaded)
-6. `sudo xmutil loadapp core_bench`
+### Generate the overlay (one command)
 
-### The minimal overlay (`core_bench.dts` → compile with `dtc`)
+On your Vivado host (after `source /tools/Xilinx/Vivado/<ver>/settings64.sh`):
 
-```dts
-/dts-v1/;
-/plugin/;
-&{/} {
-    #address-cells = <2>;
-    #size-cells    = <2>;
-
-    /* CoreTop's IRQ goes through PS pl_ps_irq0[0]. Adjust the GIC interrupt
-     * number if you wired it to a different bit. The number 89 below is
-     * GIC SPI 89 = irq[0] on Zynq US+ — check your block design.
-     *
-     * The reg = <…> address MUST match the CoreTop s_axi address Vivado
-     * assigned in §2 step 5. Update both the node label (@xxxxxxxx) and the
-     * reg field together. */
-    mmfree_core: mmfree_core@a0010000 {
-        compatible    = "generic-uio";
-        reg           = <0x0 0xa0010000 0x0 0x1000>;
-        interrupts    = <0 89 4>;     /* SPI, num, level-high (Core irq is held until ack) */
-        interrupt-parent = <&gic>;
-    };
-
-    /* udmabufs for activation / weight / output buffers. */
-    udmabuf_act: udmabuf-act { compatible = "ikwzm,u-dma-buf"; size = <0x00001000>; };  /*  4 KiB */
-    udmabuf_wt:  udmabuf-wt  { compatible = "ikwzm,u-dma-buf"; size = <0x00040000>; };  /* 256 KiB */
-    udmabuf_out: udmabuf-out { compatible = "ikwzm,u-dma-buf"; size = <0x00001000>; };  /*  4 KiB */
-};
+```bash
+./scripts/gen_overlay.sh path/to/system.xsa build/overlay
 ```
 
-Sizes match `K26_Bench` worst-case (maxN=1024 bytes activations, 1024×64×4 = 256 KiB weights, 1024×4 = 4 KiB outputs).
+This extracts CoreTop's base address from the `.xsa` via xsct, substitutes it into `scripts/core_bench_overlay.dts.in`, runs `dtc` to compile the `.dtbo`, extracts the bitstream from the `.xsa`, and writes `shell.json`. Output:
+
+```
+build/overlay/
+├── core_bench.bit      (bitstream, extracted from .xsa)
+├── core_bench.dts      (populated overlay source, for inspection)
+├── core_bench.dtbo     (compiled overlay)
+└── shell.json          (consumed by xmutil)
+```
+
+Flags worth knowing:
+- `-ip <name>` — override BD cell name if auto-detection misses it (looks for `CoreTop_0`, `mmfree_core_0`, then VLNV match).
+- `-addr <hex>` — override the base address (use if hsi auto-detect fails on your Vitis version).
+- `-irq <n>` — override the GIC SPI number (defaults to 89; check your block design's Concat → ps_pl_irq wiring).
+
+Sizes encoded in the dtsi template match `K26_Bench` worst-case at aWidth=16:
+- activations: maxN × 8 bytes/beat = 8 KiB
+- weights: maxN × numColTiles × 8 bytes = 1024 × 32 × 8 = 256 KiB
+- outputs: maxM × 4 bytes = 4 KiB
+
+To change those sizes for a different preset, edit `scripts/core_bench_overlay.dts.in` directly — the tcl just substitutes the address / IRQ placeholders, the udmabuf sizes are literal.
+
+### Deploy on the KRIA
+
+```bash
+sudo mkdir -p /lib/firmware/xilinx/core_bench
+sudo cp build/overlay/core_bench.bit \
+        build/overlay/core_bench.dtbo \
+        build/overlay/shell.json \
+        /lib/firmware/xilinx/core_bench/
+sudo xmutil unloadapp || true
+sudo xmutil loadapp core_bench
+```
 
 After overlay loads:
 
 ```bash
-ls /dev/udmabuf*     # → /dev/udmabuf0 /dev/udmabuf1 /dev/udmabuf2
+ls /dev/udmabuf*     # → /dev/udmabuf-act /dev/udmabuf-wt /dev/udmabuf-out
 ls /dev/uio*         # → /dev/uio0  (CoreTop)
-cat /sys/class/u-dma-buf/udmabuf0/phys_addr  # should be a real DDR4 phys addr
+cat /sys/class/u-dma-buf/udmabuf-act/phys_addr  # should be a real DDR4 phys addr
 ```
 
 ## 4. Build and run the benchmark
@@ -159,4 +158,4 @@ Expected output (CSV header + 25 rows for the 5×5 sweep). The `gops_compute` co
 - **`open /dev/uio0` fails** → the overlay didn't bind generic-uio. Check `dmesg | grep uio`, double-check the GIC SPI number in the overlay.
 - **`COMPUTE err=0x1`** → invalid opcode reported by Core. Almost always a NEON write splitting into two AXI beats — confirm `__aarch64__` is being defined (it is on the KRIA).
 - **`COMPUTE` hangs (no IRQ)** → DMA isn't pushing enough beats. Re-check that you sized the weight buffer as `N * numColTiles * 4` bytes and that the DMA is reset between runs (the runtime does this on open).
-- **Outputs verify wrong** → the weight packing in `bench.c` must match what `SystolicArray` expects (col-tile-major). If you swap to a different config, re-derive `BENCH_OUT_LANES_PER_TILE`.
+- **Outputs verify wrong** → the weight buffer layout in `bench.c` must match what `Core` consumes: **col-tile-major** beats (all N rows for tile 0, then all N rows for tile 1, etc.), with lane 0 of each beat at the LSB. Suspect 1 if you swap to a different config: re-derive `BENCH_OUT_LANES_PER_TILE` from `xDim * aWidth/2` and `BENCH_OUT_ACC_WIDTH` from `log2(maxAcc) + aWidth`.
