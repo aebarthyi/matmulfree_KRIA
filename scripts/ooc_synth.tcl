@@ -53,6 +53,14 @@ set_property top CoreTop [current_fileset]
 # Synthesize out of context.
 synth_design -mode out_of_context -top CoreTop -part $part
 
+# Constrain aclk so the timing summary is meaningful (it was previously
+# unconstrained — WNS=NA). Default matches bd.tcl's PL0_REF (100 MHz);
+# override with CLK_MHZ in the environment to probe faster targets.
+set clk_mhz 100
+if {[info exists ::env(CLK_MHZ)]} { set clk_mhz $::env(CLK_MHZ) }
+create_clock -period [expr {1000.0 / $clk_mhz}] -name aclk [get_ports aclk]
+puts "  aclk constrained to $clk_mhz MHz"
+
 # Quick reports.
 report_utilization      -file "$build_dir/coretop_utilization.rpt"
 report_timing_summary   -file "$build_dir/coretop_timing_summary.rpt" -warn_on_violation

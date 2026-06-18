@@ -8,12 +8,19 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /**
-  * Mirror of the `software/bench/bench.c` flow at K26_Bench parameters
-  * (aWidth=16, xDim=4, batchSize=1, outBeatLanes=1). CoreSpec tests Core in
-  * isolation with weights pre-arranged in the order Core expects; this spec
+  * Mirror of the `software/bench/bench.c` flow, parameterized over the bench
+  * presets' geometry (see concrete subclasses at the bottom: K26_Bench through
+  * K26_Bench64 shapes, all batchSize=1 / outBeatLanes=1). CoreSpec tests Core
+  * in isolation with weights pre-arranged in the order Core expects; this spec
   * exercises the SOFTWARE-side packing — the layout bench.c writes to udmabuf
   * for the DMA to stream — and asserts it produces results matching a
   * straightforward on-host reference matmul.
+  *
+  * Drives [[CoreTop]] (not bare Core) so the N-way s_axis port join is in the
+  * tested path: geometries wider than 128 bits split each beat into N 128-bit
+  * slices fed on `s_axis_0..s_axis_{N-1}` in lockstep, exactly as N parallel
+  * HP-port DMAs would on the board. N==1 geometries collapse to the legacy
+  * single `s_axis` pass-through.
   *
   * If the random-buffer test passes, the only remaining gap to a working board
   * run is the DMA-side mechanics (start / length register pokes), a much
@@ -21,29 +28,33 @@ import org.scalatest.matchers.must.Matchers
   *
   * The "regression guard" test re-packs the same weight matrix in the
   * row-major order that bench.c used before the 2026-05-23 fix, and asserts
-  * the output does NOT match — proving this spec would have caught yesterday's
-  * bug.
+  * the output does NOT match — proving this spec would have caught that bug.
   */
-class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
+abstract class BenchMirrorSpecBase(
+    geomName: String,
+    aWidth:   Int,
+    maxAcc:   Int,
+    xDim:     Int,
+    maxN:     Int,
+    maxM:     Int,
+    signedAct: Boolean = false
+) extends AnyFreeSpec with Matchers with ChiselSim {
   import InstructionEncoder._
 
-  // K26_Bench-aligned params. maxAcc / maxN / maxM scaled down for sim speed —
-  // the packing logic is identical at any size so a 2-3 col-tile workload is
-  // sufficient to catch ordering bugs.
-  private val aWidth       = 16
-  private val maxAcc       = 256
-  private val xDim         = 4
-  private val batchSize    = 1
-  private val maxN         = 128
-  private val maxM         = 128
+  private val batchSize = 1
 
-  private val nLanes          = aWidth / 2                  //  8
-  private val outLanesPerTile = xDim * nLanes               // 32
-  private val tileAccWidth    = log2Ceil(maxAcc) + aWidth   // 24 here (28 on the real K26_Bench)
+  private val nLanes          = aWidth / 2
+  private val outLanesPerTile = xDim * nLanes               // 32 (bench) / 64 (bench16)
+  private val tileAccWidth    = log2Ceil(maxAcc) + aWidth
   private val outAccWidth     = tileAccWidth
   private val outAccModulus   = BigInt(1) << outAccWidth
   private val outLaneWidth    = 1 << log2Ceil(outAccWidth)
-  private val axisDataWidth   = math.max(xDim, batchSize) * aWidth  // 64
+  private val axisDataWidth   = math.max(xDim, batchSize) * aWidth
+
+  // Input-port split (mirrors CoreConfig/CoreTop): N 128-bit ports when > 128 b.
+  private val numInPorts = if (axisDataWidth <= 128) 1 else math.min(4, (axisDataWidth + 127) / 128)
+  private val portWidth  = axisDataWidth / numInPorts
+  private val sliceMask  = (BigInt(1) << portWidth) - 1
 
   private val effOutBeatLanes = 1
   private val outSubBeats     = outLanesPerTile / effOutBeatLanes
@@ -60,7 +71,7 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
 
   // ───────────────────────── Setup ─────────────────────────
 
-  private def mkCore = new Core(
+  private def mkTop = new CoreTop(
     aWidth       = aWidth,
     maxAcc       = maxAcc,
     xDim         = xDim,
@@ -70,10 +81,17 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
     outBeatLanes = effOutBeatLanes,
     axiAddrWidth = ADDR_WIDTH,
     axiDataWidth = DATA_WIDTH,
-    axiIdWidth   = ID_WIDTH
+    axiIdWidth   = ID_WIDTH,
+    signedAct    = signedAct
   )
 
-  private def resetDut(dut: Core): Unit = {
+  /** Activation generator: unsigned 0..15 (legacy presets), or a signed range
+    * that exercises sign-extension (negative values set the activation's high
+    * bit, which the engine must recover). */
+  private def genAct(rng: Random): Int =
+    if (signedAct) rng.nextInt(4096) - 2048 else rng.nextInt(16)
+
+  private def resetDut(dut: CoreTop): Unit = {
     dut.s_axi.awvalid.poke(false.B)
     dut.s_axi.wvalid.poke(false.B)
     dut.s_axi.bready.poke(false.B)
@@ -81,21 +99,23 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
     dut.s_axi.rready.poke(false.B)
     dut.s_axi.awid.poke(0.U)
     dut.s_axi.arid.poke(0.U)
-    dut.s_axis.tvalid.poke(false.B)
-    dut.s_axis.tdata.poke(0.U)
-    dut.s_axis.tlast.poke(false.B)
+    dut.sAxisPorts.foreach { p =>
+      p.tvalid.poke(false.B)
+      p.tdata.poke(0.U)
+      p.tlast.poke(false.B)
+    }
     dut.m_axis.tready.poke(false.B)
-    dut.reset.poke(true.B)
-    dut.clock.step()
-    dut.reset.poke(false.B)
-    dut.clock.step()
+    dut.aresetn.poke(false.B)
+    dut.aclk.step()
+    dut.aresetn.poke(true.B)
+    dut.aclk.step()
   }
 
   // ───────────────────────── AXI4 helpers ─────────────────────────
   // (Duplicated from CoreSpec to keep each spec self-contained — refactor into
   // a shared trait if a third spec needs them.)
 
-  private def axiWrite(dut: Core, addr: BigInt, data: BigInt, maxCycles: Int = 50): Int = {
+  private def axiWrite(dut: CoreTop, addr: BigInt, data: BigInt, maxCycles: Int = 50): Int = {
     dut.s_axi.awid.poke(0.U)
     dut.s_axi.awaddr.poke(addr.U)
     dut.s_axi.awlen.poke(0.U)
@@ -115,7 +135,7 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
       val wF  = wA  && dut.s_axi.wready.peek().litToBoolean
       val bF  = bR  && dut.s_axi.bvalid.peek().litToBoolean
       if (bF) { resp = dut.s_axi.bresp.peek().litValue.toInt; done = true }
-      dut.clock.step()
+      dut.aclk.step()
       if (awF) { dut.s_axi.awvalid.poke(false.B); awA = false }
       if (wF)  { dut.s_axi.wvalid.poke(false.B);  wA  = false }
       if (bF)  { dut.s_axi.bready.poke(false.B);  bR  = false }
@@ -130,24 +150,40 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
 
   // ───────────────────────── AXI-Stream helpers ─────────────────────────
 
-  private def pushAxisBeats(dut: Core, beats: Seq[BigInt], maxCyclesPerBeat: Int = 50): Unit = {
+  /** Push wide beats, slicing each into numInPorts port-width slices fed in
+    * lockstep (port 0 = LSBs — the CoreTop join's Cat order). With `stagger`
+    * set, each port's tvalid is randomly deasserted some cycles, mimicking N
+    * independent DMAs that are not cycle-aligned; the join must still accept
+    * every beat on all ports simultaneously, so a single index suffices. */
+  private def pushAxisBeats(
+      dut: CoreTop, beats: Seq[BigInt],
+      maxCyclesPerBeat: Int = 50, stagger: Option[Random] = None
+  ): Unit = {
     var idx    = 0
     var budget = beats.length * maxCyclesPerBeat + 50
     while (idx < beats.length && budget > 0) {
-      dut.s_axis.tdata.poke(beats(idx).U)
-      dut.s_axis.tvalid.poke(true.B)
-      dut.s_axis.tlast.poke((idx == beats.length - 1).B)
-      val accepts = dut.s_axis.tready.peek().litToBoolean
-      dut.clock.step()
+      val gates = dut.sAxisPorts.indices.map(_ => stagger.forall(_.nextInt(4) > 0))
+      for ((p, i) <- dut.sAxisPorts.zipWithIndex) {
+        p.tdata.poke(((beats(idx) >> (i * portWidth)) & sliceMask).U)
+        p.tvalid.poke(gates(i).B)
+        p.tlast.poke((gates(i) && idx == beats.length - 1).B)
+      }
+      // A transfer happens only when every port is valid AND ready (the join
+      // holds each port's tready low until all the others are valid).
+      val accepts = gates.forall(identity) &&
+        dut.sAxisPorts.head.tready.peek().litToBoolean
+      dut.aclk.step()
       if (accepts) idx += 1
       budget -= 1
     }
-    dut.s_axis.tvalid.poke(false.B)
-    dut.s_axis.tlast.poke(false.B)
+    dut.sAxisPorts.foreach { p =>
+      p.tvalid.poke(false.B)
+      p.tlast.poke(false.B)
+    }
     require(idx == beats.length, s"s_axis push: only $idx/${beats.length} beats accepted")
   }
 
-  private def pullAxisBeats(dut: Core, count: Int, maxCycles: Int = 4000): Seq[BigInt] = {
+  private def pullAxisBeats(dut: CoreTop, count: Int, maxCycles: Int = 4000): Seq[BigInt] = {
     dut.m_axis.tready.poke(true.B)
     val beats  = scala.collection.mutable.ArrayBuffer.empty[BigInt]
     var cycles = 0
@@ -155,7 +191,7 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
       if (dut.m_axis.tvalid.peek().litToBoolean) {
         beats += dut.m_axis.tdata.peek().litValue
       }
-      dut.clock.step()
+      dut.aclk.step()
       cycles += 1
     }
     dut.m_axis.tready.poke(false.B)
@@ -163,15 +199,15 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
     beats.toSeq
   }
 
-  private def waitForIrq(dut: Core, maxCycles: Int = 8000): Unit = {
+  private def waitForIrq(dut: CoreTop, maxCycles: Int = 8000): Unit = {
     var c = 0
-    while (!dut.irq.peek().litToBoolean && c < maxCycles) { dut.clock.step(); c += 1 }
+    while (!dut.irq.peek().litToBoolean && c < maxCycles) { dut.aclk.step(); c += 1 }
     require(dut.irq.peek().litToBoolean, s"IRQ never asserted within $maxCycles cycles")
   }
 
-  private def ackIrq(dut: Core): Unit = {
+  private def ackIrq(dut: CoreTop): Unit = {
     axiWrite(dut, OFF_IRQ_ACK, BigInt(1)) mustBe OKAY
-    dut.clock.step()
+    dut.aclk.step()
   }
 
   // ───────────────────────── Bench-mirroring packers ─────────────────────────
@@ -248,15 +284,16 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
   }
 
   private def runBenchFlow(
-      dut: Core, acts: Array[Int], weightBeats: Seq[BigInt], n: Int, m: Int
+      dut: CoreTop, acts: Array[Int], weightBeats: Seq[BigInt], n: Int, m: Int,
+      stagger: Option[Random] = None
   ): Seq[BigInt] = {
     axiWrite(dut, OFF_INSTR, encode(LOAD_ACT, BigInt(0x100), BigInt(n), 0)) mustBe OKAY
-    pushAxisBeats(dut, acts.map(packActBeat).toSeq)
+    pushAxisBeats(dut, acts.map(packActBeat).toSeq, stagger = stagger)
     waitForIrq(dut); ackIrq(dut)
 
     axiWrite(dut, OFF_INSTR,
       encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(m))) mustBe OKAY
-    pushAxisBeats(dut, weightBeats, maxCyclesPerBeat = 200)
+    pushAxisBeats(dut, weightBeats, maxCyclesPerBeat = 200, stagger = stagger)
     waitForIrq(dut, maxCycles = 16000); ackIrq(dut)
 
     val totalOutputs = batchSize * m
@@ -283,15 +320,15 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
   // Tests
   // ──────────────────────────────────────────────────────────────────────
 
-  "Bench mirror at K26_Bench params (aWidth=16, xDim=4, batchSize=1)" - {
+  s"Bench mirror at $geomName params (aWidth=$aWidth, xDim=$xDim, batchSize=$batchSize)" - {
 
     "single col tile: bench-style packing matches ref matmul" in {
-      simulate(mkCore) { dut =>
+      simulateRaw(mkTop) { dut =>
         resetDut(dut)
         val rng = new Random(1L)
         val n   = 16
         val m   = outLanesPerTile        // exactly one col tile
-        val acts = Array.fill(n)(rng.nextInt(16))
+        val acts = Array.fill(n)(genAct(rng))
         val wt   = randomTernaryMatrix(rng, n, m)
         val beats = packBenchWeightBuffer(wt, n, m)
         runBenchFlow(dut, acts, beats, n, m) mustBe refMatmul(acts, wt, n, m)
@@ -300,13 +337,13 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
 
     "multi col tile: bench-style packing matches ref matmul (3 seeds)" in {
       Seq(7L, 42L, 256L).foreach { seed =>
-        simulate(mkCore) { dut =>
+        simulateRaw(mkTop) { dut =>
           resetDut(dut)
           val rng = new Random(seed)
           val numColTiles = 2 + rng.nextInt(2)             // 2..3
           val m = numColTiles * outLanesPerTile
           val n = 16 + rng.nextInt(33)                     // 16..48
-          val acts = Array.fill(n)(rng.nextInt(16))
+          val acts = Array.fill(n)(genAct(rng))
           val wt   = randomTernaryMatrix(rng, n, m)
           val beats = packBenchWeightBuffer(wt, n, m)
           val actual   = runBenchFlow(dut, acts, beats, n, m)
@@ -317,7 +354,7 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
     }
 
     "edge: negative-only accumulator wraps to outAccWidth correctly" in {
-      simulate(mkCore) { dut =>
+      simulateRaw(mkTop) { dut =>
         resetDut(dut)
         val n = 16
         val m = outLanesPerTile
@@ -334,7 +371,7 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
     }
 
     "regression guard: row-major (yesterday's bug) does NOT match reference" in {
-      simulate(mkCore) { dut =>
+      simulateRaw(mkTop) { dut =>
         resetDut(dut)
         val rng = new Random(1234L)
         val n = 16
@@ -356,5 +393,76 @@ class BenchMirrorSpec extends AnyFreeSpec with Matchers with ChiselSim {
         buggyOut must not equal expected
       }
     }
+
+    if (maxN >= 2816) {
+      "large non-pow2 inner dim (down_proj-like N=2816) matches ref matmul" in {
+        simulateRaw(mkTop) { dut =>
+          resetDut(dut)
+          val rng = new Random(2816L)
+          val n = 2816                       // MMfreeLM-370M down_proj inner dim
+          val m = outLanesPerTile            // one col tile keeps sim time sane
+          val acts = Array.fill(n)(genAct(rng))
+          val wt   = randomTernaryMatrix(rng, n, m)
+          val beats = packBenchWeightBuffer(wt, n, m)
+          runBenchFlow(dut, acts, beats, n, m) mustBe refMatmul(acts, wt, n, m)
+        }
+      }
+    }
+
+    if (numInPorts > 1) {
+      s"staggered port valids: $numInPorts-way join loses no beats" in {
+        simulateRaw(mkTop) { dut =>
+          resetDut(dut)
+          val rng = new Random(99L)
+          val numColTiles = 2
+          val m = numColTiles * outLanesPerTile
+          val n = 24
+          val acts = Array.fill(n)(genAct(rng))
+          val wt   = randomTernaryMatrix(rng, n, m)
+          val beats = packBenchWeightBuffer(wt, n, m)
+          val actual = runBenchFlow(dut, acts, beats, n, m, stagger = Some(rng))
+          actual mustBe refMatmul(acts, wt, n, m)
+        }
+      }
+    }
   }
 }
+
+/** K26_Bench geometry (aWidth=16, xDim=4). maxAcc / maxN / maxM scaled down
+  * for sim speed — the packing logic is identical at any size so a 2-3
+  * col-tile workload is sufficient to catch ordering bugs. */
+class BenchMirrorSpec extends BenchMirrorSpecBase(
+  geomName = "K26_Bench", aWidth = 16, maxAcc = 256, xDim = 4, maxN = 128, maxM = 128)
+
+/** K26_Bench16 geometry (aWidth=8, xDim=16 → 64-lane col tiles, 128-bit
+  * s_axis). maxAcc kept at the real 4096 so outAccWidth=20 / outLaneWidth=32
+  * match the deployed bitstream's m_axis packing exactly. maxM=192 fits the
+  * multi-tile test's worst case of 3 col tiles x 64 lanes. */
+class BenchMirror16Spec extends BenchMirrorSpecBase(
+  geomName = "K26_Bench16", aWidth = 8, maxAcc = 4096, xDim = 16, maxN = 128, maxM = 192)
+
+/** K26_Bench32 geometry (aWidth=8, xDim=32 → 256-bit s_axis split across N=2
+  * 128-bit ports). maxM=384 fits 3 col tiles x 128 lanes. */
+class BenchMirror32Spec extends BenchMirrorSpecBase(
+  geomName = "K26_Bench32", aWidth = 8, maxAcc = 4096, xDim = 32, maxN = 128, maxM = 384)
+
+/** K26_Bench64 geometry (aWidth=8, xDim=64 → 512-bit s_axis split across N=4
+  * 128-bit ports). maxM=768 fits 3 col tiles x 256 lanes. */
+class BenchMirror64Spec extends BenchMirrorSpecBase(
+  geomName = "K26_Bench64", aWidth = 8, maxAcc = 4096, xDim = 64, maxN = 128, maxM = 768)
+
+/** K26_MMFree370M geometry at FULL size (maxN=4096, maxM=32000) so the real
+  * register widths are elaborated (15-bit cmpCols, 125-col-tile counters,
+  * 4096-entry act BRAM) and the N=2816 non-pow2 inner dim (down_proj) runs
+  * through the 4-way port join. Datapath is otherwise BenchMirror64Spec's. */
+class BenchMirror370MSpec extends BenchMirrorSpecBase(
+  geomName = "K26_MMFree370M", aWidth = 8, maxAcc = 4096, xDim = 64, maxN = 4096, maxM = 32000)
+
+/** K26_MMFree370M_A16 geometry (aWidth=16, xDim=32 → 512-bit s_axis split across
+  * N=4 ports, SIGNED activations). Reduced maxN/maxM for sim speed; the point is
+  * to exercise the signed sign-extension path end-to-end through the 4-way join
+  * with negative activations (genAct returns [-2048,2047]). outLanesPerTile=256
+  * (=32*8), so maxM=512 spans 2 col tiles. */
+class BenchMirror370M_A16Spec extends BenchMirrorSpecBase(
+  geomName = "K26_MMFree370M_A16", aWidth = 16, maxAcc = 4096, xDim = 32,
+  maxN = 128, maxM = 768, signedAct = true)

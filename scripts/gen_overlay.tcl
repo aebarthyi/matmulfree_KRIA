@@ -1,33 +1,30 @@
-# scripts/gen_overlay.tcl — generate a K26_Bench device-tree overlay (+ bitstream
+# scripts/gen_overlay.tcl — generate the K26_Bench device-tree overlay (+ bitstream
 # + shell.json) from a Vivado-exported .xsa, ready for `xmutil loadapp`.
 #
+# Flow (mirrors the known-good manual process):
+#   1. xsct `createdts` generates pl.dtsi from the .xsa — this brings in the
+#      critical fragments a hand-written overlay misses:
+#        - &fpga_full  firmware-name        → fpga-manager actually programs the PL
+#        - clocking0 (xlnx,fclk)            → PL0_REF claimed, no clk_ignore_unused hack
+#        - afi0                             → PS↔PL AXI port-width config
+#        - CoreTop placeholder (generic-uio) + axi_dma node, with correct addrs/IRQs
+#   2. Patch firmware-name → core_bench.bit.bin.
+#   3. Append the three u-dma-buf nodes from udmabuf.dtsi.in.
+#   4. Compile with dtc.
+#
 # Usage:
-#   xsct gen_overlay.tcl <xsa_file> [<out_dir>] [-ip <name>] [-addr <hex>] [-irq <n>]
+#   xsct gen_overlay.tcl <xsa_file> [<out_dir>]
 #
-#   xsa_file       Path to the .xsa exported from Vivado (`File → Export → Hardware`).
-#   out_dir        Output directory (default: build/overlay).
-#   -ip <name>     Override the BD cell name for CoreTop (default: auto-detect).
-#   -addr <hex>    Override the CoreTop base address (e.g. 0xa0010000).
-#                  Useful if hsi auto-detect fails on your Vitis version.
-#   -irq <n>       Override the GIC SPI number (default: 89).
-#                  See `cat /proc/interrupts` on a working board, or look at
-#                  the Concat → ps_pl_irq wiring in your block design.
+# Environment:
+#   DT_BRANCH   device-tree-xlnx git branch for createdts.
+#               Default: xlnx_rel_v2024.1 (proven against XSCT 2024.1/2025.x).
+#   DT_REPO     local clone of device-tree-xlnx (skips network access).
 #
-# What it produces in <out_dir>:
-#   core_bench.bit    — bitstream extracted from the .xsa
-#   core_bench.dts    — populated overlay source (for inspection)
-#   core_bench.dtbo   — compiled overlay (consumed by xmutil)
-#   shell.json        — required by the Xilinx xmutil loader
-#
-# Deployment on the KRIA:
-#   sudo mkdir -p /lib/firmware/xilinx/core_bench
-#   sudo cp <out_dir>/{core_bench.bit,core_bench.dtbo,shell.json} \
-#           /lib/firmware/xilinx/core_bench/
-#   sudo xmutil unloadapp           # if anything is currently loaded
-#   sudo xmutil loadapp core_bench
+# Produces in <out_dir>:
+#   core_bench.bit / .dts / .dtbo / shell.json
 
 if {[llength $argv] < 1} {
-    puts stderr "Usage: xsct gen_overlay.tcl <xsa_file> \[<out_dir>\] \[-ip <name>\] \[-addr <hex>\] \[-irq <n>\]"
+    puts stderr "Usage: xsct gen_overlay.tcl <xsa_file> \[<out_dir>\]"
     exit 1
 }
 
@@ -37,134 +34,110 @@ if {![file exists $xsa_file]} {
     exit 1
 }
 
-# Defaults
-set out_dir   "build/overlay"
-set ip_name   ""
-set core_addr ""
-set core_irq  89
-
-# Parse remaining args. First positional (if it doesn't start with '-') is out_dir.
-set i 1
-if {[llength $argv] > 1} {
-    set next [lindex $argv 1]
-    if {[string index $next 0] ne "-"} { set out_dir $next; incr i }
+set out_dir "build/overlay"
+if {[llength $argv] > 1 && [string index [lindex $argv 1] 0] ne "-"} {
+    set out_dir [lindex $argv 1]
 }
-while {$i < [llength $argv]} {
-    set flag [lindex $argv $i]
-    set val  [lindex $argv [expr {$i + 1}]]
-    switch -- $flag {
-        "-ip"   { set ip_name   $val }
-        "-addr" { set core_addr $val }
-        "-irq"  { set core_irq  $val }
-        default { puts stderr "Unknown flag: $flag"; exit 1 }
-    }
-    incr i 2
-}
-
 set out_dir [file normalize $out_dir]
 file mkdir $out_dir
 
+set app "core_bench"
 set script_dir [file dirname [file normalize [info script]]]
-set template_path [file join $script_dir core_bench_overlay.dts.in]
-if {![file exists $template_path]} {
-    puts stderr "ERROR: template not found: $template_path"
+
+set dt_branch "xlnx_rel_v2024.1"
+if {[info exists ::env(DT_BRANCH)]} { set dt_branch $::env(DT_BRANCH) }
+
+# ─── 1. createdts: .xsa → pl.dtsi ──────────────────────────────────────
+set dts_work [file join $out_dir dts]
+file delete -force $dts_work
+
+set cmd [list createdts -hw $xsa_file -platform-name $app \
+             -git-branch $dt_branch -overlay -zocl -out $dts_work]
+if {[info exists ::env(DT_REPO)]} {
+    lappend cmd -local-repo $::env(DT_REPO)
+}
+puts ""
+puts "==> createdts ($dt_branch)"
+eval $cmd
+
+set pl_dtsi [file join $dts_work $app psu_cortexa53_0 device_tree_domain bsp pl.dtsi]
+if {![file exists $pl_dtsi]} {
+    puts stderr "ERROR: createdts did not produce $pl_dtsi"
     exit 1
 }
 
-puts ""
-puts "==> Opening .xsa: $xsa_file"
-set hw_design [hsi::open_hw_design $xsa_file]
+set fp [open $pl_dtsi r]; set dts [read $fp]; close $fp
 
-# ─── Locate CoreTop cell ───────────────────────────────────────────────
-if {$ip_name ne ""} {
-    set core_cell [hsi::get_cells $ip_name]
-    if {$core_cell eq ""} {
-        puts stderr "ERROR: cell '$ip_name' not found in design"
+# ─── 2. Patch firmware-name to the xmutil app name ─────────────────────
+regsub {firmware-name = "[^"]+";} $dts \
+    "firmware-name = \"$app.bit.bin\";" dts
+
+# Bind CoreTop to the generic-uio driver (createdts emits a placeholder
+# compatible like "xlnx,CoreTop-1.0").
+if {![regsub {compatible = "xlnx,CoreTop[^"]*";} $dts \
+        {compatible = "generic-uio";} dts]} {
+    puts stderr "ERROR: CoreTop placeholder node not found in generated pl.dtsi"
+    exit 1
+}
+
+# ─── 3. Append u-dma-buf nodes ─────────────────────────────────────────
+# NUM_DMA (exported by build_all.sh) sets the buffer count: one wt + one act
+# buffer per DMA/HP port. N==1 uses the static fragment with the legacy bare
+# names (udmabuf-act/wt/out); N>1 generates suffixed nodes udmabuf-act{i} /
+# udmabuf-wt{i} + the single udmabuf-out (output stays on DMA0's S2MM).
+set num_dma 1
+if {[info exists ::env(NUM_DMA)]} { set num_dma $::env(NUM_DMA) }
+
+if {$num_dma == 1} {
+    set frag_path [file join $script_dir udmabuf.dtsi.in]
+    if {![file exists $frag_path]} {
+        puts stderr "ERROR: fragment not found: $frag_path"
         exit 1
     }
+    set fp [open $frag_path r]; set frag [read $fp]; close $fp
 } else {
-    # Auto-detect by common names, then by VLNV substring.
-    set candidates [list "CoreTop_0" "mmfree_core_0" "CoreTop" "mmfree_core"]
-    set core_cell ""
-    foreach name $candidates {
-        set c [hsi::get_cells $name]
-        if {$c ne ""} { set core_cell $c; break }
+    # Default sizes mirror udmabuf.dtsi.in: act = maxN beats x 16B/port slice
+    # = 16 KiB, wt = 256 KiB (whole-stream worst case; per-port need is
+    # 256K/N), out = maxM * 4B = 4 KiB. Presets with bigger sweeps (e.g.
+    # k26_mmfree370m) override via UDMABUF_ACT_SZ / UDMABUF_WT_SZ /
+    # UDMABUF_OUT_SZ, exported by build_all.sh. Port i's act buffer is
+    # all-zero for i >= 1 (the LOAD stream only carries real data in the
+    # least-significant slice).
+    set act_sz 0x00004000
+    set wt_sz  0x00040000
+    set out_sz 0x00001000
+    if {[info exists ::env(UDMABUF_ACT_SZ)]} { set act_sz $::env(UDMABUF_ACT_SZ) }
+    if {[info exists ::env(UDMABUF_WT_SZ)]}  { set wt_sz  $::env(UDMABUF_WT_SZ)  }
+    if {[info exists ::env(UDMABUF_OUT_SZ)]} { set out_sz $::env(UDMABUF_OUT_SZ) }
+    set act_kib [expr {$act_sz / 1024}]
+    set wt_kib  [expr {$wt_sz  / 1024}]
+    set out_kib [expr {$out_sz / 1024}]
+    set frag "/* u-dma-buf nodes generated by gen_overlay.tcl for NUM_DMA=$num_dma */\n"
+    append frag "&{/} {\n"
+    for {set i 0} {$i < $num_dma} {incr i} {
+        append frag "    udmabuf_act$i: udmabuf-act$i {\n"
+        append frag "        compatible = \"ikwzm,u-dma-buf\";\n"
+        append frag "        size       = <[format 0x%08x $act_sz]>;   /* $act_kib KiB */\n"
+        append frag "    };\n\n"
+        append frag "    udmabuf_wt$i: udmabuf-wt$i {\n"
+        append frag "        compatible = \"ikwzm,u-dma-buf\";\n"
+        append frag "        size       = <[format 0x%08x $wt_sz]>;   /* $wt_kib KiB */\n"
+        append frag "    };\n\n"
     }
-    if {$core_cell eq ""} {
-        foreach c [hsi::get_cells] {
-            if {[catch { set vlnv [common::get_property VLNV $c] }]} { continue }
-            if {[string match "*:CoreTop:*" $vlnv] ||
-                [string match "*:mmfree_core:*" $vlnv]} {
-                set core_cell $c; break
-            }
-        }
-    }
-    if {$core_cell eq ""} {
-        puts stderr "ERROR: could not auto-detect CoreTop in .xsa. Pass -ip <name>."
-        puts stderr "       Available cells:"
-        foreach c [hsi::get_cells] { puts stderr "         $c" }
-        exit 1
-    }
+    append frag "    udmabuf_out: udmabuf-out {\n"
+    append frag "        compatible = \"ikwzm,u-dma-buf\";\n"
+    append frag "        size       = <[format 0x%08x $out_sz]>;   /* $out_kib KiB */\n"
+    append frag "    };\n"
+    append frag "};\n"
 }
-puts "    Core IP cell:  $core_cell"
+append dts "\n" $frag
 
-# ─── Extract base address ──────────────────────────────────────────────
-if {$core_addr eq ""} {
-    # Walk the A53's memory map; find the segment that points at our cell.
-    set found ""
-    if {[catch {
-        set cpu  [hsi::get_cells -hier "psu_cortexa53_0"]
-        set segs [hsi::get_mem_ranges -of_objects $cpu]
-        foreach s $segs {
-            set inst [common::get_property INSTANCE $s]
-            if {$inst eq $core_cell} {
-                set found [common::get_property BASE_VALUE $s]
-                break
-            }
-        }
-    } err]} {
-        puts "    (mem_range lookup failed: $err)"
-    }
-    if {$found eq ""} {
-        # Fallback: try the C_BASEADDR property
-        if {[catch { set found [common::get_property CONFIG.C_BASEADDR $core_cell] }]} {
-            set found ""
-        }
-    }
-    if {$found eq ""} {
-        puts stderr "ERROR: could not extract base address. Re-run with -addr <hex>."
-        exit 1
-    }
-    set core_addr $found
-}
-
-# Normalize address representations. Accept "0xa0010000", "a0010000", or decimal.
-if {[string match "0x*" $core_addr] || [string match "0X*" $core_addr]} {
-    scan [string range $core_addr 2 end] "%x" core_addr_int
-} elseif {[regexp {^[0-9]+$} $core_addr]} {
-    set core_addr_int $core_addr
-} else {
-    scan $core_addr "%x" core_addr_int
-}
-set addr_full [format "0x%x" $core_addr_int]
-set addr_hex  [format "%x"   $core_addr_int]
-puts "    Base address:  $addr_full"
-puts "    IRQ (SPI):     $core_irq"
-
-# ─── Substitute template ───────────────────────────────────────────────
-set fp [open $template_path r]; set tmpl [read $fp]; close $fp
-set out_dts_text [string map [list \
-    "@CORE_ADDR@"     $addr_full \
-    "@CORE_ADDR_HEX@" $addr_hex  \
-    "@CORE_IRQ@"      $core_irq  \
-] $tmpl]
-
-set out_dts [file join $out_dir core_bench.dts]
-set fp [open $out_dts w]; puts -nonewline $fp $out_dts_text; close $fp
+set out_dts [file join $out_dir $app.dts]
+set fp [open $out_dts w]; puts -nonewline $fp $dts; close $fp
 puts "==> Wrote $out_dts"
 
-# ─── Compile .dts → .dtbo via dtc ──────────────────────────────────────
-set out_dtbo [file join $out_dir core_bench.dtbo]
+# ─── 4. Compile .dts → .dtbo via dtc ───────────────────────────────────
+set out_dtbo [file join $out_dir $app.dtbo]
 if {[catch { exec dtc -@ -I dts -O dtb -o $out_dtbo $out_dts 2>@1 } dtc_msg]} {
     puts stderr "ERROR: dtc failed:\n$dtc_msg"
     exit 1
@@ -179,8 +152,8 @@ if {[catch { exec unzip -o $xsa_file -d $extract_dir 2>@1 } unz_msg]} {
 } else {
     set bits [glob -nocomplain [file join $extract_dir "*.bit"]]
     if {[llength $bits] > 0} {
-        file copy -force [lindex $bits 0] [file join $out_dir core_bench.bit]
-        puts "==> Extracted core_bench.bit"
+        file copy -force [lindex $bits 0] [file join $out_dir $app.bit]
+        puts "==> Extracted $app.bit"
     } else {
         puts "WARN: no .bit found inside .xsa; you may need bootgen to produce .bit.bin"
     }
@@ -196,14 +169,4 @@ close $fp
 puts "==> Wrote shell.json"
 
 puts ""
-puts "Done. Deploy on the KRIA with:"
-puts "    sudo mkdir -p /lib/firmware/xilinx/core_bench"
-puts "    sudo cp $out_dir/core_bench.bit \\"
-puts "            $out_dir/core_bench.dtbo \\"
-puts "            $out_dir/shell.json \\"
-puts "            /lib/firmware/xilinx/core_bench/"
-puts "    sudo xmutil unloadapp || true"
-puts "    sudo xmutil loadapp core_bench"
-puts ""
-
-catch { hsi::close_hw_design $hw_design }
+puts "Done. Deploy on the KRIA with transfer/deploy_kria.sh"

@@ -39,7 +39,8 @@ class SystolicArrayOutputBundle(val aWidth: Int, val maxAcc: Int, val xDim: Int,
   *   - Back-to-back: PE.scala leaves accumCounter/accumReg dirty on done→idle,
   *     so callers must hard-reset between successive operations.
   */
-class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int) extends Module {
+class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int,
+                    val signedAct: Boolean = false) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0, "aWidth must be even and >= 2")
     require(maxAcc >= 2, "maxAcc must be >= 2")
     require(xDim >= 1, "xDim must be >= 1")
@@ -50,7 +51,7 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
 
     val nLanes = aWidth / 2
 
-    val arr = Seq.tabulate(yDim, xDim) { (_, _) => Module(new PE(aWidth, maxAcc)) }
+    val arr = Seq.tabulate(yDim, xDim) { (_, _) => Module(new PE(aWidth, maxAcc, signedAct)) }
 
     val nAccReg = Reg(UInt(log2Ceil(maxAcc).W))
 

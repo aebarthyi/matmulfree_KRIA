@@ -373,7 +373,7 @@ class PESpec extends AnyFreeSpec with Matchers with ChiselSim {
       }
     }
 
-    "input ready deasserts on final accumulation cycle" in {
+    "input ready stays high through the final beat, deasserts in done" in {
       val aWidth = 8
       val maxAcc = 64
       val numLanes = aWidth / 2
@@ -384,19 +384,58 @@ class PESpec extends AnyFreeSpec with Matchers with ChiselSim {
         dut.input.valid.poke(true.B)
         dut.output.ready.poke(false.B)
 
-        // First cycle (idle→running)
-        pokeInput(dut, Seq.fill(numLanes)(1), 1, nAcc)
-        dut.clock.step()
-
-        // Middle cycles: input.ready should be true
-        for (cycle <- 1 until nAcc - 1) {
-          dut.input.ready.expect(true.B, s"ready should be true on cycle $cycle")
+        // Every beat — including the final one — is a clean valid&&ready handshake.
+        for (cycle <- 0 until nAcc) {
+          dut.input.ready.expect(true.B, s"ready should be true on beat $cycle")
           pokeInput(dut, Seq.fill(numLanes)(1), 1, nAcc)
           dut.clock.step()
         }
 
-        // Final accumulation cycle: input.ready should be false (counter === nAccReg)
-        dut.input.ready.expect(false.B, "ready should deassert on final accumulation cycle")
+        // Done: output pending, no further input accepted until it drains.
+        dut.input.valid.poke(false.B)
+        dut.output.valid.expect(true.B, "output valid after nAcc handshaken beats")
+        dut.input.ready.expect(false.B, "ready should deassert in done state")
+      }
+    }
+
+    "valid gap on the final accumulation cycle stalls — no phantom beat" in {
+      val aWidth = 8
+      val maxAcc = 64
+      val numLanes = aWidth / 2
+      simulate(new PE(aWidth, maxAcc)) { dut =>
+        resetDut(dut)
+        val nAcc = 4
+        val weights     = Seq.fill(nAcc)(Seq.fill(numLanes)(1))
+        val activations = Seq(3, 5, 7, 11)
+        val expected    = PEModel.compute(aWidth, maxAcc, weights, activations)
+
+        dut.input.valid.poke(true.B)
+        dut.output.ready.poke(false.B)
+        for (cycle <- 0 until nAcc - 1) {
+          pokeInput(dut, weights(cycle), activations(cycle), nAcc)
+          dut.clock.step()
+        }
+
+        // Gap right where the final beat is due, with garbage on the bus. The
+        // old PE grabbed the bus contents without a handshake here and finished
+        // one beat early, desyncing the upstream stream.
+        dut.input.valid.poke(false.B)
+        pokeInput(dut, Seq.fill(numLanes)(3), 99, nAcc)
+        for (_ <- 0 until 3) {
+          dut.clock.step()
+          dut.output.valid.expect(false.B, "PE must stall through the gap, not complete")
+        }
+
+        // Resume with the real final beat: clean handshake, correct result.
+        dut.input.valid.poke(true.B)
+        pokeInput(dut, weights(nAcc - 1), activations(nAcc - 1), nAcc)
+        dut.input.ready.expect(true.B, "ready should be high for the resumed final beat")
+        dut.clock.step()
+        dut.input.valid.poke(false.B)
+        dut.output.valid.expect(true.B, "output valid after the real final beat")
+        for (lane <- 0 until numLanes) {
+          dut.output.bits.accum(lane).expect(expected(lane).U, s"lane $lane")
+        }
       }
     }
 
@@ -489,6 +528,98 @@ class PESpec extends AnyFreeSpec with Matchers with ChiselSim {
           activations = Seq.fill(4)(7)
         )
         // Each lane in op 3 should be exactly 28.
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Signed-activation mode (signedAct = true)
+  // ---------------------------------------------------------------
+
+  "PE signed-activation mode" - {
+
+    /** Signed reference: activations are signed ints, accumulator wraps mod 2^outWidth. */
+    def signedRef(aWidth: Int, maxAcc: Int, weights: Seq[Seq[Int]], acts: Seq[Int]): Seq[BigInt] = {
+      val numLanes = aWidth / 2
+      val mod = BigInt(1) << (log2Ceil(maxAcc) + aWidth)
+      val accum = Array.fill(numLanes)(BigInt(0))
+      for (c <- acts.indices; lane <- 0 until numLanes) weights(c)(lane) match {
+        case 1 => accum(lane) += acts(c)
+        case 3 => accum(lane) -= acts(c)
+        case _ =>
+      }
+      accum.map(v => ((v % mod) + mod) % mod).toSeq
+    }
+
+    /** Two's-complement of a signed int in aWidth bits, for poking the bus. */
+    def tc(a: Int, aWidth: Int): BigInt = BigInt(a) & ((BigInt(1) << aWidth) - 1)
+
+    def runSigned(dut: PE, aWidth: Int, maxAcc: Int, weights: Seq[Seq[Int]], acts: Seq[Int]): Unit = {
+      val numLanes = aWidth / 2
+      val expected = signedRef(aWidth, maxAcc, weights, acts)
+      dut.input.valid.poke(true.B); dut.output.ready.poke(false.B)
+      for (c <- acts.indices) {
+        weights(c).zipWithIndex.foreach { case (w, i) => dut.input.bits.weights_i(i).poke(w.U) }
+        dut.input.bits.activation_i.poke(tc(acts(c), aWidth).U)
+        dut.input.bits.nAcc.poke(acts.length.U)
+        dut.clock.step()
+      }
+      dut.input.valid.poke(false.B)
+      dut.output.valid.expect(true.B)
+      for (lane <- 0 until numLanes)
+        dut.output.bits.accum(lane).expect(expected(lane).U, s"lane $lane: expected ${expected(lane)}")
+      dut.output.ready.poke(true.B); dut.clock.step()
+    }
+
+    "negative activations accumulate as signed (add path)" in {
+      val aWidth = 8; val maxAcc = 64; val numLanes = aWidth / 2
+      simulate(new PE(aWidth, maxAcc, signedAct = true)) { dut =>
+        resetDut(dut)
+        val acts = Seq(-5, 10, -3, 7)                      // sum = +9
+        runSigned(dut, aWidth, maxAcc, Seq.fill(4)(Seq.fill(numLanes)(1)), acts)
+      }
+    }
+
+    "negative activation with subtract weight (−1 × −x = +x)" in {
+      val aWidth = 8; val maxAcc = 64; val numLanes = aWidth / 2
+      simulate(new PE(aWidth, maxAcc, signedAct = true)) { dut =>
+        resetDut(dut)
+        val acts = Seq(-50, -30)                           // both subtracted: -(-50)-(-30)=+80
+        runSigned(dut, aWidth, maxAcc, Seq.fill(2)(Seq.fill(numLanes)(3)), acts)
+      }
+    }
+
+    "full int16 signed range, mixed weights" in {
+      val aWidth = 16; val maxAcc = 1024; val numLanes = aWidth / 2
+      simulate(new PE(aWidth, maxAcc, signedAct = true)) { dut =>
+        resetDut(dut)
+        val rng = new Random(31337)
+        val nAcc = 20
+        val weights = Seq.fill(nAcc)(Seq.fill(numLanes)(randWeight(rng)))
+        val acts = Seq.fill(nAcc)(rng.nextInt(1 << aWidth) - (1 << (aWidth - 1)))  // [-32768,32767]
+        runSigned(dut, aWidth, maxAcc, weights, acts)
+      }
+    }
+
+    "same negative bit pattern differs signed vs unsigned" in {
+      val aWidth = 8; val maxAcc = 64; val numLanes = aWidth / 2
+      val weights = Seq.fill(3)(Seq.fill(numLanes)(1))   // all add
+      val acts = Seq(-1, -1, -1)                          // bit pattern 0xFF each
+      // unsigned PE sees 255 each -> 765; signed sees -1 each -> -3 (mod 2^14)
+      simulate(new PE(aWidth, maxAcc, signedAct = false)) { dut =>
+        resetDut(dut)
+        dut.input.valid.poke(true.B); dut.output.ready.poke(false.B)
+        for (_ <- 0 until 3) {
+          (0 until numLanes).foreach(i => dut.input.bits.weights_i(i).poke(1.U))
+          dut.input.bits.activation_i.poke(255.U); dut.input.bits.nAcc.poke(3.U); dut.clock.step()
+        }
+        dut.input.valid.poke(false.B)
+        dut.output.bits.accum(0).expect((255 * 3).U)
+        dut.output.ready.poke(true.B); dut.clock.step()
+      }
+      simulate(new PE(aWidth, maxAcc, signedAct = true)) { dut =>
+        resetDut(dut)
+        runSigned(dut, aWidth, maxAcc, weights, acts)   // expects (-3) mod 2^14
       }
     }
   }

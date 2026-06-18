@@ -1,0 +1,11 @@
+AxiInstructionHandler.sv
+PE.sv
+SystolicArray.sv
+ram_2x528.sv
+Queue2_StreamBeat.sv
+ram_2x33.sv
+Queue2_OutBeat.sv
+actBram_0_4096x16.sv
+outBram_0_32000x28.sv
+Core.sv
+CoreTop.sv

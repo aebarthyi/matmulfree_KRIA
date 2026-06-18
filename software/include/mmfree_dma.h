@@ -63,12 +63,32 @@ static inline void mmfree_dma_wr(volatile void *regs, uint32_t off, uint32_t v) 
     *(volatile uint32_t *)((char *)regs + off) = v;
 }
 
-/* Soft-reset both channels. Spin until RESET bit self-clears. */
-static inline void mmfree_dma_reset(volatile void *regs) {
+/* All register spins are bounded so a wedged engine (or unprogrammed PL)
+ * turns into an error return instead of a silent hang. Each /dev/mem read is
+ * roughly a microsecond, so ~10M iterations ≈ 10 s — far beyond any legal
+ * completion time for the bench shapes. */
+#define MMFREE_DMA_SPIN_LIMIT   10000000u
+
+/* Soft-reset the MM2S channel only. For MM2S-only DMA instances (DMAs 1..N-1
+ * in the multi-HP-port topology, built with c_include_s2mm=0) whose S2MM
+ * register block does not exist. Returns 0 on ok, -1 on timeout. */
+static inline int mmfree_dma_mm2s_reset(volatile void *regs) {
+    uint32_t spins;
     mmfree_dma_wr(regs, AXI_DMA_MM2S_DMACR, DMACR_RESET);
-    while (mmfree_dma_rd(regs, AXI_DMA_MM2S_DMACR) & DMACR_RESET) { }
+    for (spins = 0; mmfree_dma_rd(regs, AXI_DMA_MM2S_DMACR) & DMACR_RESET; spins++)
+        if (spins >= MMFREE_DMA_SPIN_LIMIT) return -1;
+    return 0;
+}
+
+/* Soft-reset both channels. Spin until RESET bit self-clears.
+ * Returns 0 on ok, -1 if a channel never came out of reset. */
+static inline int mmfree_dma_reset(volatile void *regs) {
+    uint32_t spins;
+    if (mmfree_dma_mm2s_reset(regs) < 0) return -1;
     mmfree_dma_wr(regs, AXI_DMA_S2MM_DMACR, DMACR_RESET);
-    while (mmfree_dma_rd(regs, AXI_DMA_S2MM_DMACR) & DMACR_RESET) { }
+    for (spins = 0; mmfree_dma_rd(regs, AXI_DMA_S2MM_DMACR) & DMACR_RESET; spins++)
+        if (spins >= MMFREE_DMA_SPIN_LIMIT) return -1;
+    return 0;
 }
 
 /* Start an MM2S transfer of `bytes` from physical address `pa`. Returns 0 on ok.
@@ -76,10 +96,12 @@ static inline void mmfree_dma_reset(volatile void *regs) {
  * bytes are drained or upstream tready falls. Poll mmfree_dma_mm2s_wait() for
  * idle. */
 static inline int mmfree_dma_mm2s_start(volatile void *regs, uint64_t pa, uint32_t bytes) {
+    uint32_t spins;
     /* Bring channel out of halt by setting RS. */
     mmfree_dma_wr(regs, AXI_DMA_MM2S_DMACR, DMACR_RS);
     /* Wait for !halted. */
-    while (mmfree_dma_rd(regs, AXI_DMA_MM2S_DMASR) & DMASR_HALTED) { }
+    for (spins = 0; mmfree_dma_rd(regs, AXI_DMA_MM2S_DMASR) & DMASR_HALTED; spins++)
+        if (spins >= MMFREE_DMA_SPIN_LIMIT) return -1;
 
     mmfree_dma_wr(regs, AXI_DMA_MM2S_SA,     (uint32_t)(pa & 0xFFFFFFFFu));
     mmfree_dma_wr(regs, AXI_DMA_MM2S_SA_MSB, (uint32_t)(pa >> 32));
@@ -88,20 +110,24 @@ static inline int mmfree_dma_mm2s_start(volatile void *regs, uint64_t pa, uint32
     return 0;
 }
 
-/* Wait for MM2S idle. Returns 0 on clean completion, -1 on DMA error. */
+/* Wait for MM2S idle. Returns 0 on clean completion, -1 on DMA error,
+ * -2 on timeout (engine still busy — upstream/downstream stall). */
 static inline int mmfree_dma_mm2s_wait(volatile void *regs) {
-    uint32_t sr;
+    uint32_t sr, spins = 0;
     do {
         sr = mmfree_dma_rd(regs, AXI_DMA_MM2S_DMASR);
         if (sr & DMASR_ANY_ERR) return -1;
+        if (spins++ >= MMFREE_DMA_SPIN_LIMIT) return -2;
     } while (!(sr & DMASR_IDLE));
     return 0;
 }
 
 /* Same pair for S2MM. */
 static inline int mmfree_dma_s2mm_start(volatile void *regs, uint64_t pa, uint32_t bytes) {
+    uint32_t spins;
     mmfree_dma_wr(regs, AXI_DMA_S2MM_DMACR, DMACR_RS);
-    while (mmfree_dma_rd(regs, AXI_DMA_S2MM_DMASR) & DMASR_HALTED) { }
+    for (spins = 0; mmfree_dma_rd(regs, AXI_DMA_S2MM_DMASR) & DMASR_HALTED; spins++)
+        if (spins >= MMFREE_DMA_SPIN_LIMIT) return -1;
 
     mmfree_dma_wr(regs, AXI_DMA_S2MM_DA,     (uint32_t)(pa & 0xFFFFFFFFu));
     mmfree_dma_wr(regs, AXI_DMA_S2MM_DA_MSB, (uint32_t)(pa >> 32));
@@ -110,10 +136,11 @@ static inline int mmfree_dma_s2mm_start(volatile void *regs, uint64_t pa, uint32
 }
 
 static inline int mmfree_dma_s2mm_wait(volatile void *regs) {
-    uint32_t sr;
+    uint32_t sr, spins = 0;
     do {
         sr = mmfree_dma_rd(regs, AXI_DMA_S2MM_DMASR);
         if (sr & DMASR_ANY_ERR) return -1;
+        if (spins++ >= MMFREE_DMA_SPIN_LIMIT) return -2;
     } while (!(sr & DMASR_IDLE));
     return 0;
 }

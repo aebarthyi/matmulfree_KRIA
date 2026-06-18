@@ -66,6 +66,50 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       c.outBeatWidth  mustBe 1024
     }
 
+    "K26_MMFree370M covers every MMfreeLM-370M projection shape" in {
+      val c = CoreConfig.K26_MMFree370M
+      c.xDim          mustBe 64
+      c.batchSize     mustBe 1
+      c.numInPorts    mustBe 4      // all 4 HP ports
+      c.inPortWidth   mustBe 128
+      c.axisDataWidth mustBe 512
+      c.outBeatWidth  mustBe 32     // output stays on DMA0's 32-bit S2MM
+      // Distinct (N inner, M out) projections of the 370M model — each must
+      // fit the config and land tile-aligned (no padding lanes).
+      val shapes = Seq(
+        (1024, 1024),   // i/f/g/o_proj
+        (1024, 5632),   // fused gate_up
+        (2816, 1024),   // down_proj
+        (1024, 32000)   // lm_head
+      )
+      shapes.foreach { case (n, m) =>
+        withClue(s"projection ${n}x$m") {
+          n must be <= c.maxN
+          n must be <= c.maxAcc
+          m must be <= c.maxM
+          m % c.outLanesPerTile mustBe 0
+        }
+      }
+    }
+
+    "K26_MMFree370M_A16 is the signed int16 sibling, same output geometry" in {
+      val a16 = CoreConfig.K26_MMFree370M_A16
+      val a8  = CoreConfig.K26_MMFree370M
+      a16.aWidth        mustBe 16
+      a16.xDim          mustBe 32
+      a16.signedAct     mustBe true
+      a16.numInPorts    mustBe 4          // still all 4 HP ports
+      a16.axisDataWidth mustBe 512
+      // identical compute width + output format to the int8 preset
+      a16.outLanesPerTile mustBe a8.outLanesPerTile   // 256 either way
+      a16.outBeatWidth    mustBe a8.outBeatWidth       // 32-bit m_axis unchanged
+      a16.outLaneWidth    mustBe 32                     // nextPow2(28)
+      // every projection still fits + tile-aligned
+      Seq((1024,1024),(1024,5632),(2816,1024),(1024,32000)).foreach { case (n,m) =>
+        withClue(s"${n}x$m") { (m % a16.outLanesPerTile) mustBe 0; n must be <= a16.maxN }
+      }
+    }
+
     "rejects maxN > maxAcc" in {
       assertThrows[IllegalArgumentException] {
         CoreConfig(maxAcc = 16, maxN = 32)
