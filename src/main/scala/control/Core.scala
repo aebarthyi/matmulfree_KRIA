@@ -119,14 +119,21 @@ class Core(
 
     // ─── On-chip storage ──────────────────────────────────────────────────────
     val actBram = SyncReadMem(maxN, Vec(batchSize, UInt(aWidth.W)))
-    val outBram = SyncReadMem(outBramRows, Vec(effOutBeatLanes, SInt(outAccWidth.W)))
-
     val actRdAddr = Wire(UInt(log2Ceil(maxN).W))
-    val outRdAddr = Wire(UInt(log2Ceil(outBramRows).W))
     actRdAddr := 0.U
-    outRdAddr := 0.U
     val actRdData = actBram.read(actRdAddr)
-    val outRdData = outBram.read(outRdAddr)
+
+    // Output-memory port wires. The implementation (BRAM SyncReadMem vs URAM
+    // BlackBox) is selected by `outRamStyle` in the STORE section below; both
+    // present `outRdData` delayed by `outReadLat`, advanced/gated by `outRdEn`.
+    // The drain engine drives the write port.
+    val outRdAddr = Wire(UInt(log2Ceil(outBramRows).W)); outRdAddr := 0.U
+    val outRdEn   = WireDefault(false.B)
+    val outWrEn   = WireDefault(false.B)
+    val outWrAddr = WireDefault(0.U(log2Ceil(outBramRows).W))
+    val outWrData = Wire(Vec(effOutBeatLanes, SInt(outAccWidth.W)))
+    outWrData := VecInit(Seq.fill(effOutBeatLanes)(0.S(outAccWidth.W)))
+    val outRdData = Wire(Vec(effOutBeatLanes, SInt(outAccWidth.W)))
 
     // ─── 250 MHz pipeline stages ──────────────────────────────────────────────
     // Both failing paths at 250 MHz started at a BRAM read and ended across the
@@ -149,6 +156,19 @@ class Core(
     inQ.io.enq.valid := false.B
     inQ.io.enq.bits  := DontCare
     inQ.io.deq.ready := false.B
+
+    // Array-feed source. Batched cores (yDim=B) double the PE grid, lengthening
+    // the inQ-read -> PE-accumulate path (the -0.39 ns path at B=2). A 1-deep
+    // registered slice (pipe=true keeps full throughput) terminates the inQ
+    // distributed-RAM read at a register so the accumulate starts fresh. B=1
+    // keeps the direct path (validated, closes timing) untouched. The uniform
+    // 1-cycle delay on every beat is functionally transparent (nAcc unchanged).
+    // Flushed with inQ (below) so stray streamed beats can't cross into the next op.
+    val armSlice = if (batchSize > 1)
+      Some(Module(new Queue(new StreamBeat, entries = 1, pipe = true, flow = false, hasFlush = true)))
+    else None
+    armSlice.foreach { s => s.io.enq <> inQ.io.deq; s.io.deq.ready := false.B }
+    val armSrc = armSlice.map(_.io.deq).getOrElse(inQ.io.deq)
 
     // `outQ` decouples the store path; it keeps draining to m_axis after the
     // FSM returns to sIdle (the runtime waits for S2MM idle, not just the
@@ -183,6 +203,7 @@ class Core(
     outQ.io.deq.ready := m_axis.tready
 
     inQ.io.flush.get := (state === sIdle)
+    armSlice.foreach { _.io.flush.get := (state === sIdle) }
 
     arr.input.weights_i.valid    := false.B
     arr.input.weights_i.bits     := VecInit(Seq.fill(outLanesPerTile)(0.U(2.W)))
@@ -214,12 +235,61 @@ class Core(
     val drainSubCtr     = RegInit(0.U(log2Ceil(outSubBeats + 1).W))
     val drainBatchCtr   = RegInit(0.U(log2Ceil(batchSize + 1).W))
     val drainColTile    = Reg(UInt(log2Ceil(numColTilesMax + 1).W))
+    // Counts down the OutMemUltra write-pipeline flush after drainBusy falls, so
+    // completion (cDone) waits for the last write to land in the URAM. 0-effect
+    // when outWriteLat==0 (B=1 / BRAM path). See outWriteLat below.
+    val drainFlush      = RegInit(0.U(log2Ceil(2).W))
 
-    // STORE
+    // STORE — output memory + read pipeline.
+    // The deep outBram maps to a memory read cascade (~7 hops at 370M sizes) that
+    // eats the 4 ns budget. `outReadLat` registered read stages let the cascade
+    // pipeline so STORE closes 250 MHz; the store latency is hidden (drained while
+    // the next op streams), so it is free. Batched cores deepen outBram
+    // (B*tiles*subBeats) and use a URAM BlackBox (ram_style="ultra"): its internal
+    // pipeline packs into the URAM cascade AND it frees the BRAMs (needed for B>=4).
+    // B=1 keeps the BRAM SyncReadMem path (validated) untouched.
+    val outRamStyle = if (batchSize > 1) "ultra" else "block"
+    val outReadLat  = if (batchSize > 1) 4 else 2
+    require(outReadLat >= 2, s"outReadLat=$outReadLat must be >= 2")
+    // Extra registered write stages inside OutMemUltra (ultra path only). The
+    // deep batched outBram's write-address arithmetic → URAM is the 250 MHz
+    // critical path at B>=6; pipelining the write port terminates it at a flop
+    // adjacent to the URAM. The drain writes during COMPUTE and reads happen in a
+    // later STORE, so the latency is hidden — but the drain-completion gate
+    // (cDone) must wait these extra cycles so a STORE off the IRQ sees it landed.
+    val outWriteLat = if (outRamStyle == "ultra") 1 else 0
+    require(outWriteLat <= 1, s"outWriteLat=$outWriteLat: widen drainFlush before raising this")
     val storeTotalBeats   = Reg(UInt(log2Ceil(outBramRows + 1).W))
     val storeBeatCtr      = RegInit(0.U(log2Ceil(outBramRows + 1).W))
-    val storePrimed       = RegInit(false.B)
-    val outDataReg        = Reg(Vec(effOutBeatLanes, SInt(outAccWidth.W)))
+    val rdPtr             = RegInit(0.U(log2Ceil(outBramRows + outReadLat + 1).W))
+    val primeCtr          = RegInit(0.U(log2Ceil(outReadLat + 1).W))
+
+    // Output-memory implementation. Both forms expose the wires declared above:
+    // a write port (drain) and an `outReadLat`-deep, `outRdEn`-gated read.
+    if (outRamStyle == "ultra") {
+        // URAM BlackBox — pipeline registers live inside so they pack into the
+        // URAM cascade (external regs would SRL-optimize and never pipeline it).
+        val mem = Module(new OutMemUltra(outBramRows, effOutBeatLanes * outAccWidth, outReadLat, writeLat = outWriteLat.max(1)))
+        mem.io.clk   := clock
+        mem.io.wen   := outWrEn
+        mem.io.waddr := outWrAddr
+        mem.io.wdata := outWrData.asUInt
+        mem.io.ren   := outRdEn
+        mem.io.raddr := outRdAddr
+        outRdData := mem.io.rdata.asTypeOf(outRdData)
+    } else {
+        // BRAM SyncReadMem + an external register pipeline (outReadLat-1 stages
+        // after the 1-cycle synchronous read), gated by outRdEn.
+        val outBram = SyncReadMem(outBramRows, Vec(effOutBeatLanes, SInt(outAccWidth.W)))
+        when(outWrEn) { outBram.write(outWrAddr, outWrData) }
+        val raw  = outBram.read(outRdAddr, outRdEn)
+        val pipe = Reg(Vec(outReadLat - 1, Vec(effOutBeatLanes, SInt(outAccWidth.W))))
+        when(outRdEn) {
+            pipe(0) := raw
+            for (i <- 1 until outReadLat - 1) pipe(i) := pipe(i - 1)
+        }
+        outRdData := pipe(outReadLat - 2)
+    }
 
     // ─── sIdle: accept the next command ──────────────────────────────────────
     when(state === sIdle) {
@@ -242,6 +312,8 @@ class Core(
         }.elsewhen(handler.store.fire) {
             storeTotalBeats   := handler.store.bits.len / effOutBeatLanes.U
             storeBeatCtr      := 0.U
+            rdPtr             := 0.U
+            primeCtr          := outReadLat.U   // fill the read pipeline before emitting
             state             := sStore
         }
     }
@@ -309,13 +381,13 @@ class Core(
                 val outPending = arr.output.valid
                 val capture    = outPending && !drainBusy
 
-                arr.input.weights_i.valid    := inQ.io.deq.valid && !outPending
-                arr.input.weights_i.bits     := inQ.io.deq.bits.weights
-                arr.input.activation_i.valid := inQ.io.deq.valid && !outPending
-                arr.input.activation_i.bits  := inQ.io.deq.bits.act
+                arr.input.weights_i.valid    := armSrc.valid && !outPending
+                arr.input.weights_i.bits     := armSrc.bits.weights
+                arr.input.activation_i.valid := armSrc.valid && !outPending
+                arr.input.activation_i.bits  := armSrc.bits.act
                 arr.input.nAcc.valid         := !outPending
                 arr.input.nAcc.bits          := cmpRows
-                inQ.io.deq.ready             := arr.input.weights_i.ready && !outPending
+                armSrc.ready                 := arr.input.weights_i.ready && !outPending
 
                 when(capture) {
                     tileAccums       := arr.output.bits.accum.asTypeOf(tileAccums)
@@ -347,7 +419,8 @@ class Core(
             is(cDone) {
                 // Hold the completion until the last tile's drain has landed
                 // in outBram — a host could issue STORE right off the IRQ.
-                when(!drainBusy) {
+                // drainFlush covers the OutMemUltra write-pipeline depth.
+                when(!drainBusy && drainFlush === 0.U) {
                     handler.computeDone := true.B
                     state               := sIdle
                 }
@@ -368,7 +441,9 @@ class Core(
         }
         val entryIdx = drainBatchCtr * numColTiles + drainColTile
         val rowAddr  = (entryIdx * outSubBeats.U + drainSubCtr)(log2Ceil(outBramRows) - 1, 0)
-        outBram.write(rowAddr, writeVec)
+        outWrEn   := true.B
+        outWrAddr := rowAddr
+        outWrData := writeVec
 
         for (i <- 0 until totalTileLanes) {
             tileAccums(i) := (if (i + effOutBeatLanes < totalTileLanes)
@@ -390,29 +465,40 @@ class Core(
         }
     }
 
+    // While draining, keep the flush counter primed; once drainBusy falls, count
+    // down the OutMemUltra write-pipeline depth so the last write has landed
+    // before cDone signals completion (the URAM write port is `outWriteLat`-deep).
+    when(drainBusy) {
+        drainFlush := outWriteLat.U
+    }.elsewhen(drainFlush =/= 0.U) {
+        drainFlush := drainFlush - 1.U
+    }
+
     // ─── sStore: stream outBram rows (one per m_axis beat) via outQ ──────────
-    // Rows are exactly one beat wide and laid out in stream order, so the walk
-    // is a flat row counter — no sub-beat lane mux. The read is 2-cycle:
-    // `outDataReg` sits between the BRAM and outQ so Vivado can absorb it into
-    // the final RAMB36's DOUT register — the deep memory maps to a BRAM
-    // cascade chain (~7 hops at the 370M sizes) that otherwise eats the whole
-    // 4 ns budget before the data even reaches fabric. The first sStore cycle
-    // primes the register (no beat emitted); after that the invariant is
-    // outDataReg = row[storeBeatCtr] and outRdData = row[storeBeatCtr + 1].
-    // m_axis drains outQ unconditionally — including the 1-2 tail beats after
-    // storeDone fires.
+    // Rows are exactly one beat wide and laid out in stream order, so the walk is
+    // a flat row counter — no sub-beat lane mux. The read is `outReadLat`-deep
+    // (inside the memory block above) so the tool pipelines the deep read cascade.
+    // `rdPtr` issues addresses, leading the emitted beat by `outReadLat`;
+    // `primeCtr` counts down the fill cycles before the first beat is valid;
+    // `outRdEn` advances/gates the read pipeline (freezes the whole read on a
+    // stall). m_axis drains outQ unconditionally — including the tail beats in
+    // flight after storeDone fires.
     when(state === sStore) {
-        val fire = outQ.io.enq.ready && storePrimed
-        outRdAddr := Mux(fire, storeBeatCtr + 2.U, storeBeatCtr + 1.U)(log2Ceil(outBramRows) - 1, 0)
-        when(!storePrimed || fire) {
-            outDataReg := outRdData
+        val primed = primeCtr === 0.U
+        val fire   = outQ.io.enq.ready && primed
+        val adv    = !primed || fire          // advance the read pipeline this cycle
+
+        outRdAddr := rdPtr(log2Ceil(outBramRows) - 1, 0)
+        outRdEn   := adv
+        when(adv) {
+            rdPtr := rdPtr + 1.U
+            when(!primed) { primeCtr := primeCtr - 1.U }
         }
-        storePrimed := true.B
 
         // Each lane is sign-extended from outAccWidth to outLaneWidth so the
         // beat width hits a clean power of two.
-        val laneBits = VecInit(outDataReg.map(_.pad(outLaneWidth).asUInt))
-        outQ.io.enq.valid      := storePrimed
+        val laneBits = VecInit(outRdData.map(_.pad(outLaneWidth).asUInt))
+        outQ.io.enq.valid      := primed
         outQ.io.enq.bits.tdata := Cat(laneBits.reverse)
         outQ.io.enq.bits.tlast := (storeBeatCtr + 1.U) === storeTotalBeats
 
@@ -422,7 +508,6 @@ class Core(
             when(nextBeat === storeTotalBeats) {
                 handler.storeDone := true.B
                 state             := sIdle
-                storePrimed       := false.B
             }
         }
     }

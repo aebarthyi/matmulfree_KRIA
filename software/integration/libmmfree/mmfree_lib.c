@@ -11,9 +11,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "mmfree_lib.h"
 #include "mmfree_runtime.h"
+
+/* Monotonic nanosecond clock for the per-phase timers. Reads go through the
+ * vDSO (no syscall), so the ~6 reads per bitlinear call are cheap relative to
+ * the IRQ round-trips they bracket. */
+static inline uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 /* ---- pure-software helpers (no hardware; unit-tested on the host) ---- */
 
@@ -26,6 +36,22 @@ void mmfree_pack_act_beat(volatile uint8_t *dst, int32_t value,
     uint32_t u = (uint32_t)value;
     for (uint32_t b = 0; b < nbytes; b++)
         dst[b] = (b < abytes) ? (uint8_t)((u >> (b * 8)) & 0xFFu) : 0u;
+}
+
+/* Pack one batched LOAD beat: `batch` activations, row r in bytes
+ * [r*abytes, (r+1)*abytes) (two's complement, little-endian), the tail
+ * [batch*abytes, nbytes) zeroed. Row layout mirrors Core.scala sLoad's
+ * tdata((r+1)*aWidth-1, r*aWidth) unpack across the joined ports. Caller
+ * zero-pads vals[] for unused rows. Requires batch*abytes <= nbytes (holds when
+ * batch <= xDim). Pure / board-free — unit-tested in tests/test_helpers.c. */
+void mmfree_pack_act_beat_batch(volatile uint8_t *dst, const int32_t *vals,
+                                uint32_t batch, uint32_t abytes, uint32_t nbytes) {
+    for (uint32_t r = 0; r < batch; r++) {
+        uint32_t u = (uint32_t)vals[r];
+        for (uint32_t k = 0; k < abytes; k++)
+            dst[r * abytes + k] = (uint8_t)((u >> (k * 8)) & 0xFFu);
+    }
+    for (uint32_t k = batch * abytes; k < nbytes; k++) dst[k] = 0u;
 }
 
 /* Sign-extend an `accWidth`-bit accumulator that arrives right-aligned in an
@@ -68,7 +94,16 @@ struct mmfree_lib {
     uint32_t nproj, max_proj;
     int      open_bufs;                /* how many wt/act ports were opened */
     int      out_open;
+    mmfree_lib_stats_t stats;          /* per-phase timers (mmfree_bitlinear) */
 };
+
+void mmfree_lib_get_stats(const mmfree_lib_t *h, mmfree_lib_stats_t *out) {
+    if (h && out) *out = h->stats;
+}
+
+void mmfree_lib_reset_stats(mmfree_lib_t *h) {
+    if (h) memset(&h->stats, 0, sizeof(h->stats));
+}
 
 uint32_t mmfree_lib_num_ports(uint32_t aWidth, uint32_t xDim) {
     mmfree_geom_t g;
@@ -100,28 +135,45 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
                 cfg->num_dma, h->ctx.geom.numPorts);
         goto fail;
     }
+    /* Batched bitstream support: geom_init seeded batch=1. A batched engine packs
+     * batch activations into the low batch*aWidth bits of each LOAD beat, so it
+     * must fit one port's slice — i.e. batch <= xDim (port math is xDim-derived;
+     * see mmfree_geom_init note). */
+    h->ctx.geom.batch = cfg->batch ? cfg->batch : 1u;
+    if (h->ctx.geom.batch > cfg->xDim) {
+        fprintf(stderr, "mmfree_lib_open: batch=%u must be <= xDim=%u\n",
+                h->ctx.geom.batch, cfg->xDim);
+        goto fail;
+    }
 
     const uint32_t P = h->ctx.geom.numPorts;
     for (uint32_t p = 0; p < P; p++) {
-        if (mmfree_buf_open(&h->wt[p], cfg->wt_dev[p], cfg->weight_bytes_per_port) < 0 ||
+        /* Weights are written once (cold path) and ports 1..P-1 carry only the
+         * static zero slice — leave those non-cached. Only act port 0 (re-packed
+         * every op) and the output (drained every op) are hot, so map those
+         * cacheable and sync them per call in mmfree_bitlinear. */
+        if (mmfree_buf_open(&h->wt[p], cfg->wt_dev[p], cfg->weight_bytes_per_port, 0) < 0 ||
             h->wt[p].size < cfg->weight_bytes_per_port) {
             fprintf(stderr, "mmfree_lib_open: weight buf port %u (%s) too small/failed\n",
                     p, cfg->wt_dev[p]);
             goto fail;
         }
-        if (mmfree_buf_open(&h->act[p], cfg->act_dev[p], cfg->act_bytes_per_port) < 0 ||
+        if (mmfree_buf_open(&h->act[p], cfg->act_dev[p], cfg->act_bytes_per_port,
+                            /*cached=*/p == 0) < 0 ||
             h->act[p].size < cfg->act_bytes_per_port) {
             fprintf(stderr, "mmfree_lib_open: act buf port %u (%s) too small/failed\n",
                     p, cfg->act_dev[p]);
             goto fail;
         }
         /* Every activation port slice is zero outside the low aWidth bits, and
-         * ports 1..P-1 are zero entirely — clear once; port 0 is rewritten per
-         * op (the whole portBytes slice, so no stale carry). */
+         * ports 1..P-1 are zero entirely — clear once. Port 0 is cacheable and
+         * per op we only rewrite the low aWidth bytes of each beat, relying on
+         * these high-byte zeros staying put, so flush them to DDR once now. */
         dev_zero((volatile uint8_t *)h->act[p].vaddr, h->act[p].size);
+        if (p == 0) mmfree_buf_sync_for_device(&h->act[0], h->act[0].size);
         h->open_bufs = (int)(p + 1);
     }
-    if (mmfree_buf_open(&h->out, cfg->out_dev, cfg->out_bytes) < 0 ||
+    if (mmfree_buf_open(&h->out, cfg->out_dev, cfg->out_bytes, /*cached=*/1) < 0 ||
         h->out.size < cfg->out_bytes) {
         fprintf(stderr, "mmfree_lib_open: out buf (%s) too small/failed\n", cfg->out_dev);
         goto fail;
@@ -201,8 +253,11 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
                 (unsigned long long)byte_offset, blob_bytes, h->wt[0].size);
         return -ENOSPC;
     }
-    if ((size_t)n_outputs * g->outLaneBytes > h->out.size) {
-        fprintf(stderr, "register: n_outputs %u exceeds out buf\n", n_outputs);
+    /* The engine drains all `batch` PE rows per STORE, so the out buffer must
+     * hold batch * n_outputs lanes (batch-major). */
+    if ((size_t)g->batch * n_outputs * g->outLaneBytes > h->out.size) {
+        fprintf(stderr, "register: batch(%u) * n_outputs(%u) exceeds out buf\n",
+                g->batch, n_outputs);
         return -ENOSPC;
     }
 
@@ -211,29 +266,94 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
     return id;
 }
 
-int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
-                     const int16_t *x, int32_t *acc) {
+int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
+                           const int16_t *x, int32_t *acc, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj || !x || !acc) return -EINVAL;
     const proj_t *pr = &h->projs[proj_id];
     const mmfree_geom_t *g = &h->ctx.geom;
     const uint32_t abytes = g->aWidth / 8u;
-
-    /* 1. Write activations into port 0 (ports 1..P-1 stay zero from open). */
-    volatile uint8_t *a0 = (volatile uint8_t *)h->act[0].vaddr;
-    for (uint32_t n = 0; n < pr->N; n++)
-        mmfree_pack_act_beat(&a0[(size_t)n * g->portBytes], (int32_t)x[n], abytes, g->portBytes);
-
-    /* 2. LOAD_ACT -> 3. COMPUTE_MM at this projection's resident offset
-     *    -> 4. STORE_OUT. */
-    if (mmfree_load(&h->ctx, h->act, pr->N) < 0)                               return -EIO;
-    if (mmfree_compute_off(&h->ctx, h->wt, pr->N, pr->M, pr->byte_offset) < 0) return -EIO;
-    if (mmfree_store(&h->ctx, &h->out, pr->n_outputs) < 0)                     return -EIO;
-
-    /* 5. Sign-expand the first M lanes (the rest are col-tile padding). */
-    const volatile uint8_t *ob = (const volatile uint8_t *)h->out.vaddr;
-    for (uint32_t m = 0; m < pr->M; m++) {
-        uint32_t raw = ((const volatile uint32_t *)ob)[m];   /* outLaneBytes == 4 */
-        acc[m] = (int32_t)mmfree_expand_acc(raw, g->accWidth);
+    const uint32_t B = g->batch;            /* PE rows the bitstream loads/drains */
+    if (b == 0 || b > B) {
+        fprintf(stderr, "bitlinear_batch: b=%u out of range 1..%u\n", b, B);
+        return -EINVAL;
     }
+
+    uint64_t t0 = now_ns();
+
+    /* 1. Pack the B activation rows into port 0 (ports 1..P-1 stay zero from
+     *    open). Row r occupies bytes [r*abytes, (r+1)*abytes) of each beat slice,
+     *    matching Core.scala sLoad's tdata((r+1)*aWidth-1, r*aWidth) unpack; rows
+     *    [b, B) are zero-padded (their outputs are ignored). B*abytes <= portBytes
+     *    since batch <= xDim. Fast path (cached + int16) writes only those low
+     *    B*abytes bytes, relying on the open-time zeroing of the rest; the
+     *    fallback rewrites the whole slice. */
+    volatile uint8_t *a0 = (volatile uint8_t *)h->act[0].vaddr;
+    if (h->act[0].cached && abytes == 2) {
+        /* act[0] is a *cached* normal-memory mapping flushed by the explicit
+         * sync_for_device below, so these stores need no `volatile` — it only
+         * defeats coalescing/vectorization. This strided int16 scatter was the
+         * dominant per-call cost in profiling (~30%); writing through a plain
+         * pointer lets the compiler pipeline/unroll it. Semantics unchanged. */
+        int16_t *a0w = (int16_t *)h->act[0].vaddr;
+        const uint32_t stride = g->portBytes / 2u;   /* int16 slots per beat */
+        for (uint32_t n = 0; n < pr->N; n++) {
+            int16_t *beat = a0w + (size_t)n * stride;
+            for (uint32_t r = 0; r < B; r++)
+                beat[r] = (int16_t)((r < b) ? x[(size_t)r * pr->N + n] : 0);
+        }
+    } else {
+        int32_t vals[MMFREE_MAX_DMA * 64];   /* batch <= xDim; ample headroom */
+        for (uint32_t n = 0; n < pr->N; n++) {
+            for (uint32_t r = 0; r < B; r++)
+                vals[r] = (r < b) ? (int32_t)x[(size_t)r * pr->N + n] : 0;
+            mmfree_pack_act_beat_batch(&a0[(size_t)n * g->portBytes], vals, B,
+                                       abytes, g->portBytes);
+        }
+    }
+    uint64_t tps = now_ns();
+    /* act port 0 is cacheable: clean the beats we just wrote so the MM2S DMA
+     * reads them from DDR (no-op if the buffer is non-cached). */
+    mmfree_buf_sync_for_device(&h->act[0], (size_t)pr->N * g->portBytes);
+    uint64_t t1 = now_ns();
+
+    /* 2. LOAD_ACT (N B-wide beats) -> 3. COMPUTE_MM (weights broadcast to all B
+     *    rows) -> 4. STORE_OUT (B*n_outputs lanes — the engine drains every row).
+     *    Each blocks on its own completion IRQ. */
+    if (mmfree_load(&h->ctx, h->act, pr->N) < 0)                               return -EIO;
+    uint64_t t2 = now_ns();
+    if (mmfree_compute_off(&h->ctx, h->wt, pr->N, pr->M, pr->byte_offset) < 0) return -EIO;
+    uint64_t t3 = now_ns();
+    const uint32_t total_outputs = B * pr->n_outputs;
+    if (mmfree_store(&h->ctx, &h->out, total_outputs) < 0)                     return -EIO;
+    uint64_t tos = now_ns();
+    /* Output is cacheable: invalidate the drained lanes so the readback sees the
+     * S2MM result from DDR rather than stale cache. */
+    mmfree_buf_sync_for_cpu(&h->out, (size_t)total_outputs * g->outLaneBytes);
+    uint64_t t4 = now_ns();
+
+    /* 5. Sign-expand the first M lanes of each requested row. Output is
+     *    batch-major: row i occupies lanes [i*n_outputs, i*n_outputs + M)
+     *    (Core.scala drain rowAddr = (batch*numColTiles + colTile)*outSubBeats). */
+    const volatile uint32_t *ob = (const volatile uint32_t *)h->out.vaddr;
+    for (uint32_t i = 0; i < b; i++) {
+        const volatile uint32_t *row = ob + (size_t)i * pr->n_outputs;
+        for (uint32_t m = 0; m < pr->M; m++)
+            acc[(size_t)i * pr->M + m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
+    }
+    uint64_t t5 = now_ns();
+
+    h->stats.calls++;
+    h->stats.pack_ns     += t1 - t0;
+    h->stats.act_sync_ns += t1 - tps;
+    h->stats.load_ns     += t2 - t1;
+    h->stats.compute_ns  += t3 - t2;
+    h->stats.store_ns    += t4 - t3;
+    h->stats.out_sync_ns += t4 - tos;
+    h->stats.readback_ns += t5 - t4;
     return 0;
+}
+
+int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
+                     const int16_t *x, int32_t *acc) {
+    return mmfree_bitlinear_batch(h, proj_id, x, acc, 1u);
 }

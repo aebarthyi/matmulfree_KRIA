@@ -6,7 +6,8 @@
 #   bd.tcl  ─vivado─▶  build/t_matmul/  +  build/t_matmul.xsa   (bitstream + platform)
 #   xsa     ──xsct──▶  build/overlay/{core_bench.bit,.dtbo,shell.json}
 #   .bit  ─bootgen─▶   build/overlay/core_bench.bit.bin
-#   assemble       ▶   transfer/{core_bench.bit.bin, core_bench.dtbo, shell.json}
+#   assemble       ▶   transfer/<preset>/{core_bench.bit.bin, .dtbo, shell.json, deploy_kria.sh}
+#                       (one folder per preset — configs coexist, no rebuild to switch)
 #
 # Run from anywhere; paths resolve relative to the repo root.
 #
@@ -29,7 +30,7 @@
 #   SKIP_SV=0           set 1 to skip Chisel SV regeneration
 #   BITSTREAM_ONLY=0    set 1 to stop after the bitstream/XSA (steps 1-3)
 #   PACKAGE_ONLY=0      set 1 to skip steps 1-3 and package the existing
-#                       build/t_matmul.xsa into transfer/ (steps 4-6)
+#                       build/t_matmul.xsa into transfer/<preset>/ (steps 4-6)
 
 set -euo pipefail
 
@@ -53,9 +54,32 @@ case "$PRESET" in
     k26_bench64)     XDIM=64; AWIDTH=8  ;;
     k26_mmfree370m)     XDIM=64; AWIDTH=8  ;;
     k26_mmfree370m_a16) XDIM=32; AWIDTH=16 ;;   # signed int16 activations
+    # Batched a16 (CoreConfig.batchSize=B): B activation vectors per weight
+    # stream. B<=xDim keeps the same 512-b/4-port topology as the B=1 a16 preset;
+    # only the engine's PE rows / output drain scale (see BATCH below).
+    k26_mmfree370m_a16_b2|k26_mmfree370m_a16_b4|k26_mmfree370m_a16_b6|k26_mmfree370m_a16_b8) XDIM=32; AWIDTH=16 ;;
     *) echo "ERROR: preset '$PRESET' has no geometry entry here — add xDim/aWidth (mirror CoreConfig)." >&2
        exit 1 ;;
 esac
+
+# Batch size baked into the bitstream (parsed from the _bN preset suffix). Only
+# the OUTPUT udmabuf scales with it — the engine drains B output vectors per
+# STORE; activations (B fit one port slice for B<=8) and weights are unchanged.
+case "$PRESET" in
+    *_b2) BATCH=2 ;;
+    *_b4) BATCH=4 ;;
+    *_b6) BATCH=6 ;;
+    *_b8) BATCH=8 ;;
+    *)    BATCH=1 ;;
+esac
+
+# Output stream (CoreTop m_axis / DMA0 S2MM) width = outBeatLanes * outLaneWidth.
+# The batched a16 presets use outBeatLanes=4 (outLaneWidth=32) → 128-bit S2MM so
+# the store isn't capped at the 32-bit ~1 GB/s ceiling (128-bit = the HP port =
+# ~4 GB/s). Default 32. Mirrors CoreConfig outBeatLanes — keep in sync (the
+# preset-manifest consolidation in docs/REPO_CONSOLIDATION_PLAN.md removes this).
+if [ "$BATCH" -gt 1 ]; then S2MM_WIDTH=128; else S2MM_WIDTH=32; fi
+export S2MM_WIDTH
 
 # PL fabric clock (vivado/bd.tcl PL0_REF). 250 MHz closes since the 2026-06-11
 # Core pipeline stages (inQ/outQ queues terminate both BRAM-sourced critical
@@ -66,7 +90,7 @@ esac
 # BENCH_CLK_MHZ matching it. Legacy presets keep their proven 100 MHz builds.
 # Override per build with PL_CLK_MHZ=... in the environment.
 case "$PRESET" in
-    k26_mmfree370m|k26_mmfree370m_a16) PL_CLK_MHZ="${PL_CLK_MHZ:-250}" ;;
+    k26_mmfree370m|k26_mmfree370m_a16|k26_mmfree370m_a16_b2|k26_mmfree370m_a16_b4|k26_mmfree370m_a16_b6|k26_mmfree370m_a16_b8) PL_CLK_MHZ="${PL_CLK_MHZ:-250}" ;;
     *)                                 PL_CLK_MHZ="${PL_CLK_MHZ:-100}" ;;
 esac
 export PL_CLK_MHZ
@@ -84,10 +108,16 @@ fi
 # 8 MiB — the 370m projection sweep itself peaks at 2 MiB/port on lm_head),
 # and the 32000-lane output (125 KiB).
 case "$PRESET" in
-  k26_mmfree370m|k26_mmfree370m_a16)        # 16 B/port either way → same sizes
-    export UDMABUF_ACT_SZ=0x00010000   #  64 KiB / port
-    export UDMABUF_WT_SZ=0x00800000    #   8 MiB / port
-    export UDMABUF_OUT_SZ=0x00020000   # 128 KiB
+  k26_mmfree370m|k26_mmfree370m_a16|k26_mmfree370m_a16_b2|k26_mmfree370m_a16_b4|k26_mmfree370m_a16_b6|k26_mmfree370m_a16_b8)  # 16 B/port → same act/wt sizes
+    # Defaults cover the per-shape bench (wt peaks ~8 MiB on the pow2 sweep). The
+    # resident full-model runner (integration/fpga_runner) holds ALL 145 projections
+    # at once — ~21.3 MiB/port — so override with UDMABUF_WT_SZ=0x01800000 (24 MiB)
+    # before this script for that flow. All honor a pre-set env value.
+    # Batched presets drain BATCH output vectors per STORE, so the OUT node scales
+    # xBATCH (act/wt unchanged — B<=8 fits one port slice; weights are broadcast).
+    export UDMABUF_ACT_SZ=${UDMABUF_ACT_SZ:-0x00010000}   #  64 KiB / port
+    export UDMABUF_WT_SZ=${UDMABUF_WT_SZ:-0x00800000}     #   8 MiB / port (bench)
+    export UDMABUF_OUT_SZ=${UDMABUF_OUT_SZ:-$(printf '0x%08x' $((BATCH * 0x00020000)))}   # 128 KiB x BATCH
     ;;
 esac
 STREAM_BITS=$((XDIM * AWIDTH))
@@ -112,7 +142,9 @@ SV_DIR="$REPO_ROOT/generated/$PRESET"
 PROJ_DIR="$REPO_ROOT/build/$DESIGN"
 XSA="$REPO_ROOT/build/$DESIGN.xsa"
 OVERLAY_DIR="$REPO_ROOT/build/overlay"
-TRANSFER_DIR="$REPO_ROOT/transfer"
+# Per-config: each preset lands in its own transfer/<preset>/ so multiple built
+# bitstreams coexist and you can switch configs on the board without rebuilding.
+TRANSFER_DIR="$REPO_ROOT/transfer/$PRESET"
 
 # ─── Pre-flight: required tools ─────────────────────────────────────────────
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not on PATH. Source Vivado settings64.sh / install it." >&2; exit 1; }; }
@@ -136,6 +168,11 @@ else
     else
         echo; echo "==> [1/6] Skipping SV regeneration (SKIP_SV=1)"
     fi
+
+    # Note: batched presets emit the output memory as a URAM BlackBox
+    # (control.OutMemUltra, ram_style="ultra") directly from Chisel — no SV
+    # post-processing needed. REPACKAGE=1 is still required to pull regenerated
+    # SV (incl. the BlackBox module) into the packaged IP.
 
     # ─── 2. (optional) Re-package CoreTop IP ────────────────────────────────
     if [ "$REPACKAGE" = "1" ]; then
@@ -177,7 +214,7 @@ echo; echo "==> [5/6] Converting $APP.bit → $APP.bit.bin (bootgen)"
 )
 [ -f "$OVERLAY_DIR/$APP.bit.bin" ] || { echo "ERROR: bootgen did not produce $APP.bit.bin" >&2; exit 1; }
 
-# ─── 6. Assemble transfer/ ──────────────────────────────────────────────────
+# ─── 6. Assemble transfer/<preset>/ ─────────────────────────────────────────
 echo; echo "==> [6/6] Assembling $TRANSFER_DIR/"
 rm -rf "$TRANSFER_DIR"
 mkdir -p "$TRANSFER_DIR"
@@ -189,10 +226,10 @@ chmod +x "$TRANSFER_DIR/deploy_kria.sh"
 
 echo
 echo "############################################################"
-echo "# DONE. transfer/ ready for the KRIA:"
+echo "# DONE. transfer/$PRESET/ ready for the KRIA:"
 ls -la "$TRANSFER_DIR"
 echo "#"
-echo "# Deploy on the board:"
-echo "#   scp -r transfer/ ubuntu@<kria>:~/"
-echo "#   sudo ~/transfer/deploy_kria.sh"
+echo "# Deploy on the board (per-config — other configs are left intact):"
+echo "#   scp -r transfer/$PRESET ubuntu@<kria>:~/transfer/"
+echo "#   sudo ~/transfer/$PRESET/deploy_kria.sh"
 echo "############################################################"

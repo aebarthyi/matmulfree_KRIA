@@ -1,0 +1,3 @@
+[submodule "matmulfreellmCPU"]
+	path = matmulfreellmCPU
+	url = https://github.com/aebarthyi/matmulfreellmCPU.git

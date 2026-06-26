@@ -627,6 +627,11 @@ Port;FD4A0000;FD4AFFFF;1|FPD;DPDMA;FD4C0000;FD4CFFFF;1|FPD;DDR_XMPU5_CFG;FD05000
   # (k26_bench32 -> 2, k26_bench64 -> 4). build_all.sh exports both.
   set mm2s_width 64
   if { [info exists ::env(MM2S_WIDTH)] } { set mm2s_width $::env(MM2S_WIDTH) }
+  # S2MM (output) stream width = CoreTop m_axis = outBeatLanes*outLaneWidth.
+  # Default 32 (outBeatLanes=1); batched presets set 128 (outBeatLanes=4) so the
+  # store isn't capped at the 32-bit ~1 GB/s ceiling. Capped at the 128-bit HP port.
+  set s2mm_width 32
+  if { [info exists ::env(S2MM_WIDTH)] } { set s2mm_width $::env(S2MM_WIDTH) }
   set num_dma 1
   if { [info exists ::env(NUM_DMA)] } { set num_dma $::env(NUM_DMA) }
   if { $num_dma < 1 || $num_dma > 4 } {
@@ -673,6 +678,8 @@ Port;FD4A0000;FD4AFFFF;1|FPD;DPDMA;FD4C0000;FD4CFFFF;1|FPD;DDR_XMPU5_CFG;FD05000
     CONFIG.c_include_sg {0} \
     CONFIG.c_m_axi_mm2s_data_width $mm2s_width \
     CONFIG.c_m_axis_mm2s_tdata_width $mm2s_width \
+    CONFIG.c_m_axi_s2mm_data_width $s2mm_width \
+    CONFIG.c_s2mm_tdata_width $s2mm_width \
     CONFIG.c_mm2s_burst_size {256} \
     CONFIG.c_s2mm_burst_size {256} \
     CONFIG.c_sg_length_width {23} \

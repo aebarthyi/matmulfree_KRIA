@@ -37,11 +37,11 @@ abstract class BenchMirrorSpecBase(
     xDim:     Int,
     maxN:     Int,
     maxM:     Int,
+    batchSize: Int = 1,
+    outBeatLanes: Int = 1,
     signedAct: Boolean = false
 ) extends AnyFreeSpec with Matchers with ChiselSim {
   import InstructionEncoder._
-
-  private val batchSize = 1
 
   private val nLanes          = aWidth / 2
   private val outLanesPerTile = xDim * nLanes               // 32 (bench) / 64 (bench16)
@@ -56,7 +56,7 @@ abstract class BenchMirrorSpecBase(
   private val portWidth  = axisDataWidth / numInPorts
   private val sliceMask  = (BigInt(1) << portWidth) - 1
 
-  private val effOutBeatLanes = 1
+  private val effOutBeatLanes = outBeatLanes
   private val outSubBeats     = outLanesPerTile / effOutBeatLanes
   private val outBeatWidth    = effOutBeatLanes * outLaneWidth
 
@@ -305,6 +305,58 @@ abstract class BenchMirrorSpecBase(
     unpackOutputs(raw)
   }
 
+  // ───────────────────── Batched (batchSize > 1) variants ─────────────────────
+  // The engine is activation-stationary + weight-broadcast: one weight stream
+  // feeds all `batchSize` PE rows, each row carrying its own activation vector.
+  // So a batched op is: LOAD B-wide activation beats, COMPUTE the SAME weight
+  // stream once, STORE B*m outputs (batch-major — see Core.scala drain rowAddr
+  // = (batch*numColTiles + colTile)*outSubBeats + sub).
+
+  /** One LOAD beat carrying all B batch items' activations for inner-dim row n:
+    * item b occupies bits [(b+1)*aWidth-1 : b*aWidth], matching Core.scala sLoad's
+    * `tdata((i+1)*aWidth-1, i*aWidth)` unpack. */
+  private def packActBeatBatch(actsAtN: Seq[Int]): BigInt = {
+    val mask = (BigInt(1) << aWidth) - 1
+    var beat = BigInt(0)
+    for (b <- 0 until batchSize) beat |= (BigInt(actsAtN(b)) & mask) << (b * aWidth)
+    beat
+  }
+
+  /** Per-batch reference, flattened batch-major: out[b][j] = sum_n A[b][n]*W[n][j].
+    * Layout matches the STORE stream order (all of batch 0's m columns, then
+    * batch 1's, ...). */
+  private def refMatmulBatch(acts: Array[Array[Int]], wt: Array[Array[Int]], n: Int, m: Int): Seq[BigInt] =
+    (0 until batchSize).flatMap { b =>
+      val out = Array.fill(m)(BigInt(0))
+      for (i <- 0 until n; j <- 0 until m) out(j) += BigInt(wt(i)(j)) * BigInt(acts(b)(i))
+      out.map(v => ((v % outAccModulus) + outAccModulus) % outAccModulus).toSeq
+    }
+
+  /** Batched LOAD_ACT → COMPUTE_MM → STORE_OUT. `acts` is [batchSize][n]; weights
+    * are the same single-vector col-tile-major stream (broadcast to all rows).
+    * Returns batchSize*m accumulators, batch-major. */
+  private def runBenchFlowBatch(
+      dut: CoreTop, acts: Array[Array[Int]], weightBeats: Seq[BigInt], n: Int, m: Int
+  ): Seq[BigInt] = {
+    axiWrite(dut, OFF_INSTR, encode(LOAD_ACT, BigInt(0x100), BigInt(n), 0)) mustBe OKAY
+    val actBeats = (0 until n).map(i => packActBeatBatch((0 until batchSize).map(b => acts(b)(i))))
+    pushAxisBeats(dut, actBeats)
+    waitForIrq(dut); ackIrq(dut)
+
+    axiWrite(dut, OFF_INSTR,
+      encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(m))) mustBe OKAY
+    pushAxisBeats(dut, weightBeats, maxCyclesPerBeat = 400)
+    waitForIrq(dut, maxCycles = 64000); ackIrq(dut)
+
+    val totalOutputs = batchSize * m
+    axiWrite(dut, OFF_INSTR,
+      encode(STORE_OUT, BigInt(0x400), BigInt(totalOutputs), 0)) mustBe OKAY
+    val numBeats = totalOutputs / effOutBeatLanes
+    val raw = pullAxisBeats(dut, numBeats, maxCycles = 32000)
+    waitForIrq(dut); ackIrq(dut)
+    unpackOutputs(raw)
+  }
+
   /** Random ternary weight matrix matching bench.c's distribution
     * (25% +1, 25% -1, 50% 0 — via 2-bit RNG with c_map[2]==0). */
   private def randomTernaryMatrix(rng: Random, n: Int, m: Int): Array[Array[Int]] =
@@ -322,6 +374,10 @@ abstract class BenchMirrorSpecBase(
 
   s"Bench mirror at $geomName params (aWidth=$aWidth, xDim=$xDim, batchSize=$batchSize)" - {
 
+    // Single-vector flow tests: these LOAD one activation/beat and check m
+    // outputs, so they are only meaningful at batchSize == 1. The batched
+    // subclasses run the B-wide tests below instead.
+    if (batchSize == 1) {
     "single col tile: bench-style packing matches ref matmul" in {
       simulateRaw(mkTop) { dut =>
         resetDut(dut)
@@ -408,8 +464,45 @@ abstract class BenchMirrorSpecBase(
         }
       }
     }
+    }  // end if (batchSize == 1) single-vector tests
 
-    if (numInPorts > 1) {
+    if (batchSize > 1) {
+      s"batched: $batchSize vectors share one weight stream, match per-batch ref (2 seeds)" in {
+        Seq(11L, 73L).foreach { seed =>
+          simulateRaw(mkTop) { dut =>
+            resetDut(dut)
+            val rng = new Random(seed)
+            val numColTiles = 1 + rng.nextInt(2)             // 1..2
+            val m = numColTiles * outLanesPerTile
+            val n = 12 + rng.nextInt(20)                     // 12..31
+            val acts = Array.fill(batchSize, n)(genAct(rng)) // [B][N], distinct per row
+            val wt   = randomTernaryMatrix(rng, n, m)
+            val beats = packBenchWeightBuffer(wt, n, m)
+            val actual   = runBenchFlowBatch(dut, acts, beats, n, m)
+            val expected = refMatmulBatch(acts, wt, n, m)
+            withClue(s"seed=$seed B=$batchSize n=$n m=$m") { actual mustBe expected }
+          }
+        }
+      }
+
+      "batched: distinct per-row activations are not cross-contaminated" in {
+        simulateRaw(mkTop) { dut =>
+          resetDut(dut)
+          val n = 16
+          val m = outLanesPerTile                            // one col tile
+          // Row b is the constant (b+1); each row's column-sum is (b+1)*colWeightSum,
+          // so any row/accumulator bleed shows up as a wrong multiple.
+          val acts = Array.tabulate(batchSize, n)((b, _) => b + 1)
+          val wt   = randomTernaryMatrix(new Random(5L), n, m)
+          val beats = packBenchWeightBuffer(wt, n, m)
+          val actual   = runBenchFlowBatch(dut, acts, beats, n, m)
+          val expected = refMatmulBatch(acts, wt, n, m)
+          actual mustBe expected
+        }
+      }
+    }
+
+    if (batchSize == 1 && numInPorts > 1) {
       s"staggered port valids: $numInPorts-way join loses no beats" in {
         simulateRaw(mkTop) { dut =>
           resetDut(dut)
@@ -466,3 +559,47 @@ class BenchMirror370MSpec extends BenchMirrorSpecBase(
 class BenchMirror370M_A16Spec extends BenchMirrorSpecBase(
   geomName = "K26_MMFree370M_A16", aWidth = 16, maxAcc = 4096, xDim = 32,
   maxN = 128, maxM = 768, signedAct = true)
+
+// ─── Batched (batchSize > 1) specs — Phase 0 hardening of the Core FSM batch
+//     path (the SystolicArray grid is already verified at yDim=2 in
+//     SystolicArraySpec; these close the LOAD/drain/STORE wrapper gap). ───
+
+/** Small/fast batch geometry (xDim=4, single 32-bit port): primary correctness
+  * for B=2 and B=4 — exercises the B-wide LOAD, B-row compute, batch-major
+  * drain and B*m STORE cheaply. */
+class BenchMirrorBatch2Spec extends BenchMirrorSpecBase(
+  geomName = "Batch-small", aWidth = 8, maxAcc = 256, xDim = 4,
+  maxN = 128, maxM = 128, batchSize = 2)
+
+class BenchMirrorBatch4Spec extends BenchMirrorSpecBase(
+  geomName = "Batch-small", aWidth = 8, maxAcc = 256, xDim = 4,
+  maxN = 128, maxM = 128, batchSize = 4)
+
+/** Realistic deployed geometry batched: a16 (aWidth=16, xDim=32 → 256-lane col
+  * tiles, 4-way port join, signed activations), batchSize=2. Reduced maxN/maxM
+  * for sim speed; the point is the full batched datapath at the real array
+  * width. (Drain = B*256 cycles/tile here — slow in sim but functionally what
+  * the bitstream does.) */
+class BenchMirror370M_A16_B2Spec extends BenchMirrorSpecBase(
+  geomName = "K26_MMFree370M_A16_B2", aWidth = 16, maxAcc = 4096, xDim = 32,
+  maxN = 64, maxM = 512, batchSize = 2, signedAct = true)
+
+// ─── outBeatLanes=4 (128-bit m_axis) batched specs — the store-bandwidth config
+//     (board B=4 showed the 32-bit store was the batch bottleneck). Exercise the
+//     4-lane drain + multi-lane m_axis beats together with batch. The batched a16
+//     presets (k26_mmfree370m_a16_b{2,4,8}) now carry outBeatLanes=4. ───
+class BenchMirrorBatch4_Obl4Spec extends BenchMirrorSpecBase(
+  geomName = "Batch-small-obl4", aWidth = 8, maxAcc = 256, xDim = 4,
+  maxN = 128, maxM = 128, batchSize = 4, outBeatLanes = 4)
+
+class BenchMirror370M_A16_B4_Obl4Spec extends BenchMirrorSpecBase(
+  geomName = "K26_MMFree370M_A16_B4", aWidth = 16, maxAcc = 4096, xDim = 32,
+  maxN = 64, maxM = 512, batchSize = 4, outBeatLanes = 4, signedAct = true)
+
+// B=6: the K26 device sweet spot (B8 overflowed the fabric — see CoreConfig
+// K26_MMFree370M_A16_B6). Non-power-of-2 batch exercises the arithmetic batch
+// addressing (drainBatchCtr*numColTiles+…, outBram depth 6*…) at the real a16
+// array width with the 4-lane store.
+class BenchMirror370M_A16_B6_Obl4Spec extends BenchMirrorSpecBase(
+  geomName = "K26_MMFree370M_A16_B6", aWidth = 16, maxAcc = 4096, xDim = 32,
+  maxN = 64, maxM = 512, batchSize = 6, outBeatLanes = 4, signedAct = true)

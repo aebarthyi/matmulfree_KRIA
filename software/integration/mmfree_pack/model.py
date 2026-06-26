@@ -44,6 +44,46 @@ _LAYER_PROJS_UNFUSED: List[Tuple[str, List[str]]] = [
 
 _LAYER_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.")
 
+# Per-layer projection order for packing from a model.mmfree blob (compute order;
+# unfused, one projection per BitLinear — mirrors the C++ block, which calls i/f/g
+# separately with the shared post-norm input). The blob tags use these suffixes.
+_BLOB_LAYER_PROJS = ["i_proj", "f_proj", "g_proj", "o_proj", "gate_proj", "down_proj"]
+
+
+def iter_blob_projections(
+    tensors: Dict[str, np.ndarray],
+) -> Iterator[Tuple[str, np.ndarray, float]]:
+    """Yield (tag, codes_MN int8 {-1,0,1}, s) for every ternary projection in a
+    model.mmfree blob (see mmfree_pack.blob.read_mmfree_blob).
+
+    `tag` is the C++ projection tag — the '.wq' tensor's prefix, e.g.
+    "model.layers.3.i_proj" or "lm_head" — so the emitted manifest keys match the
+    runtime's Weights::get(tag) 1:1 and the FPGA runner can map tag -> proj_id. The
+    weights are already quantized in the blob; they are packed verbatim (no
+    re-quantization) to keep the engine codes identical to the CPU path.
+    """
+    wq_tags = {n[:-len(".wq")] for n in tensors if n.endswith(".wq")}
+    layers = sorted({int(m.group(1)) for t in wq_tags
+                     for m in [_LAYER_RE.search(t + ".")] if m})
+
+    ordered: List[str] = []
+    for L in layers:
+        for proj in _BLOB_LAYER_PROJS:
+            tag = f"model.layers.{L}.{proj}"
+            if tag in wq_tags:
+                ordered.append(tag)
+    if "lm_head" in wq_tags:
+        ordered.append("lm_head")
+    # Any projection not matched by the known schema (robustness) — stable order.
+    for t in sorted(wq_tags):
+        if t not in ordered:
+            ordered.append(t)
+
+    for tag in ordered:
+        codes = np.ascontiguousarray(tensors[tag + ".wq"], dtype=np.int8)  # (M, N)
+        s = float(np.asarray(tensors[tag + ".scale_w"]).reshape(-1)[0])
+        yield tag, codes, s
+
 
 def _num_layers(weights: Dict[str, np.ndarray]) -> int:
     n = -1

@@ -24,6 +24,7 @@ class _Cfg(ctypes.Structure):
         ("maxAcc", ctypes.c_uint32),
         ("maxN", ctypes.c_uint32),
         ("maxM", ctypes.c_uint32),
+        ("batch", ctypes.c_uint32),
         ("core_phys", ctypes.c_uint64),
         ("core_size", ctypes.c_size_t),
         ("dma_phys", ctypes.c_uint64 * MAX_DMA),
@@ -48,6 +49,7 @@ class LibConfig:
     maxAcc: int = 4096
     maxN: int = 4096
     maxM: int = 32000
+    batch: int = 1
     core_phys: int = 0xA0010000
     core_size: int = 0x1000
     dma_phys: Sequence[int] = field(default_factory=lambda: [0xA0000000, 0xA0020000, 0xA0030000, 0xA0040000])
@@ -99,6 +101,12 @@ class MmfreeLib:
             ctypes.POINTER(ctypes.c_int16), ctypes.POINTER(ctypes.c_int32),
         ]
         L.mmfree_bitlinear.restype = ctypes.c_int
+        L.mmfree_bitlinear_batch.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int16), ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_uint32,
+        ]
+        L.mmfree_bitlinear_batch.restype = ctypes.c_int
 
     @staticmethod
     def num_ports(aWidth: int, xDim: int, so_path: str = "libmmfree.so") -> int:
@@ -108,6 +116,7 @@ class MmfreeLib:
         c = _Cfg()
         c.aWidth, c.xDim = cfg.aWidth, cfg.xDim
         c.maxAcc, c.maxN, c.maxM = cfg.maxAcc, cfg.maxN, cfg.maxM
+        c.batch = cfg.batch
         c.core_phys, c.core_size = cfg.core_phys, cfg.core_size
         c.num_dma, c.dma_size = len(cfg.wt_dev), cfg.dma_size
         for i, p in enumerate(cfg.dma_phys):
@@ -153,6 +162,21 @@ class MmfreeLib:
         )
         if rc < 0:
             raise RuntimeError(f"mmfree_bitlinear(id={proj_id}) failed rc={rc}")
+        return acc
+
+    def bitlinear_batch(self, proj_id: int, x_int16: np.ndarray, M: int, b: int) -> np.ndarray:
+        """Run b activation vectors (x_int16 shape [b, N], row-major) through one
+        weight stream. Returns acc shape [b, M]."""
+        x = np.ascontiguousarray(x_int16, dtype=np.int16)
+        acc = np.empty((b, M), dtype=np.int32)
+        rc = self._lib.mmfree_bitlinear_batch(
+            self._h, proj_id,
+            x.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            acc.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            b,
+        )
+        if rc < 0:
+            raise RuntimeError(f"mmfree_bitlinear_batch(id={proj_id}, b={b}) failed rc={rc}")
         return acc
 
     def close(self):

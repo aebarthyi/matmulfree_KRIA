@@ -13,11 +13,13 @@ from .packer import (
     codes_to_2bit,
     pack_projection,
 )
-from .model import iter_projections, load_checkpoint
+from .model import iter_projections, iter_blob_projections, load_checkpoint
+from .blob import read_mmfree_blob
 
 __all__ = [
     "Geometry", "A16",
     "WeightPacker", "ProjEntry",
     "quantize_weight", "codes_to_2bit", "pack_projection",
-    "iter_projections", "load_checkpoint",
+    "iter_projections", "iter_blob_projections", "load_checkpoint",
+    "read_mmfree_blob",
 ]

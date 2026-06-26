@@ -48,11 +48,39 @@ from mmfree_bridge.runner import open_real_engine  # noqa: E402
 from phase_e_validate import Int8RefBackend, _mem, _start_mem_monitor  # noqa: E402
 
 
-def _load_weights(checkpoint: str):
-    """name -> fp32 np.ndarray for the whole checkpoint (torch only here)."""
-    import mmfreelm  # noqa: F401  (registers MMfreeLM with AutoModel)  # noqa: PLC0415
-    from mmfree_pack.model import load_checkpoint  # noqa: PLC0415
-    return load_checkpoint(checkpoint)
+def _load_single_layer_weights(checkpoint: str, layer: int):
+    """name -> fp32 np.ndarray for ONLY decoder layer `layer`, re-indexed to 0.
+
+    Pulls just the `layers.{layer}.` tensors straight from the cached safetensors
+    via safe_open (mmap'd — only the keys we touch are materialized), instead of
+    instantiating the whole 370M model in fp32 and copying every tensor to numpy
+    just to throw all but one layer away. RAM drops from whole-model to ~6 small
+    matrices, which is what kept this from finishing on the 4 GB A53.
+
+    framework="pt" + .float() handles weights stored as bf16/fp16 (numpy can't
+    read those dtypes directly)."""
+    import json  # noqa: PLC0415
+    from huggingface_hub import hf_hub_download  # noqa: PLC0415
+    from safetensors import safe_open  # noqa: PLC0415
+
+    tag = f"layers.{layer}."
+    try:  # sharded checkpoint?
+        idx = hf_hub_download(checkpoint, "model.safetensors.index.json")
+        with open(idx) as fh:
+            files = sorted(set(json.load(fh)["weight_map"].values()))
+    except Exception:
+        files = ["model.safetensors"]
+
+    out = {}
+    for f in files:
+        with safe_open(hf_hub_download(checkpoint, f), framework="pt") as st:
+            for k in st.keys():
+                if tag in k:
+                    out[k.replace(tag, "layers.0.")] = (
+                        st.get_tensor(k).to("cpu").float().numpy())
+    if not out:
+        raise SystemExit(f"no weights found for layer {layer} in {checkpoint}")
+    return out
 
 
 def _single_layer_weights(weights, layer: int):
@@ -112,20 +140,23 @@ def main(argv=None) -> int:
                     help="synthetic activation distribution before int16 quant")
     ap.add_argument("--ref-only", action="store_true",
                     help="skip the FPGA (dev/debug; nothing to compare against)")
+    ap.add_argument("--fuse", action="store_true",
+                    help="fuse i/f/g into one (3*hidden, N) projection (gate+up already "
+                         "fused by the model) — one LOAD+COMPUTE replaces three, paying "
+                         "the per-call overhead once. HW-vs-CPU stays exact (same input "
+                         "to both); only end-to-end model match needs norm folding.")
     args = ap.parse_args(argv)
 
     print(f"== Phase E single-layer FPGA-vs-CPU ==\n"
-          f"checkpoint={args.checkpoint}  layer={args.layer}  "
+          f"checkpoint={args.checkpoint}  layer={args.layer}  fuse_ifg={args.fuse}  "
           f"geom: aWidth={args.awidth} xDim={args.xdim}  reps={args.reps}")
     _start_mem_monitor()
     _mem("startup")
 
-    print("loading checkpoint...", flush=True)
+    print(f"loading layer {args.layer} weights (lazy, single-layer)...", flush=True)
     t0 = time.time()
-    weights = _load_weights(args.checkpoint)
-    wl = _single_layer_weights(weights, args.layer)
-    del weights
-    print(f"weights loaded + layer {args.layer} sliced: {time.time()-t0:.1f}s", flush=True)
+    wl = _load_single_layer_weights(args.checkpoint, args.layer)
+    print(f"layer {args.layer} weights loaded: {time.time()-t0:.1f}s", flush=True)
     _mem("after load")
 
     geom = Geometry.derive(args.awidth, args.xdim)
@@ -133,7 +164,7 @@ def main(argv=None) -> int:
     # CPU golden model (numpy integer matmul, int8 codes to keep it light).
     print("building CPU RefBackend engine...", flush=True)
     t0 = time.time()
-    ref_eng = MmfreeEngine.from_weights(wl, geom, Int8RefBackend(), fuse_ifg=False)
+    ref_eng = MmfreeEngine.from_weights(wl, geom, Int8RefBackend(), fuse_ifg=args.fuse)
     print(f"CPU engine built: {time.time()-t0:.1f}s "
           f"({len(ref_eng.proj)} projections)", flush=True)
 
@@ -144,7 +175,7 @@ def main(argv=None) -> int:
         print("packing blobs + opening FPGA engine...", flush=True)
         t0 = time.time()
         hw_eng, lib = open_real_engine(wl, geom, libcfg, args.blob_dir,
-                                       so_path=args.so_path, fuse_ifg=False)
+                                       so_path=args.so_path, fuse_ifg=args.fuse)
         print(f"FPGA engine opened: {time.time()-t0:.1f}s", flush=True)
     _mem("after engines built")
 

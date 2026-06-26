@@ -144,7 +144,12 @@ class WeightPacker:
         }
 
     def write(self, out_dir: str | Path, prefix: str = "weights") -> Dict:
-        """Emit `<prefix>.port{p}.bin` blobs + `<prefix>.manifest.json`."""
+        """Emit `<prefix>.port{p}.bin` blobs + `<prefix>.manifest.json` (+ `.tsv`).
+
+        The `.tsv` sidecar is the same projection table in a tab-separated form the
+        C++ FPGA runner parses without a JSON dependency; it is generated from the
+        same data as the JSON, so the two can't drift.
+        """
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         for p in range(self.geom.numPorts):
@@ -153,4 +158,18 @@ class WeightPacker:
             blob.tofile(out / f"{prefix}.port{p}.bin")
         manifest = self.manifest()
         (out / f"{prefix}.manifest.json").write_text(json.dumps(manifest, indent=2))
+        (out / f"{prefix}.manifest.tsv").write_text(self._manifest_tsv())
         return manifest
+
+    def _manifest_tsv(self) -> str:
+        """Tab-separated projection table for the C++ runner (see write()).
+
+        First line is geometry metadata (`# total_bytes_per_port=<n> numPorts=<n>`),
+        then a header comment, then one row per projection. Columns:
+            name  byte_offset  N  M  n_outputs  s
+        """
+        lines = [f"# total_bytes_per_port={self._offset} numPorts={self.geom.numPorts}",
+                 "# name\tbyte_offset\tN\tM\tn_outputs\ts"]
+        for e in self._entries:
+            lines.append(f"{e.name}\t{e.byte_offset}\t{e.N}\t{e.M}\t{e.n_outputs}\t{e.s!r}")
+        return "\n".join(lines) + "\n"

@@ -235,6 +235,36 @@ object CoreConfig {
     )
 
     /**
+      * Batched siblings of K26_MMFree370M_A16 for the batching sweep (Phase 0+).
+      * batchSize=B processes B activation vectors per single weight stream
+      * (one-load, B-results), amortizing the DDR weight bandwidth that bounds
+      * decode. Spatial batching: weights broadcast to all B PE rows, each row has
+      * its own activations + accumulators.
+      *
+      *   - B ≤ 8 keeps the LOAD beat (max(xDim,B)*aWidth = 512 b) at 4 × 128-bit
+      *     ports, so the bitstream topology is identical to the B=1 a16 preset;
+      *     only the yDim PE rows, actBram width, accumulator banks and outBram
+      *     depth scale ×B.
+      *   - outBeatLanes=4 (128-bit m_axis) — board B=4 showed the STORE is the
+      *     batch bottleneck: it doesn't amortize (B*M outputs read out) and was
+      *     m_axis-width-bound at ~1 GB/s (32-bit S2MM). 128-bit matches the HP
+      *     port → 4 GB/s store. It also shrinks outSubBeats (256→64) so the drain
+      *     hides through B=8 AND shallows outBram (shorter URAM cascade). See
+      *     docs/BATCHING_INTEGRATION_PLAN.md.
+      */
+    val K26_MMFree370M_A16_B2: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 2, outBeatLanes = 4)
+    val K26_MMFree370M_A16_B4: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 4, outBeatLanes = 4)
+    // B6 is the device sweet spot on K26: B8 overflowed the fabric (95.4% LUT →
+    // routing congestion, post-route WNS −0.693 @250 MHz, a capacity wall not a
+    // single path). B6 is ~3/4 of that array (~74–77% LUT est.) so it closes at
+    // full 250 MHz — no clock drop, no HP-port bandwidth loss — for ~1.5× the
+    // B4 stream-bound throughput. No power-of-2 batch requirement: all batch
+    // addressing is arithmetic (drainBatchCtr*numColTiles+…). outBram = 6*125*64
+    // = 48000-deep URAM (shallower than B8's 64000 → easier write-addr cascade).
+    val K26_MMFree370M_A16_B6: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 6, outBeatLanes = 4)
+    val K26_MMFree370M_A16_B8: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 8, outBeatLanes = 4)
+
+    /**
       * LM head config for matmulfree HGRN: M=32000 output (vocab size), inner dim
       * up to 4096 (covers the 370M-class model with hidden_dim=2731 and headroom).
       *
@@ -266,6 +296,10 @@ object CoreConfig {
         "k26_bench64" -> K26_Bench64,
         "k26_mmfree370m" -> K26_MMFree370M,
         "k26_mmfree370m_a16" -> K26_MMFree370M_A16,
+        "k26_mmfree370m_a16_b2" -> K26_MMFree370M_A16_B2,
+        "k26_mmfree370m_a16_b4" -> K26_MMFree370M_A16_B4,
+        "k26_mmfree370m_a16_b6" -> K26_MMFree370M_A16_B6,
+        "k26_mmfree370m_a16_b8" -> K26_MMFree370M_A16_B8,
         "k26_lm_head" -> K26_LMHead
     )
 

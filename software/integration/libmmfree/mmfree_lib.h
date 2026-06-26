@@ -39,6 +39,7 @@ typedef struct mmfree_lib mmfree_lib_t;   /* opaque handle */
 typedef struct mmfree_lib_cfg {
     /* geometry (mirror CoreConfig K26_MMFree370M_A16: 16, 32, 4096, 4096, 32000) */
     uint32_t aWidth, xDim, maxAcc, maxN, maxM;
+    uint32_t batch;                      /* CoreConfig.batchSize (yDim); 0/1 = unbatched. Must be <= xDim. */
 
     /* Core + DMA register windows */
     uint64_t core_phys;
@@ -87,6 +88,39 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
  * success, negative on error/timeout (state dumped to stderr by the runtime). */
 int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
                      const int16_t *x, int32_t *acc);
+
+/* Batched BitLinear: run `b` activation vectors through ONE weight stream (the
+ * engine is weight-broadcast + activation-stationary, so the B PE rows share the
+ * streamed weights — amortizing the DDR weight bandwidth that bounds decode).
+ *   x:   b*N int16, row-major (vector i at x[i*N + n])
+ *   acc: b*M int32, row-major (vector i at acc[i*M + m])
+ * `b` must be in 1..geom.batch (the bitstream's batchSize); if b < geom.batch the
+ * unused PE rows are zero-padded and their outputs ignored. mmfree_bitlinear is
+ * the b==1 case. Returns 0 on success, negative on error/timeout. */
+int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
+                           const int16_t *x, int32_t *acc, uint32_t b);
+
+/* Per-phase timing accumulated across every mmfree_bitlinear call, in
+ * nanoseconds (CLOCK_MONOTONIC). The five phases are the serialized cost of one
+ * projection: CPU-side activation packing into Device memory, then the three
+ * blocking IRQ round-trips (LOAD_ACT / COMPUTE_MM / STORE_OUT), then reading the
+ * M output lanes back. Use to see where the per-call ~600us actually goes. */
+typedef struct mmfree_lib_stats {
+    uint64_t calls;        /* mmfree_bitlinear invocations measured */
+    uint64_t pack_ns;      /* pack activations into port-0 udmabuf (incl. act sync) */
+    uint64_t act_sync_ns;  /*   ...of which: sync_for_device(act) clean (subset of pack) */
+    uint64_t load_ns;      /* mmfree_load   + wait_done (IRQ) */
+    uint64_t compute_ns;   /* mmfree_compute_off + wait_done (IRQ) */
+    uint64_t store_ns;     /* mmfree_store  + wait_done (IRQ) + s2mm_wait (incl. out sync) */
+    uint64_t out_sync_ns;  /*   ...of which: sync_for_cpu(out) invalidate (subset of store) */
+    uint64_t readback_ns;  /* sign-expand M lanes out of the udmabuf */
+} mmfree_lib_stats_t;
+
+/* Copy the accumulated phase timers into *out (no-op if either is NULL). */
+void mmfree_lib_get_stats(const mmfree_lib_t *h, mmfree_lib_stats_t *out);
+
+/* Zero the phase timers (e.g. to exclude warmup before a timed run). */
+void mmfree_lib_reset_stats(mmfree_lib_t *h);
 
 /* Number of s_axis ports the configured geometry uses (== required num_dma). */
 uint32_t mmfree_lib_num_ports(uint32_t aWidth, uint32_t xDim);

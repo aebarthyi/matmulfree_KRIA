@@ -14,6 +14,8 @@
 #include <string.h>
 
 void    mmfree_pack_act_beat(volatile uint8_t *dst, int32_t value, uint32_t abytes, uint32_t nbytes);
+void    mmfree_pack_act_beat_batch(volatile uint8_t *dst, const int32_t *vals,
+                                   uint32_t batch, uint32_t abytes, uint32_t nbytes);
 int64_t mmfree_expand_acc(uint64_t raw, uint32_t accWidth);
 
 static int fails = 0;
@@ -40,6 +42,30 @@ static void test_pack_act_signed_roundtrip(void) {
     }
 }
 
+/* Batched LOAD beat: B int16 activations, row r in bytes [r*2, r*2+2), tail
+ * zeroed. Mirrors Core.scala sLoad's per-row unpack. */
+static void test_pack_act_batch(void) {
+    const uint32_t B = 4;
+    int32_t vals[4] = { 1234, -1, -2048, 32767 };
+    uint8_t beat[PORTBYTES];
+    memset(beat, 0xAA, sizeof(beat));  /* poison: helper must write rows + tail */
+    mmfree_pack_act_beat_batch(beat, vals, B, ABYTES, PORTBYTES);
+
+    for (uint32_t r = 0; r < B; r++) {
+        int16_t got = (int16_t)((uint16_t)beat[r * ABYTES] | ((uint16_t)beat[r * ABYTES + 1] << 8));
+        CHECK(got == (int16_t)vals[r], "batch row %u: %d -> %d", r, vals[r], got);
+    }
+    for (uint32_t k = B * ABYTES; k < PORTBYTES; k++)
+        CHECK(beat[k] == 0, "batch tail byte %u = 0x%02x (must be 0)", k, beat[k]);
+
+    /* B=1 must be byte-identical to the single-vector packer. */
+    uint8_t b1[PORTBYTES], b1ref[PORTBYTES];
+    int32_t one = -12345;
+    mmfree_pack_act_beat_batch(b1, &one, 1, ABYTES, PORTBYTES);
+    mmfree_pack_act_beat(b1ref, one, ABYTES, PORTBYTES);
+    CHECK(memcmp(b1, b1ref, PORTBYTES) == 0, "batch B=1 matches single-vector packer");
+}
+
 static void test_expand_acc(void) {
     /* small positives unchanged */
     CHECK(mmfree_expand_acc(0u, ACCW) == 0, "expand 0");
@@ -62,6 +88,7 @@ static void test_expand_acc(void) {
 
 int main(void) {
     test_pack_act_signed_roundtrip();
+    test_pack_act_batch();
     test_expand_acc();
     if (fails == 0) { printf("test_helpers: all checks passed\n"); return 0; }
     printf("test_helpers: %d check(s) FAILED\n", fails);

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "mmfree_runtime.h"
@@ -67,6 +68,27 @@ static int read_sysfs_u64(const char *path, uint64_t *out) {
     fclose(f);
     *out = strtoull(buf, NULL, 0);
     return 0;
+}
+
+/* Open a u-dma-buf sysfs attribute for `name` (e.g. "udmabuf-act0"), trying the
+ * current "u-dma-buf" class then the legacy "udmabuf" name. Returns an fd or -1. */
+static int open_udmabuf_attr(const char *name, const char *attr, int flags) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/u-dma-buf/%s/%s", name, attr);
+    int fd = open(path, flags);
+    if (fd < 0) {
+        snprintf(path, sizeof(path), "/sys/class/udmabuf/%s/%s", name, attr);
+        fd = open(path, flags);
+    }
+    return fd;
+}
+
+/* Write a decimal value to an already-open sysfs attribute fd (rewinds to 0). */
+static void write_sysfs_fd(int fd, uint64_t val) {
+    if (fd < 0) return;
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%llu", (unsigned long long)val);
+    if (n > 0) { ssize_t w = pwrite(fd, buf, (size_t)n, 0); (void)w; }
 }
 
 /* ---------- setup / teardown ---------- */
@@ -146,9 +168,10 @@ void mmfree_close(mmfree_ctx_t *ctx) {
     ctx->uio_fd = -1;
 }
 
-int mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size) {
+int mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size, int cached) {
     memset(b, 0, sizeof(*b));
     b->fd = -1;
+    b->sync_size_fd = b->sync_cpu_fd = b->sync_dev_fd = -1;
 
     /* Resolve the sysfs entry for udmabufN to read its phys_addr + actual size. */
     const char *slash = strrchr(udmabuf_dev, '/');
@@ -173,7 +196,9 @@ int mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size) {
     }
     if (size == 0 || size > sz) size = sz;
 
-    int fd = open(udmabuf_dev, O_RDWR | O_SYNC);
+    /* O_SYNC forces a non-cacheable (Device) mapping on ikwzm u-dma-buf; drop it
+     * for a write-back cacheable mapping (then the caller must sync manually). */
+    int fd = open(udmabuf_dev, cached ? O_RDWR : (O_RDWR | O_SYNC));
     if (fd < 0) {
         fprintf(stderr, "open %s: %s\n", udmabuf_dev, strerror(errno));
         return -errno;
@@ -185,14 +210,60 @@ int mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size) {
     b->vaddr = p;
     b->paddr = pa;
     b->size  = size;
+    b->cached = cached;
+
+    if (cached) {
+        /* Hold the sync attrs open for the buffer's life. sync_offset stays 0;
+         * sync_size is set per call. sync_for_device/_for_cpu carry an explicit
+         * dma_data_direction (TO_DEVICE=1 clean-only, FROM_DEVICE=2 invalidate-
+         * only) so each sync does the minimum cache work. */
+        /* Fix offset=0 and direction=BIDIRECTIONAL(0) once; both are the minimum
+         * safe configuration (for_device cleans, for_cpu invalidates regardless).
+         * Per call we set sync_size and write exactly 1 to the trigger — the
+         * plain form that uses these attrs, not the combined-value form. */
+        int off_fd = open_udmabuf_attr(name, "sync_offset", O_WRONLY);
+        write_sysfs_fd(off_fd, 0);
+        if (off_fd >= 0) close(off_fd);
+        int dir_fd = open_udmabuf_attr(name, "sync_direction", O_WRONLY);
+        write_sysfs_fd(dir_fd, 0);
+        if (dir_fd >= 0) close(dir_fd);
+        b->sync_size_fd = open_udmabuf_attr(name, "sync_size", O_WRONLY);
+        b->sync_dev_fd  = open_udmabuf_attr(name, "sync_for_device", O_WRONLY);
+        b->sync_cpu_fd  = open_udmabuf_attr(name, "sync_for_cpu", O_WRONLY);
+        if (b->sync_size_fd < 0 || b->sync_dev_fd < 0 || b->sync_cpu_fd < 0)
+            fprintf(stderr, "warning: %s cached but sync attrs missing — "
+                            "results may be incoherent\n", name);
+    }
     return 0;
 }
 
 void mmfree_buf_close(mmfree_buf_t *b) {
     if (b->vaddr) munmap(b->vaddr, b->size);
     if (b->fd >= 0) close(b->fd);
+    if (b->sync_size_fd >= 0) close(b->sync_size_fd);
+    if (b->sync_cpu_fd  >= 0) close(b->sync_cpu_fd);
+    if (b->sync_dev_fd  >= 0) close(b->sync_dev_fd);
     memset(b, 0, sizeof(*b));
     b->fd = -1;
+}
+
+/* Set sync_size to the touched region (cache-line rounded, clamped) and write 1
+ * to `trigger_fd` — the plain trigger form, which syncs [sync_offset, sync_size)
+ * in the configured sync_direction (offset 0, BIDIRECTIONAL set at open). */
+static void buf_sync(mmfree_buf_t *b, int trigger_fd, size_t nbytes) {
+    if (!b->cached || trigger_fd < 0) return;
+    size_t n = (nbytes + 63u) & ~(size_t)63u;       /* round up to a cache line */
+    if (n == 0 || n > b->size) n = b->size;
+    write_sysfs_fd(b->sync_size_fd, n);
+    write_sysfs_fd(trigger_fd, 1u);
+}
+
+void mmfree_buf_sync_for_device(mmfree_buf_t *b, size_t nbytes) {
+    buf_sync(b, b->sync_dev_fd, nbytes);   /* clean: CPU writes -> DDR */
+}
+
+void mmfree_buf_sync_for_cpu(mmfree_buf_t *b, size_t nbytes) {
+    buf_sync(b, b->sync_cpu_fd, nbytes);   /* invalidate: DDR -> CPU reads */
 }
 
 /* ---------- IRQ + instruction issue ---------- */
@@ -211,6 +282,52 @@ static int wait_timeout_ms(void) {
         if (ms < 0) ms = 0;
     }
     return ms;
+}
+
+/* MMFREE_POLL=1 trades the UIO IRQ round-trip (poll()+read()+ack+re-arm, tens of
+ * us of kernel/interrupt latency) for a userspace spin on the Core status word.
+ * Worth it for the short LOAD/STORE ops that dominate the decode loop; costs one
+ * busy core for the op's duration. Default 0 = IRQ path. */
+static int poll_mode(void) {
+    static int p = -1;
+    if (p < 0) {
+        const char *e = getenv("MMFREE_POLL");
+        p = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return p;
+}
+
+/* Spin on the Core status register until completion (irqPending set), bounded by
+ * the same MMFREE_TIMEOUT_MS as the IRQ path. We watch irqPending, NOT busy:
+ * busy hasn't asserted yet in the launch-latency window right after push_instr,
+ * so polling !busy would false-complete immediately. irqPending is cleared by
+ * our ack each op, so it is reliably 0 until this op finishes. The status word is
+ * one 32-bit read, so the snapshot is consistent. Returns 0 on completion. */
+static int mmfree_spin_done(mmfree_ctx_t *ctx) {
+    int ms = wait_timeout_ms();
+    uint64_t deadline = 0;
+    struct timespec ts;
+    if (ms > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        deadline = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec
+                 + (uint64_t)ms * 1000000ull;
+    }
+    for (uint32_t i = 0;; i++) {
+        if (MMFREE_STATUS_IRQ_PEND(mmfree_status(ctx))) return 0;
+        /* Check the (vDSO, syscall-free) clock only every 1024 spins so the
+         * hot path stays a single MMIO read. */
+        if (ms > 0 && (i & 0x3FFu) == 0x3FFu) {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+            if (now >= deadline) {
+                fprintf(stderr, "timeout: no core completion (poll) within %d ms\n", ms);
+                return -ETIMEDOUT;
+            }
+        }
+#if defined(__aarch64__)
+        __asm__ __volatile__("yield");   /* SEV-friendly spin hint */
+#endif
+    }
 }
 
 /* Dump everything observable about the Core + DMA so a stuck run pinpoints
@@ -283,6 +400,20 @@ void mmfree_push_instr(mmfree_ctx_t *ctx, mmfree_instr_t inst) {
 }
 
 uint32_t mmfree_wait_done(mmfree_ctx_t *ctx) {
+    if (poll_mode()) {
+        /* Userspace spin — no UIO involvement, so nothing to re-arm. The Core
+         * IRQ line still asserts and is cleared by the ack below; UIO masks its
+         * one delivered IRQ at open and we simply never service it. */
+        if (mmfree_spin_done(ctx) < 0) {
+            fprintf(stderr, "poll wait failed\n");
+            mmfree_dump_state(ctx, "poll wait");
+            return 0xFFFFFFFFu;
+        }
+        uint32_t s = mmfree_status(ctx);
+        mmfree_ack_irq(ctx);
+        return s;
+    }
+
     /* Block on UIO (bounded — see wait_timeout_ms). */
     if (mmfree_wait_irq(ctx) < 0) {
         fprintf(stderr, "uio wait failed\n");
@@ -316,6 +447,7 @@ int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
 
     g->aWidth = aWidth; g->xDim = xDim; g->maxAcc = maxAcc;
     g->maxN = maxN; g->maxM = maxM;
+    g->batch = 1u;     /* unbatched default; batched callers set g->batch (<= xDim) */
 
     g->nLanes          = aWidth / 2u;
     g->outLanesPerTile = xDim * g->nLanes;

@@ -44,6 +44,7 @@ typedef struct mmfree_geom {
     uint32_t maxAcc;            /* max accumulation cycles (bounds N) */
     uint32_t maxN;              /* max inner dim swept */
     uint32_t maxM;              /* max output dim swept */
+    uint32_t batch;             /* yDim — activation vectors per weight stream (CoreConfig.batchSize). 1 = unbatched. Must be <= xDim (see note). */
     /* derived */
     uint32_t nLanes;            /* aWidth / 2 (ternary lanes per PE) */
     uint32_t outLanesPerTile;   /* xDim * nLanes = output cols per col-tile */
@@ -57,7 +58,11 @@ typedef struct mmfree_geom {
 
 /* Fill the derived fields of `g` from the five inputs. Returns 0 on success,
  * -1 if the geometry is unrepresentable (xDim*aWidth not a whole number of
- * bytes, or a zero dimension). */
+ * bytes, or a zero dimension). Sets g->batch = 1; a caller running a batched
+ * bitstream sets g->batch afterward. NOTE batch must be <= xDim: the s_axis
+ * width is max(xDim,batch)*aWidth, so the numPorts/portBytes derived here from
+ * xDim only stay correct exactly while batch <= xDim (the 4-port wall caps both
+ * at 32 at aWidth=16 anyway). */
 int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
                      uint32_t maxAcc, uint32_t maxN, uint32_t maxM);
 
@@ -81,6 +86,10 @@ typedef struct mmfree_buf {
     uint64_t  paddr;            /* physical bus address (use in instructions / DMA) */
     size_t    size;             /* total bytes */
     int       fd;
+    int       cached;           /* mapped write-back cacheable (manual sync required) */
+    int       sync_size_fd;     /* sysfs sync_size (-1 if not cached) */
+    int       sync_cpu_fd;      /* sysfs sync_for_cpu  (invalidate, post-S2MM) */
+    int       sync_dev_fd;      /* sysfs sync_for_device (clean, pre-MM2S) */
 } mmfree_buf_t;
 
 /* ---------------------------------------------------------------------- */
@@ -101,9 +110,23 @@ void mmfree_close(mmfree_ctx_t *ctx);
 
 /* Allocate a contiguous physical buffer via udmabuf. `udmabuf_dev` is the
  * path like "/dev/udmabuf0". The buffer's size is whatever the udmabuf was
- * created with — caller passes `size` to limit what mmfree maps. */
-int  mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size);
+ * created with — caller passes `size` to limit what mmfree maps.
+ *
+ * `cached`: 0 maps the buffer non-cacheable (Device memory, the legacy O_SYNC
+ * behavior — CPU access is slow but needs no cache management). 1 maps it
+ * write-back cacheable (fast CPU access) and requires the caller to bracket
+ * every DMA with mmfree_buf_sync_for_device (before the engine reads) and
+ * mmfree_buf_sync_for_cpu (after the engine writes). Only valid on non-coherent
+ * ikwzm u-dma-buf nodes (dma_coherent=0). */
+int  mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size, int cached);
 void mmfree_buf_close(mmfree_buf_t *b);
+
+/* Cache sync for a `cached` buffer over its first `nbytes` (rounded up to a
+ * cache line, clamped to the buffer). No-op when the buffer is non-cached.
+ *   _for_device: clean CPU caches so the engine reads what the CPU wrote.
+ *   _for_cpu:    invalidate CPU caches so the CPU reads what the engine wrote. */
+void mmfree_buf_sync_for_device(mmfree_buf_t *b, size_t nbytes);
+void mmfree_buf_sync_for_cpu(mmfree_buf_t *b, size_t nbytes);
 
 /* ---------------------------------------------------------------------- */
 /* Status / IRQ                                                           */
