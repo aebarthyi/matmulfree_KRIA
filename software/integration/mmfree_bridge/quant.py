@@ -1,6 +1,6 @@
 """Activation quantization / output dequantization for the int16 engine.
 
-Numeric contract (docs/MMFREELLM_INTEGRATION.md §1, int16 variant):
+Numeric contract (int16 variant):
     a_scale  = 32767 / max(|x_norm|)          (per token / per row)
     x_int    = round(x_norm * a_scale)         (int16)
     engine     acc[m] = Σ_n x_int[n] * w_t[n,m]

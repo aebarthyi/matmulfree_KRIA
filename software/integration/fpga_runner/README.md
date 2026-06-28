@@ -4,7 +4,7 @@ Runs **matmulfreellmCPU** (the C++ HGRN-Bit / MMfreeLM forward) with the ternary
 BitLinear projections executed on the KRIA systolic engine, and compares it head-to-head
 against the pure-CPU path. Same model, same `FixedQ510` numerics, same `run_bench` timing —
 only the `TernaryBackend` differs — so the measurement isolates exactly *ternary matmul on
-the A53 vs on the engine*. See `docs/MMFREELLM_CPP_FPGA_INTEGRATION.md`.
+the A53 vs on the engine*.
 
 ## Pieces
 
@@ -115,7 +115,7 @@ parity gate: PASS
 - `--prompt TEXT` needs `--tokenizer`; `--ids a,b,c` bypasses the tokenizer (deterministic,
   preferred for the gate). With no input a fixed pseudo-prompt is used.
 - Per-op engine round-trip (~145 ops/token) is the expected post-offload bottleneck.
-  Phase-F levers (see `docs/PIPELINING_PLAN.md`): `MMFREE_POLL=1` (default for dedicated
+  Phase-F levers: `MMFREE_POLL=1` (default for dedicated
   decode, +24%) and b-aware pack (+8%) are landed; the i/f/g cluster pipeline (overlap
   pack/readback under the engine) is next. NOTE: i/f/g *weight* fusion is a dead end —
   each BitLinear has its own inner RMSNorm so the three quantized activations differ.

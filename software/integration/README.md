@@ -1,7 +1,7 @@
 # mmfree integration — engine-side tooling for MMfreeLM-370M
 
-Implements the phases in [`docs/MMFREELLM_INTEGRATION.md`](../../docs/MMFREELLM_INTEGRATION.md)
-that turn the ternary matmul engine into a drop-in BitLinear backend.
+Implements the phased MMfreeLM integration that turns the ternary matmul engine
+into a drop-in BitLinear backend.
 
 > **Branch note:** `main` carries the production tooling (`mmfree_pack`, `mmfree_bridge`,
 > `libmmfree`, `fpga_runner`). The validation/test harness referenced below — the pytest

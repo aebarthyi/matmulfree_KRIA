@@ -19,8 +19,7 @@ INCDIRS  = -Iinclude
 # (the resolved geometry MUST match the loaded bitstream, or the core wedges →
 # completion timeout + state dump). bench.c keeps a k26_bench compiled-in default
 # for when nothing sets the env. The per-preset -DBENCH_* compile flags (and the
-# per-preset build dirs that isolated them) are gone — see
-# docs/REPO_CONSOLIDATION_PLAN.md.
+# per-preset build dirs that isolated them) are gone.
 OUT_DIR  = build
 BIN      = $(OUT_DIR)/bench
 

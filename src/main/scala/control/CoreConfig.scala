@@ -119,7 +119,7 @@ case class CoreConfig(
       * Flat KEY=VALUE preset manifest. `source`-able in bash (build_all.sh,
       * gen_overlay.tcl, the root Makefile) and trivially parsed in C. This is the
       * single source of truth for every geometry/deployment field that used to be
-      * hand-duplicated across the build/run scripts — see docs/REPO_CONSOLIDATION_PLAN.md.
+      * hand-duplicated across the build/run scripts.
       *
       * @param name the CoreConfig preset name (CoreConfig does not store its own).
       */
@@ -355,8 +355,7 @@ object CoreConfig {
       *     batch bottleneck: it doesn't amortize (B*M outputs read out) and was
       *     m_axis-width-bound at ~1 GB/s (32-bit S2MM). 128-bit matches the HP
       *     port → 4 GB/s store. It also shrinks outSubBeats (256→64) so the drain
-      *     hides through B=8 AND shallows outBram (shorter URAM cascade). See
-      *     docs/BATCHING_INTEGRATION_PLAN.md.
+      *     hides through B=8 AND shallows outBram (shorter URAM cascade).
       */
     val K26_MMFree370M_A16_B2: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 2, outBeatLanes = 4)
     val K26_MMFree370M_A16_B4: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 4, outBeatLanes = 4)

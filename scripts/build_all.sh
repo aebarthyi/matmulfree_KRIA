@@ -47,8 +47,7 @@ DESIGN="t_matmul"
 # PL_CLK_MHZ, UDMABUF_ACT/WT/OUT_SZ …) is derived once by CoreConfig and emitted
 # to generated/<preset>/preset.env by control.EmitCore (step 1). This script
 # SOURCES that file rather than re-deriving — the per-preset case tables that used
-# to live here (and silently drifted from CoreConfig) are gone. See
-# docs/REPO_CONSOLIDATION_PLAN.md.
+# to live here (and silently drifted from CoreConfig) are gone.
 #
 # load_manifest sets each KEY=VAL pair only if the var is NOT already in the
 # environment, so documented overrides still win. e.g.:
