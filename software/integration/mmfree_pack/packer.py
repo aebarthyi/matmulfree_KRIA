@@ -4,7 +4,7 @@ Turns each BitLinear weight matrix into the engine's col-tile-major, 2-bit,
 per-port byte layout — byte-identical to bench.c's pack loop — plus the scale
 `s` the runtime needs to dequantize. Pure numpy: no torch, no board.
 
-Numeric contract (see docs/MMFREELLM_INTEGRATION.md §1):
+Numeric contract:
     s        = 1 / mean(|W|)                       (per projection, scalar)
     w_t[m,n] = clamp(round(W[m,n] * s), -1, 1)      (ternary, matches weight_quant)
     engine acc[m] = Σ_n x_int[n] * w_t[n,m]

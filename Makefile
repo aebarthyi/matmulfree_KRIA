@@ -2,7 +2,7 @@
 #
 # Every verb derives geometry from the preset manifest (generated/<preset>/preset.env,
 # emitted by control.EmitCore — the single source of truth) and board addresses from
-# board.conf, so nothing is retyped or hand-synced. See docs/REPO_CONSOLIDATION_PLAN.md.
+# board.conf, so nothing is retyped or hand-synced.
 #
 #   make help                                   # this list
 #   make sim [SPEC=CoreConfig]                  # mill tests (SPEC = name substring)

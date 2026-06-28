@@ -38,7 +38,6 @@ object EmitCore extends App {
 
     // Preset manifest: single source of truth for every build/run consumer.
     // preset.env (KEY=VAL, source-able in bash + parsed in C) + preset.json (Python).
-    // See docs/REPO_CONSOLIDATION_PLAN.md.
     Files.createDirectories(Paths.get(targetDir))
     def write(file: String, content: String): Unit = {
         val p = Paths.get(targetDir, file)

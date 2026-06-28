@@ -86,7 +86,7 @@ if {![regsub {compatible = "xlnx,CoreTop[^"]*";} $dts \
 # already in the environment win, so documented overrides (e.g. a bigger
 # UDMABUF_WT_SZ for the resident full-model runner) still hold. The hand-tuned
 # case tables / static udmabuf.dtsi.in fragment that used to live here (and
-# drifted from CoreConfig) are retired — see docs/REPO_CONSOLIDATION_PLAN.md.
+# drifted from CoreConfig) are retired.
 proc load_manifest {path} {
     if {![file exists $path]} { return 0 }
     set fp [open $path r]

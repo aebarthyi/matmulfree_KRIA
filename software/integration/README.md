@@ -1,7 +1,7 @@
 # mmfree integration — engine-side tooling for MMfreeLM-370M
 
-Implements the phases in [`docs/MMFREELLM_INTEGRATION.md`](../../docs/MMFREELLM_INTEGRATION.md)
-that turn the ternary matmul engine into a drop-in BitLinear backend.
+Implements the phased MMfreeLM integration that turns the ternary matmul engine
+into a drop-in BitLinear backend.
 
 The PyTorch runtime ([matmulfreellmCPU](https://github.com/aebarthyi/matmulfreellmCPU))
 is cloned at the repo root as `runtime/` (gitignored — it carries its own git

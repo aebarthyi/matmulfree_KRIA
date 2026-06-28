@@ -299,6 +299,5 @@ make pack BLOB=path/to/model.mmfree OUT=packed PRESET=k26_mmfree370m_a16
 - **`scripts/BOARD_BRINGUP.md`** — full Vivado IP-packaging + block-design + KRIA deployment recipe, including troubleshooting for the failure modes seen during initial bring-up.
 - **`software/README.md`** — driver / register-map orientation.
 - **`software/integration/README.md`** — MMfreeLM weight packer, Python bridge, and the C++ decode runner.
-- **`docs/REPO_CONSOLIDATION_PLAN.md`** — how the preset manifest became the single source of truth (the design behind the `Makefile` flow).
 - **`CLAUDE.md`** — short orientation for Claude Code sessions in this repo.
 - **`src/main/scala/control/CoreConfig.scala`** — parameter definitions, derived widths, presets, the manifest emitters (`presetEnv`/`presetJson`), and the `forShape(n, m, …)` smart constructor for one-off configs.
