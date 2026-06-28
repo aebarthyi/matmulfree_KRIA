@@ -1,0 +1,27 @@
+# board.conf — per-board addresses + device paths for the root Makefile.
+#
+# Copy to ./board.conf and edit for your KRIA. The root Makefile -includes it
+# (and falls back to these same defaults when it is absent). KEY=VAL only, so it
+# is both make-includable and bash-sourceable — no spaces around '=', literals
+# only (no $-expansion).
+#
+# Discover the real values on the board:
+#   ls /dev/uio*                       # UIO node bound to the Core IRQ
+#   ls /dev/udmabuf-*                  # u-dma-buf nodes (bare or -act0.. suffixed)
+#   cat /sys/class/u-dma-buf/*/phys_addr
+#   # CSR / DMA base = the CoreTop + axi_dma addresses from the Vivado address map
+#   #                  (also printed by build_all.sh / in the generated dts).
+
+# user@host for `make deploy`
+BOARD=ubuntu@kria
+
+# Core CSR window + DMA0 register base (from the Vivado address map).
+CORE_PHYS=0xA0010000
+DMA_PHYS=0xA0000000
+
+# UIO + u-dma-buf base device paths. For NUM_DMA>1 the bench/runner append the
+# port index to ACT_UDMA/WT_UDMA (udmabuf-act0, udmabuf-act1, …); OUT stays bare.
+UIO_DEV=/dev/uio4
+ACT_UDMA=/dev/udmabuf-act
+WT_UDMA=/dev/udmabuf-wt
+OUT_UDMA=/dev/udmabuf-out

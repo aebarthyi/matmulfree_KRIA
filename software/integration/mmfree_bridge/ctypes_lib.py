@@ -8,6 +8,7 @@ so header/ABI drift fails loudly instead of corrupting the config silently.
 from __future__ import annotations
 
 import ctypes
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
@@ -62,6 +63,29 @@ class LibConfig:
     act_bytes_per_port: int = 0
     out_bytes: int = 0
     max_proj: int = 256
+
+    @classmethod
+    def from_manifest(cls, path: str, **overrides) -> "LibConfig":
+        """Build a LibConfig with geometry from a preset.json manifest
+        (control.EmitCore) so it matches the loaded bitstream. Board addresses /
+        device paths keep their defaults unless passed as keyword overrides.
+
+        `path` may point at the preset.json or its preset.env sibling."""
+        if path.endswith(".env"):
+            path = path[:-4] + ".json"
+        with open(path) as f:
+            m = json.load(f)
+        cfg = cls(
+            aWidth=int(m["aWidth"]),
+            xDim=int(m["xDim"]),
+            maxAcc=int(m["maxAcc"]),
+            maxN=int(m["maxN"]),
+            maxM=int(m["maxM"]),
+            batch=int(m["batch"]),
+        )
+        for k, v in overrides.items():
+            setattr(cfg, k, v)
+        return cfg
 
 
 def _bytes(s: str) -> bytes:

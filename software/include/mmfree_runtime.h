@@ -66,6 +66,22 @@ typedef struct mmfree_geom {
 int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
                      uint32_t maxAcc, uint32_t maxN, uint32_t maxM);
 
+/* Cross-check the resolved geometry `g` against a preset.env manifest emitted by
+ * control.EmitCore (the single source of truth for the loaded bitstream). Catches
+ * the classic footgun where the binary's geometry (compiled default or MMFREE_*
+ * env) disagrees with the bitstream actually programmed into the PL — which
+ * otherwise only surfaces as a Core wedge + completion timeout.
+ *
+ * `path` is a preset.env file; NULL/empty or unreadable → skipped (returns 0,
+ * no check). Compares aWidth/xDim/maxAcc/maxN/maxM/batch/numPorts. Returns the
+ * number of mismatched fields (0 = match), each WARNed to stderr. WARN-only by
+ * default; set MMFREE_STRICT=1 in the environment to make any mismatch fatal,
+ * in which case it returns -1.
+ *
+ * mmfree_geom_check_env reads the path from $MMFREE_MANIFEST. */
+int mmfree_geom_check_manifest(const mmfree_geom_t *g, const char *path);
+int mmfree_geom_check_env(const mmfree_geom_t *g);
+
 /* Max parallel DMAs/HP ports the input stream can be split across (HP0..HP3). */
 #define MMFREE_MAX_DMA 4
 

@@ -1,8 +1,7 @@
 """Phase E (single-layer) — FPGA vs CPU per-projection check.
 
-A focused alternative to the full-model phase_e_validate: take ONE decoder
-layer, run each of its BitLinear projections on both backends with identical
-inputs, and report
+A focused, fast full-model-free check: take ONE decoder layer, run each of its
+BitLinear projections on both backends with identical inputs, and report
 
   1. functional correctness — the CPU RefBackend (numpy integer matmul) is the
      golden model; the FPGA accumulators must match it EXACTLY (both compute the
@@ -39,13 +38,13 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mmfree_pack import Geometry  # noqa: E402
+from mmfree_pack import Geometry, manifest_path  # noqa: E402
 from mmfree_bridge.backend import RefBackend  # noqa: E402
 from mmfree_bridge.ctypes_lib import LibConfig  # noqa: E402
 from mmfree_bridge.engine import MmfreeEngine  # noqa: E402
 from mmfree_bridge.quant import quantize_act_int16  # noqa: E402
 from mmfree_bridge.runner import open_real_engine  # noqa: E402
-from phase_e_validate import Int8RefBackend, _mem, _start_mem_monitor  # noqa: E402
+from phase_e_common import Int8RefBackend, _mem, _start_mem_monitor  # noqa: E402
 
 
 def _load_single_layer_weights(checkpoint: str, layer: int):
@@ -133,6 +132,9 @@ def main(argv=None) -> int:
     ap.add_argument("--so-path", default="libmmfree.so")
     ap.add_argument("--awidth", type=int, default=16)
     ap.add_argument("--xdim", type=int, default=32)
+    ap.add_argument("--manifest", default=None,
+                    help="preset.json/.env (control.EmitCore) — geometry is read from "
+                         "it, overriding --awidth/--xdim. Defaults to $MMFREE_MANIFEST.")
     ap.add_argument("--layer", type=int, default=0, help="which decoder layer to probe")
     ap.add_argument("--reps", type=int, default=50, help="timing repetitions per projection")
     ap.add_argument("--seed", type=int, default=0)
@@ -159,7 +161,8 @@ def main(argv=None) -> int:
     print(f"layer {args.layer} weights loaded: {time.time()-t0:.1f}s", flush=True)
     _mem("after load")
 
-    geom = Geometry.derive(args.awidth, args.xdim)
+    _mpath = manifest_path(args.manifest)
+    geom = Geometry.from_manifest(_mpath) if _mpath else Geometry.derive(args.awidth, args.xdim)
 
     # CPU golden model (numpy integer matmul, int8 codes to keep it light).
     print("building CPU RefBackend engine...", flush=True)
@@ -171,7 +174,8 @@ def main(argv=None) -> int:
     # FPGA engine — same projections, same pack order, so proj_ids align.
     hw_eng = lib = None
     if not args.ref_only:
-        libcfg = LibConfig(aWidth=args.awidth, xDim=args.xdim)
+        libcfg = (LibConfig.from_manifest(_mpath) if _mpath
+                  else LibConfig(aWidth=args.awidth, xDim=args.xdim))
         print("packing blobs + opening FPGA engine...", flush=True)
         t0 = time.time()
         hw_eng, lib = open_real_engine(wl, geom, libcfg, args.blob_dir,

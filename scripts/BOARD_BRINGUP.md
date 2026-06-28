@@ -5,7 +5,10 @@ This is the minimum path from a successful `vivado` build of CoreTop (already do
 ## 0. Pre-reqs on the board
 
 - Ubuntu certified for KRIA (22.04 LTS or 24.04 LTS, Xilinx image).
-- `u-dma-buf` kernel module installed (Xilinx's [u-dma-buf](https://github.com/ikwzm/udmabuf)). Verify with `lsmod | grep u_dma_buf`.
+- `u-dma-buf` driver — **vendored as the `external/udmabuf` submodule** and built + loaded by
+  `scripts/deploy_kria.sh` / `make deploy` (or `make udmabuf` from a repo checkout). Needs
+  kernel headers: `sudo apt install linux-headers-$(uname -r)`. Verify after deploy with
+  `lsmod | grep u_dma_buf`. (Upstream: [ikwzm/udmabuf](https://github.com/ikwzm/udmabuf).)
 - `xmutil` available (ships with the Xilinx Ubuntu).
 - A serial / SSH session to the board.
 
@@ -71,17 +74,23 @@ File → Export → Export Hardware → include bitstream → save as core_bench
 
 ## 3. Boot the bitstream on the KRIA
 
-The Xilinx Ubuntu image uses `xmutil` + DT overlays. Both pieces — the bitstream and the overlay — are generated from the `.xsa` by `scripts/gen_overlay.sh`.
+The Xilinx Ubuntu image uses `xmutil` + DT overlays. `make build PRESET=<p>` (=
+`scripts/build_all.sh`) produces the bitstream **and** the overlay from the `.xsa` and
+assembles `transfer/<p>/`; you normally never run the overlay step by hand.
 
-### Generate the overlay (one command)
+### Generate the overlay (standalone)
 
-On your Vivado host (after `source /tools/Xilinx/Vivado/<ver>/settings64.sh`):
+The overlay step is `scripts/gen_overlay.tcl`, run via `xsct` (after
+`source /tools/Xilinx/Vivado/<ver>/settings64.sh`):
 
 ```bash
-./scripts/gen_overlay.sh path/to/system.xsa build/overlay
+MMFREE_MANIFEST=generated/<p>/preset.env \
+  xsct scripts/gen_overlay.tcl path/to/system.xsa build/overlay
 ```
 
-This extracts CoreTop's base address from the `.xsa` via xsct, substitutes it into `scripts/core_bench_overlay.dts.in`, runs `dtc` to compile the `.dtbo`, extracts the bitstream from the `.xsa`, and writes `shell.json`. Output:
+It uses xsct `createdts` to **auto-derive** CoreTop's base address + IRQ from the `.xsa`
+(no manual flags), patches the firmware-name, appends the u-dma-buf nodes **sized from the
+preset manifest** (`NUM_DMA` + `UDMABUF_*`), and compiles the `.dtbo`. Output:
 
 ```
 build/overlay/
@@ -91,17 +100,9 @@ build/overlay/
 └── shell.json          (consumed by xmutil)
 ```
 
-Flags worth knowing:
-- `-ip <name>` — override BD cell name if auto-detection misses it (looks for `CoreTop_0`, `mmfree_core_0`, then VLNV match).
-- `-addr <hex>` — override the base address (use if hsi auto-detect fails on your Vitis version).
-- `-irq <n>` — override the GIC SPI number (defaults to 89; check your block design's Concat → ps_pl_irq wiring).
-
-Sizes encoded in the dtsi template match `K26_Bench` worst-case at aWidth=16:
-- activations: maxN × 8 bytes/beat = 8 KiB
-- weights: maxN × numColTiles × 8 bytes = 1024 × 32 × 8 = 256 KiB
-- outputs: maxM × 4 bytes = 4 KiB
-
-To change those sizes for a different preset, edit `scripts/core_bench_overlay.dts.in` directly — the tcl just substitutes the address / IRQ placeholders, the udmabuf sizes are literal.
+The u-dma-buf node sizes and port count come entirely from the manifest, which is derived
+from the `CoreConfig` preset — to change them, change the preset (or override `UDMABUF_*` /
+`NUM_DMA` in the environment), never a static template.
 
 ### Deploy on the KRIA
 

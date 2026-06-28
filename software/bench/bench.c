@@ -574,6 +574,13 @@ int main(int argc, char **argv) {
     }
     geom.batch = (uint32_t)g_batch;
 
+    /* Cross-check the resolved geometry against the loaded bitstream's preset
+     * manifest ($MMFREE_MANIFEST), if set. WARN-only unless MMFREE_STRICT=1. */
+    if (mmfree_geom_check_env(&geom) < 0) {
+        fprintf(stderr, "MMFREE_STRICT: aborting on geometry/bitstream mismatch\n");
+        return 2;
+    }
+
     /* Build the sweep up front — the udmabuf sizes below derive from it. */
     bench_shape_t sweep[128]; size_t nsweep = 0;
     const char *mode = getenv("MMFREE_SHAPES");

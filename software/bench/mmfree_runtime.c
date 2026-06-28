@@ -472,6 +472,72 @@ int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
     return 0;
 }
 
+/* ---------- preset manifest cross-check ---------- */
+
+int mmfree_geom_check_manifest(const mmfree_geom_t *g, const char *path) {
+    if (!g || !path || !*path) return 0;   /* nothing configured → skip */
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "warn: MMFREE_MANIFEST=%s not readable (%s) — skipping "
+                "geometry cross-check\n", path, strerror(errno));
+        return 0;
+    }
+
+    struct { const char *key; uint32_t want, got; int seen; } chk[] = {
+        { "MMFREE_AWIDTH", g->aWidth,   0, 0 },
+        { "MMFREE_XDIM",   g->xDim,     0, 0 },
+        { "MMFREE_MAXACC", g->maxAcc,   0, 0 },
+        { "MMFREE_MAXN",   g->maxN,     0, 0 },
+        { "MMFREE_MAXM",   g->maxM,     0, 0 },
+        { "MMFREE_BATCH",  g->batch,    0, 0 },
+        { "NUM_DMA",       g->numPorts, 0, 0 },
+    };
+    const size_t nchk = sizeof(chk) / sizeof(chk[0]);
+    char preset[64] = "?";
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char *key = line;
+        char *val = eq + 1;
+        val[strcspn(val, "\r\n")] = '\0';   /* trim EOL */
+        if (strcmp(key, "MMFREE_PRESET") == 0) {
+            snprintf(preset, sizeof(preset), "%s", val);
+            continue;
+        }
+        for (size_t i = 0; i < nchk; i++)
+            if (strcmp(key, chk[i].key) == 0) {
+                chk[i].got  = (uint32_t)strtoul(val, NULL, 0);
+                chk[i].seen = 1;
+            }
+    }
+    fclose(f);
+
+    int mism = 0;
+    for (size_t i = 0; i < nchk; i++)
+        if (chk[i].seen && chk[i].got != chk[i].want) {
+            fprintf(stderr, "WARN: geometry vs bitstream manifest '%s' (%s): %s "
+                    "binary=%u bitstream=%u\n",
+                    preset, path, chk[i].key, chk[i].want, chk[i].got);
+            mism++;
+        }
+    if (mism) {
+        fprintf(stderr, "WARN: %d geometry field(s) disagree with the loaded "
+                "bitstream — the Core may wedge (completion timeout). Set "
+                "MMFREE_STRICT=1 to make this fatal.\n", mism);
+        const char *s = getenv("MMFREE_STRICT");
+        if (s && atoi(s) != 0) return -1;
+    }
+    return mism;
+}
+
+int mmfree_geom_check_env(const mmfree_geom_t *g) {
+    return mmfree_geom_check_manifest(g, getenv("MMFREE_MANIFEST"));
+}
+
 /* ---------- high-level ops ---------- */
 
 /* Kick all N MM2S engines with `bytes_per_port` from bufs[i] (starting at

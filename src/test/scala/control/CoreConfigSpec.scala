@@ -146,6 +146,67 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
   }
 
+  "Preset manifest (preset.env / preset.json)" - {
+    // Parse the flat KEY=VAL env into a map for assertions.
+    def envMap(c: CoreConfig, name: String): Map[String, String] =
+      c.presetEnv(name).linesIterator
+        .filterNot(l => l.trim.isEmpty || l.trim.startsWith("#"))
+        .map { l => val i = l.indexOf('='); l.substring(0, i) -> l.substring(i + 1) }
+        .toMap
+
+    "carries the a16 geometry the board flow expects" in {
+      val e = envMap(CoreConfig.K26_MMFree370M_A16, "k26_mmfree370m_a16")
+      e("MMFREE_AWIDTH")    mustBe "16"
+      e("MMFREE_XDIM")      mustBe "32"
+      e("MMFREE_SIGNED")    mustBe "1"
+      e("MMFREE_SHAPES")    mustBe "370m"
+      e("NUM_DMA")          mustBe "4"
+      e("MM2S_WIDTH")       mustBe "128"
+      e("S2MM_WIDTH")       mustBe "32"
+      e("PL_CLK_MHZ")       mustBe "250"
+      e("UDMABUF_ACT_SZ")   mustBe "0x00010000"   // maxN*portBytes = 4096*16 = 64 KiB
+      e("UDMABUF_OUT_SZ")   mustBe "0x00020000"   // 125*256*4, page-up = 128 KiB
+    }
+
+    "scales S2MM width and the output udmabuf with batch" in {
+      val e = envMap(CoreConfig.K26_MMFree370M_A16_B6, "k26_mmfree370m_a16_b6")
+      e("MMFREE_BATCH")     mustBe "6"
+      e("S2MM_WIDTH")       mustBe "128"           // outBeatLanes=4 * 32-bit lane
+      // OUT = batch*numColTilesMax*outLanesPerTile*outLaneBytes = 6*125*256*4, page-up
+      e("UDMABUF_OUT_SZ")   mustBe "0x000bc000"
+    }
+
+    "legacy bench preset keeps single-port 100 MHz geometry" in {
+      val e = envMap(CoreConfig.K26_Bench, "k26_bench")
+      e("NUM_DMA")     mustBe "1"
+      e("MM2S_WIDTH")  mustBe "64"
+      e("PL_CLK_MHZ")  mustBe "100"
+      e("MMFREE_SHAPES") mustBe "pow2"
+    }
+
+    "env udmabuf sizes equal the JSON byte counts for every preset" in {
+      CoreConfig.presets.foreach { case (name, c) =>
+        val e = envMap(c, name)
+        withClue(s"preset '$name'") {
+          java.lang.Long.decode(e("UDMABUF_ACT_SZ")) mustBe c.udmabufActBytes
+          java.lang.Long.decode(e("UDMABUF_WT_SZ"))  mustBe c.udmabufWtBytes
+          java.lang.Long.decode(e("UDMABUF_OUT_SZ")) mustBe c.udmabufOutBytes
+        }
+      }
+    }
+
+    "udmabuf defaults are never smaller than the runtime's worst-case transfer" in {
+      CoreConfig.presets.foreach { case (name, c) =>
+        withClue(s"preset '$name'") {
+          // act: maxN beats * portBytes; wt: that * col tiles; out: batch drain.
+          c.udmabufActBytes must be >= c.maxN.toLong * c.portBytes
+          c.udmabufWtBytes  must be >= c.maxN.toLong * c.numColTilesMax * c.portBytes
+          c.udmabufOutBytes must be >= c.batchSize.toLong * c.numColTilesMax * c.outLanesPerTile * c.outLaneBytes
+        }
+      }
+    }
+  }
+
   "byName" - {
     "is case-insensitive" in {
       CoreConfig.byName("DEFAULT")     mustBe CoreConfig.Default

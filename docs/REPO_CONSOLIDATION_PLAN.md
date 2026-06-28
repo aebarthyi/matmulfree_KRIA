@@ -1,7 +1,7 @@
-# Repo Consolidation Plan (future work)
+# Repo Consolidation Plan
 
-**Status:** planned, NOT started · **Created:** 2026-06-24 · execute *after* the batching
-optimizations land.
+**Status:** EXECUTED 2026-06-27 (P0 + P1 + sbt drop). One P2 item slipped — see the
+Status section at the bottom. **Created:** 2026-06-24.
 
 ## Problem
 
@@ -82,3 +82,46 @@ directly prevents the x86-binary and stale-overlay footguns.
    board and verify udmabuf sizes post-overlay-load.
 5. **P2 (last — slip first if the day runs out):** drop sbt (keep mill); unify
    `bench`+`smoke`+`fpga-cli` (all on `mmfree_runtime`/`libmmfree`) into one subcommand binary.
+
+## Status — executed 2026-06-27
+
+**The linchpin (P0): one source of truth → one manifest → all consumers.**
+- `control.EmitCore` now emits `generated/<preset>/preset.env` + `preset.json` with every
+  derived `CoreConfig` field (geometry, ports, widths, PL clock, udmabuf sizes). Added a
+  `plClkMhz` field to `CoreConfig` (the only deployment-policy value that wasn't derivable);
+  udmabuf sizes are derived from geometry. Locked by tests in `CoreConfigSpec`.
+- **Consumers wired (case tables / `-D` flags deleted):**
+  - `scripts/build_all.sh` sources `preset.env` (non-clobbering, so env overrides still win);
+    all per-preset case tables removed.
+  - `software/Makefile` — `ifeq -DBENCH_*` blocks gone; geometry is purely runtime via
+    `MMFREE_*` env, so ONE binary serves every preset (per-preset build dirs also removed).
+  - `scripts/gen_overlay.tcl` reads NUM_DMA + udmabuf sizes from the manifest (single- AND
+    multi-port nodes generated in TCL); static `udmabuf.dtsi.in` retired.
+  - `mmfree_bridge/ctypes_lib.py` + `mmfree_pack/geometry.py` got `from_manifest()`; the
+    `mmfree_pack.cli` + all three `phase_e_*` scripts accept `--manifest` / `$MMFREE_MANIFEST`.
+  - Runtime (`mmfree_runtime.c`) cross-checks geometry vs the manifest at startup —
+    `mmfree_geom_check_env()`, WARN-first; `MMFREE_STRICT=1` makes it fatal. Wired into
+    `bench.c` and `mmfree_lib.c`.
+
+**P0 task runner:** root `Makefile` with `help/sim/build/pack/deploy/bench/smoke/gate/run`.
+Arg-heavy verbs take `PRESET=`/`BATCH=`/`ARGS=`; board verbs hand geometry through
+`sudo env` (sudo strips the environment). Geometry from the manifest, addresses from `board.conf`.
+
+**P1:** `board.conf.example` template (`board.conf` git-ignored; Makefile `-include`s it with
+real-KRIA defaults). Board verbs build C natively (they `make -C` on the board). `deploy_kria.sh`
+verifies each u-dma-buf node's sysfs size against the deployed manifest (kills the stale-overlay
+footgun); `build_all.sh` ships `preset.env`/`.json` in `transfer/<preset>/`.
+
+**P2:** sbt dropped (mill is the sole build tool; `build.sbt` + `project/` removed, CI + README +
+CLAUDE.md updated). 
+
+**SLIPPED (follow-up):** physically merging `bench` + `smoke` + `fpga-cli` into one subcommand
+binary. The root `Makefile` already unifies the *UX* (one runner reaches all four harnesses), so
+the binary merge is low-benefit / high-risk churn to proven board tooling — deferred by decision
+2026-06-27. If picked up: they all already link `mmfree_runtime`/`libmmfree`; the blocker is just
+C (bench/smoke) vs C++ (runner) in one build + a dispatcher.
+
+**Not yet exercised on hardware:** the board-only paths (`make bench/smoke/gate/run`, the
+`deploy_kria.sh` udmabuf check, the runtime manifest cross-check on a live mismatch) are logic-
+verified on the host but await a board run. Flip the runtime check to hard-assert (drop the
+WARN-first) only after a known-good board run, per the original plan.

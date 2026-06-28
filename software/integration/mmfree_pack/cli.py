@@ -20,7 +20,7 @@ import argparse
 import sys
 
 from .blob import read_mmfree_blob
-from .geometry import Geometry
+from .geometry import Geometry, manifest_path
 from .model import iter_blob_projections, iter_projections, load_checkpoint
 from .packer import WeightPacker
 
@@ -36,9 +36,15 @@ def main(argv=None) -> int:
     ap.add_argument("--prefix", default="weights", help="output filename prefix")
     ap.add_argument("--awidth", type=int, default=16, help="activation bit width (a16 engine = 16)")
     ap.add_argument("--xdim", type=int, default=32, help="systolic array columns (a16 engine = 32)")
+    ap.add_argument("--manifest", default=None,
+                    help="preset.json/.env from control.EmitCore — geometry is read "
+                         "from it (overrides --awidth/--xdim). Defaults to $MMFREE_MANIFEST.")
     args = ap.parse_args(argv)
 
-    geom = Geometry.derive(args.awidth, args.xdim)
+    mpath = manifest_path(args.manifest)
+    geom = Geometry.from_manifest(mpath) if mpath else Geometry.derive(args.awidth, args.xdim)
+    if mpath:
+        print(f"geometry from manifest: {mpath}", file=sys.stderr)
     print(f"geometry: aWidth={geom.aWidth} xDim={geom.xDim} "
           f"numPorts={geom.numPorts} outLanesPerTile={geom.outLanesPerTile} "
           f"portBytes={geom.portBytes}", file=sys.stderr)

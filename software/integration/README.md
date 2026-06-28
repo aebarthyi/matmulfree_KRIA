@@ -102,25 +102,25 @@ engine (skipping the model's native int8 fake-quant) — higher precision, the p
 of the a16 build. The RMSNorm uses `eps=1e-6` (the `layer_norm_linear_quant_fn`
 default the model actually runs with, not the norm module's construction eps).
 
-## Phase E — `phase_e_validate.py` (on-board driver)
+## Phase E — `phase_e_layer.py` (on-board driver)
 
-Ties the bridge together on the KRIA and validates two ways:
+The full-model PyTorch validators (`phase_e_validate.py`, `phase_e_layer_e2e.py`) were
+**retired** once the C++ model (`matmulfreellmCPU/cpp`) replaced the original PyTorch/triton
+implementation as the trusted reference — they depended on `mmfreelm`, which is gone. Two
+validation paths remain:
 
-1. **HW(int16) vs native(int8) reference** — top-1 token agreement + logit
-   deltas (default; memory-frugal). Close, not exact — int16 is higher precision.
-2. **`--ref-check`: HW vs RefBackend twin** — same int16 math, only the backend
-   differs → must match to fp32 round-off. The rigorous hardware pass/fail. Uses
-   a compact `Int8RefBackend` (codes as int8, ~0.37 GB) so the full 370M twin
-   fits alongside the fp16 model on a 4 GB board.
+- **`phase_e_layer.py`** — fast per-projection HW-vs-CPU check on ONE decoder layer. Runs
+  each BitLinear projection on both the FPGA engine and a numpy `Int8RefBackend` (codes as
+  int8, ~0.37 GB; no torch) with identical int16 inputs → must match exactly. Memory-frugal
+  (single layer, lazy-loaded). Shared helpers live in `phase_e_common.py`.
+- **`fpga_runner`** (`make gate`) — end-to-end CPU-vs-FPGA exact-match gate over the full
+  decode loop.
 
 ```bash
-# on the KRIA (needs torch + transformers + triton-cpu + libmmfree.so + udmabufs)
-python phase_e_validate.py --checkpoint ridger/MMfreeLM-370M \
-    --blob-dir /tmp/mmfree_blobs --so-path build/libmmfree.so --ref-check
+# on the KRIA (needs libmmfree.so + udmabufs; no torch/transformers)
+python phase_e_layer.py --manifest ../../generated/<preset>/preset.env \
+    --blob-dir /tmp/mmfree_blobs --so-path build/libmmfree.so
 ```
-
-Memory: model loaded fp16 (~0.74 GB); the fp32 weights dict (~1.5 GB) is freed
-once the engine is built; HW weights live in CMA off-heap.
 
 ## Next phases
 - **F** — perf: polling completion (`MMFREE_POLL`), i/f/g fusion (norm-folded),

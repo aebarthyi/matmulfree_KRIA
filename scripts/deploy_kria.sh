@@ -54,9 +54,85 @@ else
     echo "==> clk_ignore_unused already active"
 fi
 
-# ─── 3. Load the app ─────────────────────────────────────────────────────
+# ─── 3. Ensure the u-dma-buf driver is loaded ────────────────────────────
+# Vendored as a submodule (external/udmabuf) and shipped in this transfer dir, so
+# the board needs no externally-installed module. Build + insmod it here if it
+# isn't already loaded; load it BEFORE the overlay so the driver binds the
+# ikwzm,u-dma-buf nodes the overlay adds. Building needs kernel headers
+# (linux-headers-$(uname -r)).
+if lsmod | grep -qw u_dma_buf; then
+    echo "==> u-dma-buf module already loaded"
+elif [ -f "$HERE/udmabuf/u-dma-buf.c" ]; then
+    KHDR="/lib/modules/$(uname -r)/build"
+    if [ ! -d "$KHDR" ]; then
+        echo "WARNING: kernel headers missing ($KHDR) — cannot build u-dma-buf." >&2
+        echo "         Install with: sudo apt install linux-headers-\$(uname -r)" >&2
+        echo "         then re-run this script (or: make -C $HERE/udmabuf && sudo insmod $HERE/udmabuf/u-dma-buf.ko)" >&2
+    else
+        echo "==> Building u-dma-buf from vendored source ($HERE/udmabuf)"
+        # cd in (not make -C): the upstream Makefile uses M=$(PWD), which only
+        # resolves correctly when make runs from inside the module directory.
+        ( cd "$HERE/udmabuf" && make ) >/dev/null
+        insmod "$HERE/udmabuf/u-dma-buf.ko"
+        echo "==> Loaded u-dma-buf.ko"
+        # Best-effort install so modprobe finds it after a reboot.
+        ( cd "$HERE/udmabuf" && make modules_install ) >/dev/null 2>&1 && depmod -a 2>/dev/null || true
+    fi
+else
+    echo "WARNING: no u-dma-buf source in $HERE/udmabuf and module not loaded — " >&2
+    echo "         /dev/udmabuf-* will be absent. Rebuild with the external/udmabuf" >&2
+    echo "         submodule initialized, or load the module manually." >&2
+fi
+
+# ─── 4. Load the app ─────────────────────────────────────────────────────
 xmutil unloadapp >/dev/null 2>&1 || true
 xmutil loadapp "$APP"
+
+# ─── 5. Verify u-dma-buf nodes match the deployed preset manifest ─────────
+# Directly prevents the stale-overlay footgun (an old overlay's smaller udmabuf
+# silently truncating the new geometry's transfers). preset.env ships in the
+# transfer dir; the overlay's nodes must be at least the manifest's sizes.
+if [ -f "$HERE/preset.env" ]; then
+    # shellcheck disable=SC1091
+    . "$HERE/preset.env"
+    udmabuf_size() {            # $1=node name → prints size in bytes, or empty
+        local cls
+        for cls in u-dma-buf udmabuf; do
+            [ -r "/sys/class/$cls/$1/size" ] && { cat "/sys/class/$cls/$1/size"; return; }
+        done
+    }
+    verify_node() {            # $1=node name  $2=want bytes
+        local got; got=$(udmabuf_size "$1")
+        if [ -z "$got" ]; then
+            echo "WARN: udmabuf node '$1' not found in sysfs — overlay didn't create it." >&2
+            return 1
+        fi
+        if [ "$got" -lt "$2" ]; then
+            echo "WARN: udmabuf '$1' is $got B but $MMFREE_PRESET needs $2 B — STALE OVERLAY; rebuild + redeploy." >&2
+            return 1
+        fi
+        printf "    %-14s %10s B  (>= %s) OK\n" "$1" "$got" "$2"
+    }
+    n=${NUM_DMA:-1}
+    act=$((UDMABUF_ACT_SZ)); wt=$((UDMABUF_WT_SZ)); out=$((UDMABUF_OUT_SZ))
+    echo "==> Verifying u-dma-buf nodes against preset '$MMFREE_PRESET' (NUM_DMA=$n)"
+    rc=0
+    if [ "$n" -eq 1 ]; then
+        verify_node udmabuf-act "$act" || rc=1
+        verify_node udmabuf-wt  "$wt"  || rc=1
+    else
+        i=0; while [ "$i" -lt "$n" ]; do
+            verify_node "udmabuf-act$i" "$act" || rc=1
+            verify_node "udmabuf-wt$i"  "$wt"  || rc=1
+            i=$((i + 1))
+        done
+    fi
+    verify_node udmabuf-out "$out" || rc=1
+    [ "$rc" -eq 0 ] && echo "==> udmabuf sizes OK" \
+                    || echo "WARN: udmabuf verification found problems (see above)."
+else
+    echo "==> (no preset.env in transfer dir — skipping udmabuf size verification)"
+fi
 
 if [ "$REBOOT_NEEDED" -eq 1 ]; then
     echo

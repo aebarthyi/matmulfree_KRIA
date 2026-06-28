@@ -147,6 +147,13 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
         goto fail;
     }
 
+    /* Cross-check geometry against the loaded bitstream's preset manifest
+     * ($MMFREE_MANIFEST), if set. WARN-only unless MMFREE_STRICT=1 (then fail). */
+    if (mmfree_geom_check_env(&h->ctx.geom) < 0) {
+        fprintf(stderr, "mmfree_lib_open: MMFREE_STRICT geometry/bitstream mismatch\n");
+        goto fail;
+    }
+
     const uint32_t P = h->ctx.geom.numPorts;
     for (uint32_t p = 0; p < P; p++) {
         /* Weights are written once (cold path) and ports 1..P-1 carry only the

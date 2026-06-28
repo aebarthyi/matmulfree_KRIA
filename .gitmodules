@@ -1,3 +1,7 @@
 [submodule "matmulfreellmCPU"]
 	path = matmulfreellmCPU
 	url = https://github.com/aebarthyi/matmulfreellmCPU.git
+	branch = main
+[submodule "external/udmabuf"]
+	path = external/udmabuf
+	url = https://github.com/ikwzm/udmabuf.git

@@ -42,95 +42,43 @@ cd "$REPO_ROOT"
 PRESET="${PRESET:-k26_bench}"
 DESIGN="t_matmul"
 
-# Stream geometry per preset (must mirror CoreConfig presets). The s_axis
-# stream is xDim*aWidth bits; one PS HP port carries at most 128 bits, so wider
-# streams are split across NUM_DMA parallel DMAs/HP ports (HP0..HP3), each
-# 128 bits wide. vivado/bd.tcl consumes NUM_DMA + MM2S_WIDTH via the
-# environment; gen_overlay.tcl consumes NUM_DMA for the udmabuf node count.
-case "$PRESET" in
-    k26_bench)       XDIM=4;  AWIDTH=16 ;;
-    k26_bench16)     XDIM=16; AWIDTH=8  ;;
-    k26_bench32)     XDIM=32; AWIDTH=8  ;;
-    k26_bench64)     XDIM=64; AWIDTH=8  ;;
-    k26_mmfree370m)     XDIM=64; AWIDTH=8  ;;
-    k26_mmfree370m_a16) XDIM=32; AWIDTH=16 ;;   # signed int16 activations
-    # Batched a16 (CoreConfig.batchSize=B): B activation vectors per weight
-    # stream. B<=xDim keeps the same 512-b/4-port topology as the B=1 a16 preset;
-    # only the engine's PE rows / output drain scale (see BATCH below).
-    k26_mmfree370m_a16_b2|k26_mmfree370m_a16_b4|k26_mmfree370m_a16_b6|k26_mmfree370m_a16_b8) XDIM=32; AWIDTH=16 ;;
-    *) echo "ERROR: preset '$PRESET' has no geometry entry here — add xDim/aWidth (mirror CoreConfig)." >&2
-       exit 1 ;;
-esac
+# ─── Preset manifest = single source of truth ───────────────────────────────
+# Every geometry/deployment field (XDIM, AWIDTH, NUM_DMA, MM2S_WIDTH, S2MM_WIDTH,
+# PL_CLK_MHZ, UDMABUF_ACT/WT/OUT_SZ …) is derived once by CoreConfig and emitted
+# to generated/<preset>/preset.env by control.EmitCore (step 1). This script
+# SOURCES that file rather than re-deriving — the per-preset case tables that used
+# to live here (and silently drifted from CoreConfig) are gone. See
+# docs/REPO_CONSOLIDATION_PLAN.md.
+#
+# load_manifest sets each KEY=VAL pair only if the var is NOT already in the
+# environment, so documented overrides still win. e.g.:
+#   UDMABUF_WT_SZ=0x01800000 ./scripts/build_all.sh   # 24 MiB resident-runner set
+#   PL_CLK_MHZ=100 ./scripts/build_all.sh             # rebuild a 250 preset at 100
+load_manifest() {
+    local f="$1" line key val
+    [ -f "$f" ] || { echo "ERROR: preset manifest $f missing — run a full build" \
+        "(SKIP_SV=0, no PACKAGE_ONLY) once to generate it." >&2; return 1; }
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        key="${line%%=*}"; val="${line#*=}"
+        [ -n "${!key+x}" ] || { printf -v "$key" '%s' "$val"; export "$key"; }
+    done < "$f"
+    # Above 100 MHz the default impl strategy leaves ~90 ps on the store path
+    # (outBram -> lane mux -> S2MM skid buffer); use the post-route phys_opt
+    # explore strategy. Override with IMPL_STRATEGY=... in the env.
+    if [ "${PL_CLK_MHZ:-100}" -gt 100 ]; then
+        export IMPL_STRATEGY="${IMPL_STRATEGY:-Performance_ExplorePostRoutePhysOpt}"
+    fi
+}
 
-# Batch size baked into the bitstream (parsed from the _bN preset suffix). Only
-# the OUTPUT udmabuf scales with it — the engine drains B output vectors per
-# STORE; activations (B fit one port slice for B<=8) and weights are unchanged.
-case "$PRESET" in
-    *_b2) BATCH=2 ;;
-    *_b4) BATCH=4 ;;
-    *_b6) BATCH=6 ;;
-    *_b8) BATCH=8 ;;
-    *)    BATCH=1 ;;
-esac
+print_banner() {
+    echo "############################################################"
+    echo "# t_matmul full build"
+    echo "#   preset = $PRESET   jobs = $JOBS   repackage = $REPACKAGE"
+    echo "#   stream = ${MMFREE_AXIS_DATA_WIDTH}b -> $NUM_DMA DMA(s) x ${MM2S_WIDTH}b MM2S @ ${PL_CLK_MHZ} MHz"
+    echo "############################################################"
+}
 
-# Output stream (CoreTop m_axis / DMA0 S2MM) width = outBeatLanes * outLaneWidth.
-# The batched a16 presets use outBeatLanes=4 (outLaneWidth=32) → 128-bit S2MM so
-# the store isn't capped at the 32-bit ~1 GB/s ceiling (128-bit = the HP port =
-# ~4 GB/s). Default 32. Mirrors CoreConfig outBeatLanes — keep in sync (the
-# preset-manifest consolidation in docs/REPO_CONSOLIDATION_PLAN.md removes this).
-if [ "$BATCH" -gt 1 ]; then S2MM_WIDTH=128; else S2MM_WIDTH=32; fi
-export S2MM_WIDTH
-
-# PL fabric clock (vivado/bd.tcl PL0_REF). 250 MHz closes since the 2026-06-11
-# Core pipeline stages (inQ/outQ queues terminate both BRAM-sourced critical
-# paths in registers — OOC WNS +1.12 ns; pre-pipeline 250 was marginal at
-# +0.002/-0.212 ns across seeds). Note the PS clock wizard grants the nearest
-# achievable PLL rate, not the request (e.g. a 214 ask lands on ACT=199.998) —
-# verify assigned-clock-rates in the generated dts and keep the bench's
-# BENCH_CLK_MHZ matching it. Legacy presets keep their proven 100 MHz builds.
-# Override per build with PL_CLK_MHZ=... in the environment.
-case "$PRESET" in
-    k26_mmfree370m|k26_mmfree370m_a16|k26_mmfree370m_a16_b2|k26_mmfree370m_a16_b4|k26_mmfree370m_a16_b6|k26_mmfree370m_a16_b8) PL_CLK_MHZ="${PL_CLK_MHZ:-250}" ;;
-    *)                                 PL_CLK_MHZ="${PL_CLK_MHZ:-100}" ;;
-esac
-export PL_CLK_MHZ
-
-# Above 100 MHz the default impl strategy leaves ~90 ps on the table on the
-# store path (outBram -> lane mux -> S2MM skid buffer); use the post-route
-# phys_opt explore strategy there. Override with IMPL_STRATEGY=... in the env.
-if [ "$PL_CLK_MHZ" -gt 100 ]; then
-    export IMPL_STRATEGY="${IMPL_STRATEGY:-Performance_ExplorePostRoutePhysOpt}"
-fi
-
-# u-dma-buf node sizes for gen_overlay.tcl. Defaults (unset) keep the historical
-# 16K/256K/4K nodes; the 370M preset needs room for maxN=4096 activations, the
-# pow2 sweep's worst weight stream (4096 rows x 125 col tiles x 16 B/port =
-# 8 MiB — the 370m projection sweep itself peaks at 2 MiB/port on lm_head),
-# and the 32000-lane output (125 KiB).
-case "$PRESET" in
-  k26_mmfree370m|k26_mmfree370m_a16|k26_mmfree370m_a16_b2|k26_mmfree370m_a16_b4|k26_mmfree370m_a16_b6|k26_mmfree370m_a16_b8)  # 16 B/port → same act/wt sizes
-    # Defaults cover the per-shape bench (wt peaks ~8 MiB on the pow2 sweep). The
-    # resident full-model runner (integration/fpga_runner) holds ALL 145 projections
-    # at once — ~21.3 MiB/port — so override with UDMABUF_WT_SZ=0x01800000 (24 MiB)
-    # before this script for that flow. All honor a pre-set env value.
-    # Batched presets drain BATCH output vectors per STORE, so the OUT node scales
-    # xBATCH (act/wt unchanged — B<=8 fits one port slice; weights are broadcast).
-    export UDMABUF_ACT_SZ=${UDMABUF_ACT_SZ:-0x00010000}   #  64 KiB / port
-    export UDMABUF_WT_SZ=${UDMABUF_WT_SZ:-0x00800000}     #   8 MiB / port (bench)
-    export UDMABUF_OUT_SZ=${UDMABUF_OUT_SZ:-$(printf '0x%08x' $((BATCH * 0x00020000)))}   # 128 KiB x BATCH
-    ;;
-esac
-STREAM_BITS=$((XDIM * AWIDTH))
-if [ "$STREAM_BITS" -le 128 ]; then
-    NUM_DMA=1
-    MM2S_WIDTH=$STREAM_BITS
-else
-    [ $((STREAM_BITS % 128)) -eq 0 ] || { echo "ERROR: stream width $STREAM_BITS not a multiple of 128." >&2; exit 1; }
-    NUM_DMA=$((STREAM_BITS / 128))
-    [ "$NUM_DMA" -le 4 ] || { echo "ERROR: stream width $STREAM_BITS needs $NUM_DMA HP ports (max 4)." >&2; exit 1; }
-    MM2S_WIDTH=128
-fi
-export NUM_DMA MM2S_WIDTH
 APP="core_bench"            # xmutil app name; output files are <APP>.*
 JOBS="${JOBS:-8}"
 REPACKAGE="${REPACKAGE:-0}"
@@ -151,23 +99,22 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not on PATH. Sou
 [ "$PACKAGE_ONLY" = "1" ]   || need vivado
 [ "$BITSTREAM_ONLY" = "1" ] || for t in xsct dtc bootgen unzip; do need "$t"; done
 
-echo "############################################################"
-echo "# t_matmul full build"
-echo "#   preset = $PRESET   jobs = $JOBS   repackage = $REPACKAGE"
-echo "#   stream = ${STREAM_BITS}b -> $NUM_DMA DMA(s) x ${MM2S_WIDTH}b MM2S @ ${PL_CLK_MHZ} MHz"
-echo "############################################################"
-
-# ─── 1. Chisel → SystemVerilog ──────────────────────────────────────────────
+# ─── 1. Chisel → SystemVerilog + preset manifest ────────────────────────────
 if [ "$PACKAGE_ONLY" = "1" ]; then
     echo; echo "==> [1-3/6] Skipping build steps (PACKAGE_ONLY=1) — reusing $XSA"
     [ -f "$XSA" ] || { echo "ERROR: $XSA missing — run the bitstream build first." >&2; exit 1; }
+    load_manifest "$SV_DIR/preset.env" || exit 1
+    print_banner
 else
     if [ "$SKIP_SV" = "0" ]; then
-        echo; echo "==> [1/6] Emitting SystemVerilog ($PRESET) via mill"
+        echo; echo "==> [1/6] Emitting SystemVerilog + preset manifest ($PRESET) via mill"
         ./mill matmulfree_KRIA.runMain control.EmitCore "$PRESET" "generated/$PRESET"
     else
         echo; echo "==> [1/6] Skipping SV regeneration (SKIP_SV=1)"
     fi
+    # Manifest now exists (just emitted, or from a prior build when SKIP_SV=1).
+    load_manifest "$SV_DIR/preset.env" || exit 1
+    print_banner
 
     # Note: batched presets emit the output memory as a URAM BlackBox
     # (control.OutMemUltra, ram_style="ultra") directly from Chisel — no SV
@@ -200,7 +147,9 @@ fi
 # ─── 4. XSA → overlay (.bit, .dtbo, shell.json) ─────────────────────────────
 echo; echo "==> [4/6] Generating device-tree overlay + shell.json (xsct createdts)"
 rm -rf "$OVERLAY_DIR"
-xsct "$SCRIPT_DIR/gen_overlay.tcl" "$XSA" "$OVERLAY_DIR"
+# NUM_DMA + UDMABUF_* are already in the environment (load_manifest); also point
+# gen_overlay at the manifest file so a standalone re-run is self-sufficient.
+MMFREE_MANIFEST="$SV_DIR/preset.env" xsct "$SCRIPT_DIR/gen_overlay.tcl" "$XSA" "$OVERLAY_DIR"
 for f in "$APP.bit" "$APP.dtbo" shell.json; do
     [ -f "$OVERLAY_DIR/$f" ] || { echo "ERROR: overlay step did not produce $f" >&2; exit 1; }
 done
@@ -222,6 +171,23 @@ cp "$OVERLAY_DIR/$APP.bit.bin" "$TRANSFER_DIR/"
 cp "$OVERLAY_DIR/$APP.dtbo"    "$TRANSFER_DIR/"
 cp "$OVERLAY_DIR/shell.json"   "$TRANSFER_DIR/"
 cp "$SCRIPT_DIR/deploy_kria.sh" "$TRANSFER_DIR/"
+# Ship the preset manifest so deploy_kria.sh can verify the udmabuf node sizes
+# and the on-board runtime can cross-check geometry against the loaded bitstream.
+cp "$SV_DIR/preset.env"  "$TRANSFER_DIR/" 2>/dev/null || true
+cp "$SV_DIR/preset.json" "$TRANSFER_DIR/" 2>/dev/null || true
+# Ship the vendored u-dma-buf driver source so deploy_kria.sh can build + load it
+# on the board — the user needs no externally-installed module. (Submodule:
+# external/udmabuf; init with `git submodule update --init --recursive`.)
+UDMABUF_SRC="$REPO_ROOT/external/udmabuf"
+if [ -f "$UDMABUF_SRC/u-dma-buf.c" ]; then
+    mkdir -p "$TRANSFER_DIR/udmabuf"
+    cp "$UDMABUF_SRC"/u-dma-buf.c "$UDMABUF_SRC"/u-dma-buf-ioctl.h \
+       "$UDMABUF_SRC"/Makefile "$UDMABUF_SRC"/Kconfig "$UDMABUF_SRC"/LICENSE \
+       "$TRANSFER_DIR/udmabuf/" 2>/dev/null || true
+else
+    echo "WARN: external/udmabuf submodule not initialized — transfer/ won't carry the" >&2
+    echo "      u-dma-buf driver; run 'git submodule update --init --recursive' and rebuild." >&2
+fi
 chmod +x "$TRANSFER_DIR/deploy_kria.sh"
 
 echo

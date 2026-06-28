@@ -8,11 +8,26 @@ in lockstep with mmfree_runtime.c / CoreConfig.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from typing import Optional
 
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def manifest_path(explicit: Optional[str] = None) -> Optional[str]:
+    """Resolve the preset.json manifest path: an explicit arg, else the
+    MMFREE_MANIFEST env var (a preset.env or preset.json path — we normalize to
+    the .json sibling). Returns None if nothing is configured."""
+    p = explicit or os.environ.get("MMFREE_MANIFEST")
+    if not p:
+        return None
+    if p.endswith(".env"):
+        p = p[:-4] + ".json"
+    return p
 
 
 @dataclass(frozen=True)
@@ -32,6 +47,14 @@ class Geometry:
 
     MAX_PORTS = 4
     PORT_BITS = 128
+
+    @classmethod
+    def from_manifest(cls, path: str) -> "Geometry":
+        """Derive geometry from a preset.json manifest (control.EmitCore), so the
+        packed blob matches the loaded bitstream without hand-passing aWidth/xDim."""
+        with open(path) as f:
+            m = json.load(f)
+        return cls.derive(aWidth=int(m["aWidth"]), xDim=int(m["xDim"]))
 
     @classmethod
     def derive(cls, aWidth: int, xDim: int) -> "Geometry":

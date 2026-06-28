@@ -1,6 +1,8 @@
 package control
 
 import circt.stage.ChiselStage
+import java.nio.file.{Files, Paths}
+import java.nio.charset.StandardCharsets
 
 /**
   * Emit SystemVerilog for the CoreTop module (the Vivado-facing wrapper).
@@ -34,5 +36,17 @@ object EmitCore extends App {
         )
     )
 
-    println(s"Done. SV written to $targetDir/")
+    // Preset manifest: single source of truth for every build/run consumer.
+    // preset.env (KEY=VAL, source-able in bash + parsed in C) + preset.json (Python).
+    // See docs/REPO_CONSOLIDATION_PLAN.md.
+    Files.createDirectories(Paths.get(targetDir))
+    def write(file: String, content: String): Unit = {
+        val p = Paths.get(targetDir, file)
+        Files.write(p, content.getBytes(StandardCharsets.UTF_8))
+        println(s"Wrote $p")
+    }
+    write("preset.env",  config.presetEnv(configName))
+    write("preset.json", config.presetJson(configName))
+
+    println(s"Done. SV + manifest written to $targetDir/")
 }

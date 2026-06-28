@@ -1,5 +1,12 @@
 ### Project Specific stuff
 test_run_dir/*
+# Per-board config (copy from board.conf.example). Machine-specific, not committed.
+board.conf
+# Stale compiled test binary location (now builds to software/build/).
+software/tests/encode_sanity
+# Deployable per-preset bundles (bitstream/.bit.bin/.dtbo + manifest). Build output of
+# scripts/build_all.sh — regenerate with `make build PRESET=...`; not versioned.
+transfer/
 ### XilinxISE template
 # intermediate build files
 *.bgn
