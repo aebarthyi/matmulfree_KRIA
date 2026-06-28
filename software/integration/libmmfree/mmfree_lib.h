@@ -100,6 +100,25 @@ int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
 int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
                            const int16_t *x, int32_t *acc, uint32_t b);
 
+/* ---- pipelined cluster primitives -----------------------------------------
+ * mmfree_bitlinear_batch, split into non-blocking issue + blocking wait so a
+ * caller can overlap CPU work (quant+pack the next projection, sign-expand the
+ * previous) with the engine's COMPUTE. Engine ordering is strictly one-op at a
+ * time (the Core has a 1-deep instruction buffer + single irqPending). ACT and
+ * OUT are single-region: pack the next activation only AFTER mmfree_seq_load of
+ * the current has drained ACT into on-chip BRAM, and read OUT back BEFORE the
+ * next mmfree_seq_store_issue overwrites it. Intended call order per projection:
+ *   pack -> load -> compute_issue -> [CPU overlap] -> compute_wait ->
+ *   store_issue -> store_wait -> readback.
+ * All return 0 / negative (errno-style); b is 1..geom.batch. */
+int  mmfree_seq_pack(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b);
+int  mmfree_seq_load(mmfree_lib_t *h, uint32_t N);
+int  mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id);
+int  mmfree_seq_compute_wait(mmfree_lib_t *h);
+int  mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id);
+int  mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id);
+void mmfree_seq_readback(mmfree_lib_t *h, int proj_id, int32_t *acc, uint32_t b);
+
 /* Per-phase timing accumulated across every mmfree_bitlinear call, in
  * nanoseconds (CLOCK_MONOTONIC). The five phases are the serialized cost of one
  * projection: CPU-side activation packing into Device memory, then the three

@@ -57,8 +57,28 @@ directly prevents the x86-binary and stale-overlay footguns.
   `mmfree_runtime`/`libmmfree`) into one binary with subcommands, built once. (Biggest single
   chunk — could be a P3.)
 
-## Open decisions
-- Task-runner tech: `./mmfree` bash vs root `Makefile` vs `just` (lean bash/Makefile — no new deps).
-- Manifest format: flat `preset.env` (trivial to `source`/`#include`-style consume in shell+C)
-  vs JSON (nicer for the Python side). Leaning `preset.env`, JSON only if Python needs it.
-- How far to unify the C binaries (real win, largest effort — likely defer).
+## Decisions (locked 2026-06-26, execute next session)
+- **Manifest format:** flat `preset.env` (KEY=VAL — `source` in bash, simple `#include`-style
+  read in C) **+ a parallel `preset.json`** for the Python consumer (`ctypes_lib.py`). One
+  emitter in `EmitCore`, two output files.
+- **Task runner:** root **`Makefile`** with ~8 verbs. Caveat: arg-heavy verbs (`bench`,
+  `run`) take `PRESET=`/`BATCH=`/`ARGS="…"` variables + an `ARGS` passthrough, NOT positional
+  goals (Make goal parsing mangles `--shapes …`).
+- **Scope:** full P0+P1+P2 in one pass, including the C-binary unification and dropping sbt.
+
+## Execution order (runbook)
+0. **Pre-flight:** commit/stash the dirty tree first (submodule exp + i/f/g cluster work;
+   parent `PIPELINING_PLAN.md`, `fpga_backend.*`, `mmfree_lib.*`). Cleanup on a clean tree.
+1. **P0 manifest emit:** extend `EmitCore` to write `preset.env` + `preset.json` (all
+   `CoreConfig` derived fields) into the target dir alongside the SV.
+2. **P0 consumers** (one at a time, keep old path as fallback until each is verified):
+   `build_all.sh` sources `preset.env` → delete case tables; `software/Makefile` reads it →
+   delete `ifeq -DBENCH_*`; `gen_overlay.tcl` reads udmabuf sizes; `ctypes_lib.py` reads
+   `preset.json`; runtime loads it at startup and **warns** on bitstream mismatch (flip to
+   hard-assert only after a known-good run proves it).
+3. **P0 task runner:** root `Makefile`, ~8 verbs (sim/build/pack/deploy/bench/gate/run/help),
+   each reading the manifest + board config.
+4. **P1:** `board.conf` for the 6 positional args; `deploy`/`bench` build C natively on the
+   board and verify udmabuf sizes post-overlay-load.
+5. **P2 (last — slip first if the day runs out):** drop sbt (keep mill); unify
+   `bench`+`smoke`+`fpga-cli` (all on `mmfree_runtime`/`libmmfree`) into one subcommand binary.

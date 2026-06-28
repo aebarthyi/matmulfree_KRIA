@@ -114,5 +114,8 @@ parity gate: PASS
   is CPU-only (the triton golden reference).
 - `--prompt TEXT` needs `--tokenizer`; `--ids a,b,c` bypasses the tokenizer (deterministic,
   preferred for the gate). With no input a fixed pseudo-prompt is used.
-- Per-op engine round-trip (~145 ops/token) is the expected post-offload bottleneck;
-  `MMFREE_POLL=1`, i/f/g fusion, and store/load overlap are the Phase-F levers.
+- Per-op engine round-trip (~145 ops/token) is the expected post-offload bottleneck.
+  Phase-F levers (see `docs/PIPELINING_PLAN.md`): `MMFREE_POLL=1` (default for dedicated
+  decode, +24%) and b-aware pack (+8%) are landed; the i/f/g cluster pipeline (overlap
+  pack/readback under the engine) is next. NOTE: i/f/g *weight* fusion is a dead end —
+  each BitLinear has its own inner RMSNorm so the three quantized activations differ.

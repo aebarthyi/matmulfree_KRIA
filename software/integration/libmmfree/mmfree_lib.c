@@ -15,6 +15,7 @@
 
 #include "mmfree_lib.h"
 #include "mmfree_runtime.h"
+#include "mmfree_dma.h"     /* mmfree_dma_{mm2s,s2mm}_{start,wait} for the seq primitives */
 
 /* Monotonic nanosecond clock for the per-phase timers. Reads go through the
  * vDSO (no syscall), so the ~6 reads per bitlinear call are cheap relative to
@@ -266,12 +267,44 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
     return id;
 }
 
+/* Scatter b activation rows (x[r*N + n], int16) into port-0 ACT beats (no cache
+ * sync — caller does it). Row r occupies bytes [r*abytes,(r+1)*abytes) of each
+ * beat, matching Core.scala sLoad's tdata((r+1)*aWidth-1, r*aWidth) unpack.
+ * Only the b active rows are written: rows [b,B) are never read back and the
+ * engine's PE rows are independent, so their slots are don't-care AND stay at
+ * the open-time zero (nothing writes them) — bit-identical to the old zero-fill,
+ * but cuts the scatter B:b. Shared by mmfree_bitlinear_batch and the seq driver. */
+static void pack_act_port0(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
+    const mmfree_geom_t *g = &h->ctx.geom;
+    const uint32_t abytes = g->aWidth / 8u;
+    volatile uint8_t *a0 = (volatile uint8_t *)h->act[0].vaddr;
+    if (h->act[0].cached && abytes == 2) {
+        /* act[0] is a cached normal-memory mapping flushed by an explicit
+         * sync_for_device, so plain (non-volatile) stores let the compiler
+         * pipeline/unroll the strided int16 scatter. */
+        int16_t *a0w = (int16_t *)h->act[0].vaddr;
+        const uint32_t stride = g->portBytes / 2u;   /* int16 slots per beat */
+        for (uint32_t n = 0; n < N; n++) {
+            int16_t *beat = a0w + (size_t)n * stride;
+            for (uint32_t r = 0; r < b; r++)
+                beat[r] = x[(size_t)r * N + n];
+        }
+    } else {
+        int32_t vals[MMFREE_MAX_DMA * 64];   /* batch <= xDim; ample headroom */
+        for (uint32_t n = 0; n < N; n++) {
+            for (uint32_t r = 0; r < b; r++)
+                vals[r] = (int32_t)x[(size_t)r * N + n];
+            mmfree_pack_act_beat_batch(&a0[(size_t)n * g->portBytes], vals, b,
+                                       abytes, g->portBytes);
+        }
+    }
+}
+
 int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
                            const int16_t *x, int32_t *acc, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj || !x || !acc) return -EINVAL;
     const proj_t *pr = &h->projs[proj_id];
     const mmfree_geom_t *g = &h->ctx.geom;
-    const uint32_t abytes = g->aWidth / 8u;
     const uint32_t B = g->batch;            /* PE rows the bitstream loads/drains */
     if (b == 0 || b > B) {
         fprintf(stderr, "bitlinear_batch: b=%u out of range 1..%u\n", b, B);
@@ -280,36 +313,8 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
 
     uint64_t t0 = now_ns();
 
-    /* 1. Pack the B activation rows into port 0 (ports 1..P-1 stay zero from
-     *    open). Row r occupies bytes [r*abytes, (r+1)*abytes) of each beat slice,
-     *    matching Core.scala sLoad's tdata((r+1)*aWidth-1, r*aWidth) unpack; rows
-     *    [b, B) are zero-padded (their outputs are ignored). B*abytes <= portBytes
-     *    since batch <= xDim. Fast path (cached + int16) writes only those low
-     *    B*abytes bytes, relying on the open-time zeroing of the rest; the
-     *    fallback rewrites the whole slice. */
-    volatile uint8_t *a0 = (volatile uint8_t *)h->act[0].vaddr;
-    if (h->act[0].cached && abytes == 2) {
-        /* act[0] is a *cached* normal-memory mapping flushed by the explicit
-         * sync_for_device below, so these stores need no `volatile` — it only
-         * defeats coalescing/vectorization. This strided int16 scatter was the
-         * dominant per-call cost in profiling (~30%); writing through a plain
-         * pointer lets the compiler pipeline/unroll it. Semantics unchanged. */
-        int16_t *a0w = (int16_t *)h->act[0].vaddr;
-        const uint32_t stride = g->portBytes / 2u;   /* int16 slots per beat */
-        for (uint32_t n = 0; n < pr->N; n++) {
-            int16_t *beat = a0w + (size_t)n * stride;
-            for (uint32_t r = 0; r < B; r++)
-                beat[r] = (int16_t)((r < b) ? x[(size_t)r * pr->N + n] : 0);
-        }
-    } else {
-        int32_t vals[MMFREE_MAX_DMA * 64];   /* batch <= xDim; ample headroom */
-        for (uint32_t n = 0; n < pr->N; n++) {
-            for (uint32_t r = 0; r < B; r++)
-                vals[r] = (r < b) ? (int32_t)x[(size_t)r * pr->N + n] : 0;
-            mmfree_pack_act_beat_batch(&a0[(size_t)n * g->portBytes], vals, B,
-                                       abytes, g->portBytes);
-        }
-    }
+    /* 1. Pack the b active activation rows into port 0 (see pack_act_port0). */
+    pack_act_port0(h, x, pr->N, b);
     uint64_t tps = now_ns();
     /* act port 0 is cacheable: clean the beats we just wrote so the MM2S DMA
      * reads them from DDR (no-op if the buffer is non-cached). */
@@ -356,4 +361,86 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
 int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
                      const int16_t *x, int32_t *acc) {
     return mmfree_bitlinear_batch(h, proj_id, x, acc, 1u);
+}
+
+/* ---- pipelined cluster primitives ------------------------------------------
+ * mmfree_bitlinear_batch split into non-blocking issue + blocking wait so the
+ * caller (FpgaBackend::matmul_seq) can run CPU work — quant+pack the NEXT
+ * projection, sign-expand the PREVIOUS one — inside the COMPUTE wait window,
+ * while the engine is busy. Engine ordering stays strictly one-op-outstanding
+ * (the handler's single irqPending bit + shared MM2S forbid more), so the only
+ * thing overlapped is CPU vs engine. Single ACT region (LOAD drains it into
+ * actBram before COMPUTE) and single OUT region (the caller reads OUT back
+ * before issuing the next STORE) — no double-buffering needed. */
+
+int mmfree_seq_pack(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
+    if (!h || !x) return -EINVAL;
+    const mmfree_geom_t *g = &h->ctx.geom;
+    if (b == 0 || b > g->batch) return -EINVAL;
+    pack_act_port0(h, x, N, b);
+    mmfree_buf_sync_for_device(&h->act[0], (size_t)N * g->portBytes);
+    return 0;
+}
+
+int mmfree_seq_load(mmfree_lib_t *h, uint32_t N) {
+    if (!h) return -EINVAL;
+    if (mmfree_load(&h->ctx, h->act, N) < 0) return -EIO;   /* blocking */
+    return 0;
+}
+
+int mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
+    const proj_t *pr = &h->projs[proj_id];
+    const mmfree_geom_t *g = &h->ctx.geom;
+    uint32_t col_tiles = (pr->M + g->outLanesPerTile - 1u) / g->outLanesPerTile;
+    uint32_t bytes = pr->N * col_tiles * g->portBytes;
+    for (uint32_t i = 0; i < h->ctx.num_dma; i++)
+        if (mmfree_dma_mm2s_start(h->ctx.dma_regs[i], h->wt[i].paddr + pr->byte_offset,
+                                  bytes) < 0)
+            return -EIO;
+    mmfree_push_instr(&h->ctx, mmfree_inst_compute(h->wt[0].paddr + pr->byte_offset,
+                                                   pr->N, pr->M));
+    return 0;
+}
+
+int mmfree_seq_compute_wait(mmfree_lib_t *h) {
+    if (!h) return -EINVAL;
+    uint32_t st = mmfree_wait_done(&h->ctx);
+    if (MMFREE_STATUS_ERR(st) != MMFREE_ERR_NONE) return -EIO;
+    for (uint32_t i = 0; i < h->ctx.num_dma; i++)
+        if (mmfree_dma_mm2s_wait(h->ctx.dma_regs[i]) < 0) return -EIO;
+    return 0;
+}
+
+int mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
+    const proj_t *pr = &h->projs[proj_id];
+    const mmfree_geom_t *g = &h->ctx.geom;
+    uint32_t total = g->batch * pr->n_outputs;
+    uint32_t bytes = total * g->outLaneBytes;
+    if (mmfree_dma_s2mm_start(h->ctx.dma_regs[0], h->out.paddr, bytes) < 0) return -EIO;
+    mmfree_push_instr(&h->ctx, mmfree_inst_store(h->out.paddr, total));
+    return 0;
+}
+
+int mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
+    const proj_t *pr = &h->projs[proj_id];
+    const mmfree_geom_t *g = &h->ctx.geom;
+    uint32_t st = mmfree_wait_done(&h->ctx);
+    if (MMFREE_STATUS_ERR(st) != MMFREE_ERR_NONE) return -EIO;
+    if (mmfree_dma_s2mm_wait(h->ctx.dma_regs[0]) < 0) return -EIO;
+    mmfree_buf_sync_for_cpu(&h->out, (size_t)g->batch * pr->n_outputs * g->outLaneBytes);
+    return 0;
+}
+
+void mmfree_seq_readback(mmfree_lib_t *h, int proj_id, int32_t *acc, uint32_t b) {
+    const proj_t *pr = &h->projs[proj_id];
+    const mmfree_geom_t *g = &h->ctx.geom;
+    const volatile uint32_t *ob = (const volatile uint32_t *)h->out.vaddr;
+    for (uint32_t i = 0; i < b; i++) {
+        const volatile uint32_t *row = ob + (size_t)i * pr->n_outputs;
+        for (uint32_t m = 0; m < pr->M; m++)
+            acc[(size_t)i * pr->M + m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
+    }
 }

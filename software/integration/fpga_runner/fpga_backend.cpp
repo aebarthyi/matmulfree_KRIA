@@ -40,6 +40,71 @@ void FpgaBackend::matmul_batch(int proj_id, const std::int32_t* x, std::int32_t*
   (void)M;
 }
 
+void FpgaBackend::matmul_seq(const int* proj_ids, const std::int8_t* const* wqs, int k,
+                             const std::function<void(int, std::int32_t*)>& produce,
+                             const std::function<void(int, const std::int32_t*)>& consume,
+                             std::size_t N, std::size_t M, std::size_t b) {
+  if (k <= 0) return;
+  // Escape hatch: serial default (for the token-equivalence A/B and as a fallback).
+  static const bool no_pipe = [] { const char* e = std::getenv("MMFREE_NO_PIPELINE");
+                                   return e && std::atoi(e) != 0; }();
+  if (no_pipe) {
+    TernaryBackend::matmul_seq(proj_ids, wqs, k, produce, consume, N, M, b);
+    return;
+  }
+
+  if (xq_.size() < b * N)  xq_.resize(b * N);
+  if (acc_.size() < b * M) acc_.resize(b * M);
+  const std::size_t bN = b * N;
+
+  // produce projection j -> int32 xq_, narrow to int16 x16_, scatter into the
+  // (single) ACT region. Caller guarantees ACT is free (prior LOAD drained it).
+  auto quant_narrow_pack = [&](int j) {
+    produce(j, xq_.data());
+    for (std::size_t i = 0; i < bN; ++i) {
+      std::int32_t v = xq_[i];
+      if (v > 32767) v = 32767;
+      else if (v < -32768) v = -32768;
+      x16_[i] = static_cast<std::int16_t>(v);
+    }
+    if (mmfree_seq_pack(h_, x16_.data(), static_cast<std::uint32_t>(N),
+                        static_cast<std::uint32_t>(b)) < 0)
+      throw std::runtime_error("mmfree_seq_pack failed");
+  };
+
+  quant_narrow_pack(0);
+  if (mmfree_seq_load(h_, static_cast<std::uint32_t>(N)) < 0)
+    throw std::runtime_error("mmfree_seq_load failed");
+
+  for (int n = 0; n < k; ++n) {
+    if (mmfree_seq_compute_issue(h_, proj_ids[n]) < 0)
+      throw std::runtime_error("mmfree_seq_compute_issue failed");
+
+    // --- CPU work hidden under COMPUTE(n) ---
+    // Sign-expand + dequant the PREVIOUS projection (OUT still holds STORE(n-1);
+    // STORE(n) hasn't been issued yet, so the single OUT region is safe to read).
+    if (n > 0) {
+      mmfree_seq_readback(h_, proj_ids[n - 1], acc_.data(), static_cast<std::uint32_t>(b));
+      consume(n - 1, acc_.data());
+    }
+    // RMSNorm+quant+pack the NEXT projection into ACT (free since LOAD(n) drained it).
+    if (n + 1 < k) quant_narrow_pack(n + 1);
+    // ----------------------------------------
+
+    if (mmfree_seq_compute_wait(h_) < 0)
+      throw std::runtime_error("mmfree_seq_compute_wait failed");
+    if (mmfree_seq_store_issue(h_, proj_ids[n]) < 0)
+      throw std::runtime_error("mmfree_seq_store_issue failed");
+    if (mmfree_seq_store_wait(h_, proj_ids[n]) < 0)
+      throw std::runtime_error("mmfree_seq_store_wait failed");
+    if (n + 1 < k && mmfree_seq_load(h_, static_cast<std::uint32_t>(N)) < 0)
+      throw std::runtime_error("mmfree_seq_load failed");
+  }
+  // Last projection: no COMPUTE left to hide its readback under.
+  mmfree_seq_readback(h_, proj_ids[k - 1], acc_.data(), static_cast<std::uint32_t>(b));
+  consume(k - 1, acc_.data());
+}
+
 void CompareBackend::matmul(int proj_id, const std::int32_t* x, std::int32_t* acc,
                             const std::int8_t* wq, std::size_t N, std::size_t M) {
   cpu_.matmul(-1, x, acc, wq, N, M);                       // CPU result -> acc (used downstream)

@@ -32,11 +32,20 @@ class FpgaBackend final : public mmfree::TernaryBackend {
   void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
                     const std::int8_t* wq, std::size_t N, std::size_t M,
                     std::size_t b) override;
+  // Pipelined cluster: quant+pack of projection n+1 and sign-expand+dequant of n-1
+  // run inside the COMPUTE(n) wait window (engine ordering stays one-op-at-a-time).
+  // MMFREE_NO_PIPELINE=1 forces the serial default (for token-equivalence A/B).
+  void matmul_seq(const int* proj_ids, const std::int8_t* const* wqs, int k,
+                  const std::function<void(int, std::int32_t*)>& produce,
+                  const std::function<void(int, const std::int32_t*)>& consume,
+                  std::size_t N, std::size_t M, std::size_t b) override;
 
  private:
   mmfree_lib* h_;
   std::size_t batch_;
-  std::vector<std::int16_t> x16_;   // b*N narrowed activations, row-major
+  std::vector<std::int16_t> x16_;    // b*N narrowed activations, row-major
+  std::vector<std::int32_t> xq_;     // b*N produce() scratch (int32 before narrow)
+  std::vector<std::int32_t> acc_;    // b*M readback scratch
 };
 
 // Verification backend for `--backend both`: computes the CPU reduction into `acc` (so
