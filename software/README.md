@@ -8,9 +8,9 @@ PS-side artifacts for the matmulfree ternary-matmul Core IP.
   status-word layout, and a 128-bit instruction encoder. Mirrors
   `src/main/scala/control/AxiInstructionHandler.scala`. **Treat as the
   source of truth for any PS-side driver.**
-
-The host-side encoder check (`tests/encode_sanity.c`), the libmmfree helper unit
-test, and the board smoke test live on the **`validation`** branch.
+- `tests/encode_sanity.c` — tiny host-side check that the C encoder's bit
+  layout matches `control.InstructionEncoder` in `AxiInstructionHandlerSpec`.
+  Run with `cc -I include tests/encode_sanity.c -o /tmp/enc && /tmp/enc`.
 
 ## Driver usage sketch
 
