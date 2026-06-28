@@ -32,7 +32,6 @@ OUT_UDMA   ?= /dev/udmabuf-out
 MANIFEST     := generated/$(PRESET)/preset.env
 MANIFEST_ABS := $(abspath $(MANIFEST))
 BENCH_BIN    := software/build/bench
-SMOKE_BIN    := software/build/smoke_test
 RUNNER_DIR   := software/integration/fpga_runner
 RUNNER_BIN   := $(RUNNER_DIR)/build/mmfree-cli-fpga
 
@@ -49,7 +48,7 @@ define need_manifest
 	@[ -f "$(MANIFEST)" ] || { echo "ERROR: $(MANIFEST) missing — run 'make build PRESET=$(PRESET)' first (it emits the manifest)." >&2; exit 1; }
 endef
 
-.PHONY: help sim build pack deploy udmabuf bench smoke gate run
+.PHONY: help sim build pack deploy udmabuf bench gate run
 
 UDMABUF_DIR := external/udmabuf
 
@@ -62,7 +61,6 @@ help:
 	@echo "  make deploy PRESET=<p> BOARD=user@host        scp overlay + reload + verify udmabufs"
 	@echo "  make udmabuf                                  build + load the vendored u-dma-buf driver (on board)"
 	@echo "  make bench  PRESET=<p> [BATCH=N] [ARGS=...]   build + run native bench (on board)"
-	@echo "  make smoke  PRESET=<p>                        libmmfree end-to-end smoke test (on board)"
 	@echo "  make gate   PRESET=<p> ARGS=\"--blob ...\"      fpga_runner exact-match gate"
 	@echo "  make run    PRESET=<p> ARGS=\"--blob ...\"      fpga_runner FPGA decode"
 	@echo
@@ -116,14 +114,6 @@ bench: $(BENCH_BIN)
 
 $(BENCH_BIN):
 	$(MAKE) -C software
-
-# ─── board: libmmfree end-to-end smoke test ──────────────────────────────────
-smoke: $(SMOKE_BIN)
-	$(need_manifest)
-	sudo env $(GEOM_ENV) LD_LIBRARY_PATH=$(abspath software/build) $(abspath $(SMOKE_BIN)) $(POS_ARGS) $(ARGS)
-
-$(SMOKE_BIN):
-	$(MAKE) -C software smoke
 
 # ─── board: fpga_runner — exact-match gate (CPU vs FPGA) ─────────────────────
 gate: $(RUNNER_BIN)

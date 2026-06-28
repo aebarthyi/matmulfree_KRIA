@@ -3,6 +3,11 @@
 Implements the phases in [`docs/MMFREELLM_INTEGRATION.md`](../../docs/MMFREELLM_INTEGRATION.md)
 that turn the ternary matmul engine into a drop-in BitLinear backend.
 
+> **Branch note:** `main` carries the production tooling (`mmfree_pack`, `mmfree_bridge`,
+> `libmmfree`, `fpga_runner`). The validation/test harness referenced below — the pytest
+> suites (`tests/`), the `phase_e_layer.py` FPGA-vs-CPU check, `conftest.py`, and the
+> `make test-lib` / `make smoke` board tests — lives on the **`validation`** branch.
+
 The PyTorch runtime ([matmulfreellmCPU](https://github.com/aebarthyi/matmulfreellmCPU))
 is cloned at the repo root as `runtime/` (gitignored — it carries its own git
 history). Target activation path: **signed int16** (`k26_mmfree370m_a16` preset).
