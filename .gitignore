@@ -350,7 +350,7 @@ hs_err_pid*
 *.claude
 CLAUDE.md
 
-# Cloned upstream PyTorch runtime (has its own git history) — see docs/MMFREELLM_INTEGRATION.md
+# Cloned upstream PyTorch runtime (has its own git history)
 /runtime/
 
 # Python integration tooling artifacts
