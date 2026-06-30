@@ -174,13 +174,20 @@ udmabuf:
 	    ( cd $(UDMABUF_DIR) && $(MAKE) && sudo insmod u-dma-buf.ko ) && echo "loaded u-dma-buf.ko"; \
 	fi
 
+# Always delegate to the component sub-makes so a changed source actually recompiles.
+# (A bare `$(BIN):` file rule with no prerequisites is skipped once the binary exists,
+# so edits to main_fpga.cpp / bench sources would silently run a stale binary.) The
+# sub-makes do their own up-to-date checks, so this is a no-op when nothing changed.
+.PHONY: bench-bin runner-bin
+bench-bin:
+	$(MAKE) -C software
+runner-bin:
+	$(MAKE) -C $(RUNNER_DIR)
+
 # ─── board: native bench ─────────────────────────────────────────────────────
-bench: $(BENCH_BIN)
+bench: bench-bin
 	$(need_manifest)
 	sudo env $(GEOM_ENV) $(abspath $(BENCH_BIN)) $(POS_ARGS) $(ARGS)
-
-$(BENCH_BIN):
-	$(MAKE) -C software
 
 # Weight artifacts the runner reads: model.mmfree (CPU-side weights + auto-found
 # tokenizer.mmtok beside it) and the packed per-port blobs. Both default to this
@@ -193,13 +200,13 @@ define need_blob
 endef
 
 # ─── board: fpga_runner — exact-match gate (CPU vs FPGA) ─────────────────────
-gate: $(RUNNER_BIN)
+gate: runner-bin
 	$(need_manifest)
 	$(need_blob)
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) --backend both $(ARGS)
 
 # ─── board: fpga_runner — FPGA decode ────────────────────────────────────────
-run: $(RUNNER_BIN)
+run: runner-bin
 	$(need_manifest)
 	$(need_blob)
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) --backend fpga --bench --profile $(ARGS)
@@ -211,11 +218,8 @@ run: $(RUNNER_BIN)
 #   make gen PRESET=k26_mmfree1_3b_a16_b4 PROMPT="The capital of France is" GEN=40
 GEN    ?= 64
 PROMPT ?= Once upon a time
-gen: $(RUNNER_BIN)
+gen: runner-bin
 	$(need_manifest)
 	$(need_blob)
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) \
 	    --backend fpga --prompt "$(PROMPT)" --gen $(GEN) $(ARGS)
-
-$(RUNNER_BIN):
-	$(MAKE) -C $(RUNNER_DIR)
