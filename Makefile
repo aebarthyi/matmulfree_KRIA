@@ -212,14 +212,20 @@ run: runner-bin
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) --backend fpga --bench --profile $(ARGS)
 
 # ─── board: fpga_runner — interactive generation (live streamed text) ────────
-# Single-stream greedy decode of PROMPT=, printing each token as the engine emits it
-# (decoded via tokenizer.mmtok beside the blob). No --bench/--serve: this is the plain
-# generate path. GEN=<n> sets tokens to emit (default 64). e.g.
+# Single-stream decode of PROMPT=, printing each token as the engine emits it (decoded
+# via tokenizer.mmtok beside the blob). No --bench/--serve: this is the plain generate
+# path, and it stops at the model's EOS. GEN=<n> caps tokens (default 64). TEMP>0 turns
+# on sampling (TOPK/SEED tune it); TEMP=0 (default) is greedy. e.g.
 #   make gen PRESET=k26_mmfree1_3b_a16_b4 PROMPT="The capital of France is" GEN=40
+#   make gen PRESET=... PROMPT="Once upon a time" TEMP=0.8 TOPK=40 SEED=1
 GEN    ?= 64
 PROMPT ?= Once upon a time
+TEMP   ?= 0
+TOPK   ?= 0
+SEED   ?= 0
 gen: runner-bin
 	$(need_manifest)
 	$(need_blob)
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) \
-	    --backend fpga --prompt "$(PROMPT)" --gen $(GEN) $(ARGS)
+	    --backend fpga --prompt "$(PROMPT)" --gen $(GEN) \
+	    --temp $(TEMP) --top-k $(TOPK) --seed $(SEED) $(ARGS)

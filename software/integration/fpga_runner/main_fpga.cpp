@@ -30,6 +30,10 @@
 //                      engine call per projection/step. Prints aggregate tok/s + asserts
 //                      every stream matches single-stream generate. Best with N=batchSize.
 //   --gen N            tokens to generate (default 32)
+//   --temp F           sampling temperature (0 = greedy, default); >0 enables sampling
+//   --top-k K          restrict sampling to the top-K logits (<=0 = full vocab)
+//   --seed N           RNG seed for reproducible sampling
+//   --no-eos           don't stop at EOS — always emit the full --gen length
 //   --warmup N --reps N --profile     bench controls (see mmfree/bench.hpp)
 #include "mmfree/bench.hpp"
 #include "mmfree/model.hpp"
@@ -109,9 +113,11 @@ int main(int argc, char** argv) {
 
   std::string blob = "model.mmfree", packed_dir = ".", prefix = "weights", tok_path;
   std::string backend = "fpga", mode = "fixed", ids_arg, prompt;
-  bool bench = false, profile = false;
-  int frac = 10, warmup = 1, reps = 3, serve = 0;
+  bool bench = false, profile = false, no_eos = false;
+  int frac = 10, warmup = 1, reps = 3, serve = 0, top_k = 0;
   std::size_t gen = 32;
+  float temperature = 0.0f;             // 0 => greedy
+  std::uint64_t seed = 0;
 
   for (int a = 7; a < argc; ++a) {
     std::string k = argv[a];
@@ -131,6 +137,10 @@ int main(int argc, char** argv) {
     else if (k == "--reps") reps = std::atoi(next());
     else if (k == "--profile") profile = true;
     else if (k == "--serve") serve = std::atoi(next());
+    else if (k == "--temp") temperature = (float)std::atof(next());
+    else if (k == "--top-k") top_k = std::atoi(next());
+    else if (k == "--seed") seed = (std::uint64_t)std::strtoull(next(), nullptr, 0);
+    else if (k == "--no-eos") no_eos = true;
     else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); return 2; }
   }
   const bool use_fpga = (backend == "fpga" || backend == "both");
@@ -337,8 +347,13 @@ int main(int argc, char** argv) {
       }
     }
   } else {
-    Sampling samp;  // greedy
+    Sampling samp;                      // greedy unless --temp/--top-k given
+    samp.temperature = temperature; samp.top_k = top_k; samp.seed = seed;
     Tokenizer* t = load_tok();          // null → no tokenizer reachable; stream ids instead
+    // Stop at the model's EOS once we have a tokenizer (it knows the id); --no-eos
+    // forces a full --gen run (e.g. to inspect post-answer behavior). Without a
+    // tokenizer there's no reliable EOS, so run the full length.
+    const std::int64_t eos = (t && !no_eos) ? t->eos_id() : -1;
     // Live streaming: print each new token the moment generate() produces it. With a
     // tokenizer we decode incrementally — re-decode the full id list each step and emit
     // only the newly-appended text, which keeps BPE merges + leading spaces correct
@@ -361,7 +376,7 @@ int main(int argc, char** argv) {
       }
       std::fflush(stdout);
     };
-    model.generate(ids, gen, /*eos=*/-1, samp, on_token);
+    model.generate(ids, gen, eos, samp, on_token);
     std::fputc('\n', stdout);
   }
 
