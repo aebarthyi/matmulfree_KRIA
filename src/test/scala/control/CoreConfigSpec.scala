@@ -152,9 +152,16 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     "1.3B and 2.7B share one bitstream geometry (differ only in default sweep)" in {
       val a = CoreConfig.K26_MMFree1_3B_A16
       val b = CoreConfig.K26_MMFree2_7B_A16
-      a.copy(shapesHint = "") mustBe b.copy(shapesHint = "")   // identical HW
+      // Identical HW: shapesHint and residentWtBytes are deployment metadata (default
+      // bench sweep + resident udmabuf-wt sizing), not bitstream geometry — normalize
+      // both out before comparing.
+      a.copy(shapesHint = "", residentWtBytes = 0) mustBe b.copy(shapesHint = "", residentWtBytes = 0)
       a.shapesHint mustBe "1.3b"
       b.shapesHint mustBe "2.7b"
+      // …but the resident weight set (-> UDMABUF_WT_SZ) DOES scale with model size,
+      // so the same bitstream needs a bigger wt buffer for 2.7B than for 1.3B.
+      b.residentWtBytes must be > a.residentWtBytes
+      b.udmabufWtBytes  must be > a.udmabufWtBytes
       // …and that maxN=8192 engine still covers the 370M projections.
       Seq((1024, 1024), (1024, 5632), (2816, 1024), (1024, 32000)).foreach { case (n, m) =>
         withClue(s"370M ${n}x$m on the large engine") {

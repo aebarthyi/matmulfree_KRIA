@@ -31,10 +31,16 @@ case class CoreConfig(
     plClkMhz:     Int = 100,      // PL fabric clock the bitstream targets (deployment
                                   // policy, not Chisel hardware — emitted into the
                                   // preset manifest, consumed by build_all.sh / bench).
-    shapesHint:   String = ""     // default bench sweep for this preset (MMFREE_SHAPES);
+    shapesHint:   String = "",    // default bench sweep for this preset (MMFREE_SHAPES);
                                   // "" → auto (pow2, or "370m" once maxM spans the LM head).
                                   // Model presets set this so `make bench` defaults to the
                                   // right projection sweep without an explicit env.
+    residentWtBytes: Long = 0L    // total packed ternary weight bytes the resident
+                                  // full-model runner (fpga_runner gate/run) holds across
+                                  // ALL ports. 0 → bench-only preset (no resident set), so
+                                  // UDMABUF_WT_SZ stays the single-slice default. forModel
+                                  // sets this from the model shapes so the emitted udmabuf
+                                  // fits the runner's working set, not just one weight slice.
 ) {
     require(aWidth >= 2 && aWidth % 2 == 0, s"aWidth=$aWidth must be even and >= 2")
     require(maxAcc >= 2,                    s"maxAcc=$maxAcc must be >= 2")
@@ -66,15 +72,19 @@ case class CoreConfig(
     val outLaneBytes:Int = outLaneWidth / 8          // bytes per m_axis output lane
 
     // u-dma-buf node sizes (bytes), derived from geometry to match the worst-case
-    // transfer the runtime issues, page-rounded. These are DEFAULTS the manifest
-    // carries; the resident full-model runner overrides UDMABUF_WT_SZ for its
-    // 145-projection working set (see scripts/build_all.sh).
+    // transfer the runtime issues, page-rounded.
     //   act = maxN beats x portBytes/port            (LOAD streams maxN activations)
-    //   wt  = maxN x numColTilesMax x portBytes/port (worst COMPUTE weight slice)
+    //   wt  = max(single COMPUTE slice, resident full-model set/port) — see below
     //   out = batch x numColTilesMax x outLanesPerTile x outLaneBytes (STORE drain)
     private def pageUp(b: Long): Long = ((b + 4095L) / 4096L) * 4096L
     val udmabufActBytes: Long = pageUp(maxN.toLong * portBytes)
-    val udmabufWtBytes:  Long = pageUp(maxN.toLong * numColTilesMax * portBytes)
+    // wt: the bench streams one COMPUTE weight slice at a time (maxN x numColTilesMax),
+    // but the resident full-model runner keeps the whole per-port working set mapped at
+    // once. Size to whichever is larger so ONE overlay serves both — a model preset
+    // (residentWtBytes>0) gets the resident size; a bench preset keeps the slice size.
+    val udmabufWtSliceBytes:    Long = pageUp(maxN.toLong * numColTilesMax * portBytes)
+    val udmabufWtResidentBytes: Long = if (residentWtBytes > 0) pageUp(residentWtBytes / numInPorts) else 0L
+    val udmabufWtBytes:  Long = math.max(udmabufWtSliceBytes, udmabufWtResidentBytes)
     val udmabufOutBytes: Long = pageUp(batchSize.toLong * numColTilesMax * outLanesPerTile * outLaneBytes)
 
     require(numInPorts == 1 || axisDataWidth % 128 == 0,
@@ -165,7 +175,11 @@ case class CoreConfig(
            |# --- deployment policy ---
            |PL_CLK_MHZ=$plClkMhz
            |MMFREE_CLK_MHZ=$plClkMhz
-           |# --- u-dma-buf node sizes (defaults; runner may override WT) ---
+           |# --- u-dma-buf node sizes ---
+           |# WT is sized for the resident full-model working set on model presets
+           |# (max of the bench single-slice need and totalWtBytes/NUM_DMA), so the
+           |# fpga_runner (gate/run) maps its whole per-port weight set; bench presets
+           |# keep the single-slice size. Override at build time with UDMABUF_WT_SZ=...
            |UDMABUF_ACT_SZ=$actHex
            |UDMABUF_WT_SZ=$wtHex
            |UDMABUF_OUT_SZ=$outHex
@@ -313,16 +327,10 @@ object CoreConfig {
       *   - outBeatLanes=1 keeps m_axis at 32 bits: output stays on DMA0's
       *     S2MM, unchanged from the bench presets.
       */
-    val K26_MMFree370M: CoreConfig = CoreConfig(
-        aWidth       = 8,
-        maxAcc       = 4096,
-        xDim         = 64,
-        batchSize    = 1,
-        maxN         = 4096,
-        maxM         = 32000,
-        outBeatLanes = 1,
-        plClkMhz     = 250
-    )
+    val K26_MMFree370M: CoreConfig =
+        forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
+                 aWidth = 8, xDim = 64, outBeatLanes = 1, signedAct = false,
+                 plClkMhz = 250, shapes = "370m")
 
     /**
       * Signed int16-activation sibling of K26_MMFree370M, for real BitLinear
@@ -336,17 +344,10 @@ object CoreConfig {
       * but outLaneWidth = nextPow2(28) = 32, so the m_axis output format is
       * UNCHANGED (still one 32-bit lane per beat). signedAct=true sign-extends.
       */
-    val K26_MMFree370M_A16: CoreConfig = CoreConfig(
-        aWidth       = 16,
-        maxAcc       = 4096,
-        xDim         = 32,
-        batchSize    = 1,
-        maxN         = 4096,
-        maxM         = 32000,
-        outBeatLanes = 1,
-        signedAct    = true,
-        plClkMhz     = 250
-    )
+    val K26_MMFree370M_A16: CoreConfig =
+        forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
+                 aWidth = 16, xDim = 32, outBeatLanes = 1, signedAct = true,
+                 plClkMhz = 250, shapes = "370m")
 
     /**
       * Batched siblings of K26_MMFree370M_A16 for the batching sweep (Phase 0+).
@@ -549,17 +550,26 @@ object CoreConfig {
         val maxN            = nextPow2(math.max(hidden, intermediate))
         val maxM            = ceilTo(math.max(2 * intermediate, vocab), outLanesPerTile)
         val maxAcc          = math.max(maxAccHint, maxN)
+        // Total ternary weight elements the runner streams per token, summed over every
+        // projection (matches the "weight traffic/token" table above): per layer the 4
+        // i/f/g/o_proj (hidden^2), the fused gate_up (hidden x 2*intermediate) and
+        // down_proj (intermediate x hidden); plus the one lm_head (hidden x vocab).
+        // Ternary weights pack at 2 bits each, so bytes = elements * 2 / 8 = elements/4.
+        val perLayerElems   = 4L * hidden * hidden + hidden.toLong * (2 * intermediate) + intermediate.toLong * hidden
+        val totalWtElems    = perLayerElems * layers + hidden.toLong * vocab
+        val totalWtBytes    = totalWtElems * 2L / 8L
         CoreConfig(
-            aWidth       = aWidth,
-            maxAcc       = maxAcc,
-            xDim         = xDim,
-            batchSize    = batchSize,
-            maxN         = maxN,
-            maxM         = maxM,
-            outBeatLanes = outBeatLanes,
-            signedAct    = signedAct,
-            plClkMhz     = plClkMhz,
-            shapesHint   = shapes
+            aWidth          = aWidth,
+            maxAcc          = maxAcc,
+            xDim            = xDim,
+            batchSize       = batchSize,
+            maxN            = maxN,
+            maxM            = maxM,
+            outBeatLanes    = outBeatLanes,
+            signedAct       = signedAct,
+            plClkMhz        = plClkMhz,
+            shapesHint      = shapes,
+            residentWtBytes = totalWtBytes
         )
     }
 

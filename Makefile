@@ -80,7 +80,7 @@ define need_manifest
 	@[ -f "$(MANIFEST)" ] || { echo "ERROR: no manifest for '$(PRESET)' (looked in generated/ and transfer/). On the host run 'make build PRESET=$(PRESET)'; on the board run 'make deploy PRESET=$(PRESET)' from the host first." >&2; exit 1; }
 endef
 
-.PHONY: help sim build provision pack deploy udmabuf bench gate run
+.PHONY: help sim build provision pack deploy udmabuf bench gate run gen
 
 UDMABUF_DIR := external/udmabuf
 
@@ -95,7 +95,8 @@ help:
 	@echo "  make udmabuf                                  build + load the vendored u-dma-buf driver (on board)"
 	@echo "  make bench  PRESET=<p> [BATCH=N] [ARGS=...]   build + run native bench (on board)"
 	@echo "  make gate   PRESET=<p> ARGS=\"--blob ...\"      fpga_runner exact-match gate"
-	@echo "  make run    PRESET=<p> ARGS=\"--blob ...\"      fpga_runner FPGA decode"
+	@echo "  make run    PRESET=<p> ARGS=\"--blob ...\"      fpga_runner FPGA decode (timed/profiled)"
+	@echo "  make gen    PRESET=<p> PROMPT=\"...\" [GEN=n]    interactive generate — live streamed text"
 	@echo
 	@echo "Built presets (generated/):"
 	@ls -d generated/*/ 2>/dev/null | sed 's,generated/,  ,;s,/,,' || echo "  (none — run make build)"
@@ -202,6 +203,19 @@ run: $(RUNNER_BIN)
 	$(need_manifest)
 	$(need_blob)
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) --backend fpga --bench --profile $(ARGS)
+
+# ─── board: fpga_runner — interactive generation (live streamed text) ────────
+# Single-stream greedy decode of PROMPT=, printing each token as the engine emits it
+# (decoded via tokenizer.mmtok beside the blob). No --bench/--serve: this is the plain
+# generate path. GEN=<n> sets tokens to emit (default 64). e.g.
+#   make gen PRESET=k26_mmfree1_3b_a16_b4 PROMPT="The capital of France is" GEN=40
+GEN    ?= 64
+PROMPT ?= Once upon a time
+gen: $(RUNNER_BIN)
+	$(need_manifest)
+	$(need_blob)
+	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) \
+	    --backend fpga --prompt "$(PROMPT)" --gen $(GEN) $(ARGS)
 
 $(RUNNER_BIN):
 	$(MAKE) -C $(RUNNER_DIR)

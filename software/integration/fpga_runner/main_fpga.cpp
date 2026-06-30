@@ -23,7 +23,9 @@
 //   --frac N           fixed-point frac bits (default 10)
 //   --ids a,b,c        raw token ids (bypass the tokenizer)
 //   --prompt TEXT      prompt text (needs --tokenizer)
-//   --bench            time generation (prefill/decode tok/s); else just generate ids
+//   --bench            time generation (prefill/decode tok/s); else stream generated
+//                      text live (decoded token-by-token if a tokenizer is reachable,
+//                      else live token ids)
 //   --serve N          serve N concurrent streams (same prompt) with batched decode — one
 //                      engine call per projection/step. Prints aggregate tok/s + asserts
 //                      every stream matches single-stream generate. Best with N=batchSize.
@@ -43,6 +45,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -141,12 +145,25 @@ int main(int argc, char** argv) {
   }
 
   // ---- resolve the prompt ids ----
+  // Keep the tokenizer alive past prompt encoding: the streaming generate path below
+  // reuses it to decode each new token to text. Loaded lazily (only --prompt strictly
+  // needs it; --ids streaming decodes if a tokenizer is reachable, else prints ids).
+  std::unique_ptr<Tokenizer> tok;
+  auto load_tok = [&]() -> Tokenizer* {
+    if (!tok) {
+      try { tok = std::make_unique<Tokenizer>(tok_path.empty() ? default_tokenizer_path(blob) : tok_path); }
+      catch (const std::exception&) { tok = nullptr; }
+    }
+    return tok.get();
+  };
   std::vector<std::int64_t> ids;
   if (!ids_arg.empty()) {
     ids = parse_ids(ids_arg);
   } else if (!prompt.empty()) {
-    Tokenizer t(tok_path.empty() ? default_tokenizer_path(blob) : tok_path);
-    ids = t.encode(prompt, /*add_bos=*/true);
+    Tokenizer* t = load_tok();
+    if (!t) { std::fprintf(stderr, "--prompt needs a tokenizer (looked for %s)\n",
+                           (tok_path.empty() ? default_tokenizer_path(blob) : tok_path).c_str()); return 2; }
+    ids = t->encode(prompt, /*add_bos=*/true);
   } else {
     ids = {1, 415, 310, 29871, 13, 306, 626, 263};  // fixed pseudo-prompt (no tokenizer)
   }
@@ -321,9 +338,31 @@ int main(int argc, char** argv) {
     }
   } else {
     Sampling samp;  // greedy
-    std::vector<std::int64_t> stream = model.generate(ids, gen, /*eos=*/-1, samp);
-    for (std::size_t i = 0; i < stream.size(); ++i)
-      std::printf("%lld%s", (long long)stream[i], i + 1 < stream.size() ? " " : "\n");
+    Tokenizer* t = load_tok();          // null → no tokenizer reachable; stream ids instead
+    // Live streaming: print each new token the moment generate() produces it. With a
+    // tokenizer we decode incrementally — re-decode the full id list each step and emit
+    // only the newly-appended text, which keeps BPE merges + leading spaces correct
+    // (decoding a lone piece would mangle them). flush so it appears token-by-token.
+    std::vector<std::int64_t> grown = ids;
+    std::string shown = t ? t->decode(ids) : std::string{};
+    if (t) { std::fputs(shown.c_str(), stdout); std::fflush(stdout); }
+    auto on_token = [&](std::int64_t id) {
+      grown.push_back(id);
+      if (t) {
+        std::string full = t->decode(grown);
+        if (full.size() >= shown.size() && full.compare(0, shown.size(), shown) == 0) {
+          std::fputs(full.c_str() + shown.size(), stdout);   // emit only the new suffix
+        } else {                                              // (rare) re-render from scratch
+          std::fputs("\r", stdout); std::fputs(full.c_str(), stdout);
+        }
+        shown = std::move(full);
+      } else {
+        std::printf("%lld ", (long long)id);                  // no tokenizer: live ids
+      }
+      std::fflush(stdout);
+    };
+    model.generate(ids, gen, /*eos=*/-1, samp, on_token);
+    std::fputc('\n', stdout);
   }
 
   if (lib) mmfree_lib_close(lib);
