@@ -141,6 +141,7 @@ retyped or hand-synced. Run `make help` for the list:
 |------|-------|------|
 | `make sim [SPEC=substr]`            | host  | run the Mill test suite (`SPEC` filters by test-name substring) |
 | `make build PRESET=<p>`             | host  | Chisel → SV+manifest → bitstream → `transfer/<p>/` |
+| `make provision MODEL=<hf-id>`      | host  | HF download → `model.mmfree` + `tokenizer.mmtok` (via `matmulfreellmCPU/tools/provision.py`) |
 | `make pack BLOB=<f> OUT=<dir>`      | host  | pack model weights into per-port blobs (geometry from the manifest) |
 | `make deploy PRESET=<p> BOARD=u@h`  | host  | scp `transfer/<p>/` into `<board>:$(BOARD_REPO)/transfer/` (file transfer only; load the overlay yourself on the board) |
 | `make bench PRESET=<p> [BATCH=N]`   | board | build + run the sweep benchmark |
@@ -295,15 +296,29 @@ Runtime knobs (env): `MMFREE_VERIFY=0` skips the on-host reference for a pure pe
 overrides the eff%-ceiling clock; `MMFREE_STRICT=1` turns the geometry/manifest cross-check
 from a warning into a hard error.
 
-### Pack model weights (host)
+### Provision + pack model weights (host)
 
-For the MMfreeLM integration flow, pack a checkpoint or `model.mmfree` blob into per-port
-engine blobs (the geometry comes from the manifest, so it matches the bitstream):
+The full MMfreeLM integration flow is two host steps. First **provision** — download the HF
+checkpoint and pack the engine's two inputs, `model.mmfree` (ternary weights) and
+`tokenizer.mmtok` (BPE tokenizer), via `matmulfreellmCPU/tools/provision.py`:
 
 ```bash
-make pack BLOB=path/to/model.mmfree OUT=packed PRESET=k26_mmfree370m_a16
-# or:  make pack CKPT=ridger/MMfreeLM-370M OUT=packed PRESET=k26_mmfree370m_a16
+pip install -r matmulfreellmCPU/tools/requirements.txt   # once
+make provision MODEL=ridger/MMfreeLM-1.3B                # → matmulfreellmCPU/cpp/{model.mmfree,tokenizer.mmtok}
+# OUT=<dir> relocates the two artifacts; ARGS="--skip-download" / "--tokenizer-only" pass through.
 ```
+
+Then **pack** `model.mmfree` into per-port engine blobs (the geometry comes from the manifest,
+so it matches the bitstream):
+
+```bash
+make pack BLOB=matmulfreellmCPU/cpp/model.mmfree OUT=packed PRESET=k26_mmfree370m_a16
+# or, skipping provision entirely, re-quantize straight from HF (no tokenizer.mmtok produced):
+#      make pack CKPT=ridger/MMfreeLM-370M OUT=packed PRESET=k26_mmfree370m_a16
+```
+
+`make run`/`gate` then consume all three artifacts; `--blob` points at `model.mmfree`,
+`tokenizer.mmtok` is auto-found beside it, and `--packed-dir` is the `OUT=` above.
 
 ## Where to read next
 

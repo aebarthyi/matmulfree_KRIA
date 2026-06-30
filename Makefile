@@ -7,6 +7,7 @@
 #   make help                                   # this list
 #   make sim [SPEC=CoreConfig]                  # mill tests (SPEC = name substring)
 #   make build PRESET=k26_mmfree370m_a16        # Chisel → bitstream → transfer/<preset>/
+#   make provision MODEL=ridger/MMfreeLM-1.3B   # HF download → model.mmfree + tokenizer.mmtok
 #   make pack BLOB=model.mmfree OUT=packed      # pack weights (geometry from manifest)
 #   make deploy PRESET=... BOARD=ubuntu@kria    # scp bundle into the board's repo (no remote exec)
 #   make bench PRESET=... [BATCH=N] [ARGS=...]  # build native bench + run (on the board)
@@ -43,6 +44,10 @@ BENCH_BIN    := software/build/bench
 RUNNER_DIR   := software/integration/fpga_runner
 RUNNER_BIN   := $(RUNNER_DIR)/build/mmfree-cli-fpga
 
+# CPU reference submodule + the HF checkpoint `make provision` fetches/packs.
+CPU_DIR      := matmulfreellmCPU
+MODEL        ?= ridger/MMfreeLM-370M
+
 POS_ARGS = $(CORE_PHYS) $(DMA_PHYS) $(UIO_DEV) $(ACT_UDMA) $(WT_UDMA) $(OUT_UDMA)
 
 # Geometry env for a board run: every MMFREE_*/NUM_DMA line from the manifest,
@@ -60,7 +65,7 @@ define need_manifest
 	@[ -f "$(MANIFEST)" ] || { echo "ERROR: no manifest for '$(PRESET)' (looked in generated/ and transfer/). On the host run 'make build PRESET=$(PRESET)'; on the board run 'make deploy PRESET=$(PRESET)' from the host first." >&2; exit 1; }
 endef
 
-.PHONY: help sim build pack deploy udmabuf bench gate run
+.PHONY: help sim build provision pack deploy udmabuf bench gate run
 
 UDMABUF_DIR := external/udmabuf
 
@@ -69,6 +74,7 @@ help:
 	@echo
 	@echo "  make sim    [SPEC=substr]                     mill tests"
 	@echo "  make build  PRESET=<preset>                   Chisel -> bitstream -> transfer/<preset>/"
+	@echo "  make provision MODEL=<hf-id> [OUT=<dir>]      HF download -> model.mmfree + tokenizer.mmtok"
 	@echo "  make pack   BLOB=<f>|CKPT=<id> OUT=<dir>      pack weights (geometry from manifest)"
 	@echo "  make deploy PRESET=<p> BOARD=user@host        scp bundle into <board>:$(BOARD_REPO)/transfer/ (run deploy_kria.sh yourself on the board)"
 	@echo "  make udmabuf                                  build + load the vendored u-dma-buf driver (on board)"
@@ -91,6 +97,19 @@ endif
 build:
 	PRESET=$(PRESET) ./scripts/build_all.sh
 
+# ─── host: provision model.mmfree + tokenizer.mmtok from an HF checkpoint ────
+# Runs matmulfreellmCPU/tools/provision.py: download the MMfreeLM checkpoint, pack
+# the ternary weights -> cpp/model.mmfree and the tokenizer -> cpp/tokenizer.mmtok.
+# These two files are exactly what `make pack` (FPGA per-port blobs) and `make run`/
+# `gate` consume — the tokenizer is auto-found next to the blob. MODEL=<hf-id> picks
+# the checkpoint; OUT=<dir> overrides where the artifacts land (default $(CPU_DIR)/cpp);
+# ARGS passes provision flags through (--skip-download, --weights-only, --tokenizer-only).
+# Needs the provisioning deps once: pip install -r $(CPU_DIR)/tools/requirements.txt
+provision:
+	@[ -f "$(CPU_DIR)/tools/provision.py" ] || { echo "ERROR: $(CPU_DIR)/tools/provision.py missing — run 'git submodule update --init --recursive'." >&2; exit 1; }
+	cd $(CPU_DIR) && python3 tools/provision.py --model $(MODEL) \
+	    $(if $(OUT),--out-dir $(abspath $(OUT)),) $(ARGS)
+
 # ─── host: pack model weights into per-port blobs ────────────────────────────
 pack:
 	$(need_manifest)
@@ -110,11 +129,15 @@ deploy:
 	@[ -d "transfer/$(PRESET)" ] || { echo "ERROR: transfer/$(PRESET)/ missing — run 'make build PRESET=$(PRESET)' first." >&2; exit 1; }
 	@cp $(MANIFEST) transfer/$(PRESET)/ 2>/dev/null || true
 	@cp generated/$(PRESET)/preset.json transfer/$(PRESET)/ 2>/dev/null || true
-	scp -r transfer/$(PRESET) $(BOARD):$(BOARD_REPO)/transfer/
+	@scp -r transfer/$(PRESET) $(BOARD):$(BOARD_REPO)/transfer/ || { \
+	    echo >&2; \
+	    echo "ERROR: scp into $(BOARD):$(BOARD_REPO)/transfer/ failed. On the KRIA:" >&2; \
+	    echo "  'No such file or directory' -> the dir doesn't exist yet:  mkdir -p ~/$(BOARD_REPO)/transfer" >&2; \
+	    echo "  'Permission denied'         -> it's root-owned (stale sudo):  sudo chown -R \$$USER ~/$(BOARD_REPO)/transfer" >&2; \
+	    echo "then re-run this deploy." >&2; \
+	    exit 1; }
 	@echo
 	@echo "# Shipped transfer/$(PRESET)/ -> $(BOARD):$(BOARD_REPO)/transfer/$(PRESET)/"
-	@echo "# (If scp errored 'No such file or directory', $(BOARD_REPO)/transfer/ doesn't"
-	@echo "#  exist yet — on the KRIA run once: mkdir -p ~/$(BOARD_REPO)/transfer , then redeploy.)"
 	@echo "# Now, ON THE KRIA (from ~/$(BOARD_REPO)):"
 	@echo "#   sudo ./transfer/$(PRESET)/deploy_kria.sh   # install overlay + load app + verify udmabufs"
 	@echo "#   make bench PRESET=$(PRESET)                # manifest is read from the bundle"
