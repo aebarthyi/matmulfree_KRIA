@@ -121,13 +121,20 @@ else
     # SV (incl. the BlackBox module) into the packaged IP.
 
     # ─── 2. (optional) Re-package CoreTop IP ────────────────────────────────
+    # The packaged IP (component.xml) lives under generated/<preset>/, which is a
+    # build product and not versioned — so a fresh checkout (or a brand-new preset)
+    # has no component.xml. Package automatically in that case; REPACKAGE=1 forces a
+    # re-package even when one exists (needed when ports / the SV file set changed).
     if [ "$REPACKAGE" = "1" ]; then
-        echo; echo "==> [2/6] Re-packaging CoreTop IP from $SV_DIR"
+        echo; echo "==> [2/6] Re-packaging CoreTop IP from $SV_DIR (REPACKAGE=1)"
         vivado -mode batch -nojournal -notrace -source "$SCRIPT_DIR/package_ip.tcl" \
             -tclargs "$SV_DIR" CoreTop
-    else
+    elif [ -f "$SV_DIR/component.xml" ]; then
         echo; echo "==> [2/6] Reusing packaged IP at $SV_DIR (REPACKAGE=0)"
-        [ -f "$SV_DIR/component.xml" ] || { echo "ERROR: $SV_DIR/component.xml missing — run with REPACKAGE=1." >&2; exit 1; }
+    else
+        echo; echo "==> [2/6] No packaged IP at $SV_DIR (component.xml absent) — packaging from SV"
+        vivado -mode batch -nojournal -notrace -source "$SCRIPT_DIR/package_ip.tcl" \
+            -tclargs "$SV_DIR" CoreTop
     fi
 
     # ─── 3. Vivado project + bitstream + XSA ────────────────────────────────

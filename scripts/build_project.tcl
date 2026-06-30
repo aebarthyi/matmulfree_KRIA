@@ -80,15 +80,62 @@ make_wrapper -files [get_files $bd_file] -top -import
 set_property top "${design_name}_wrapper" [current_fileset]
 update_compile_order -fileset sources_1
 
-# ─── Synthesis → implementation → bitstream ─────────────────────────────────
-# Implementation strategy: default Vivado flow for the proven 100 MHz presets;
-# build_all.sh exports IMPL_STRATEGY=Performance_ExplorePostRoutePhysOpt for
-# 250 MHz builds (the store-path BRAM->lane-mux->S2MM route misses 4 ns by
-# ~90 ps under the default strategy — post-route phys_opt recovers that).
+# ─── Timing-closure levers (env-gated; default flow is untouched) ────────────
+# Pure synth/impl strategy knobs — they never change the RTL/architecture, only
+# how Vivado optimizes/places/routes it. All optional: unset => current behavior.
+# Used to push the batched maxN=8192 presets (B4/B6) past 250 MHz, where the
+# critical path is route-dominated high fanout (arm RAM -> the xDim*batch PE
+# accumulators). See scripts/build_all.sh for the env it exports per preset.
+#
+#   SYNTH_FLATTEN=full|rebuilt|none   cross-boundary optimization
+#   SYNTH_RETIMING=1                  register retiming (balance pipeline delay)
+#   SYNTH_DIRECTIVE=<dir>             synth_design -directive
+#   OPT_DIRECTIVE / PLACE_DIRECTIVE / PHYS_OPT_DIRECTIVE /
+#   ROUTE_DIRECTIVE / POST_ROUTE_PHYS_OPT_DIRECTIVE   per-step -directive
+#     (setting a *_PHYS_OPT_* directive also ENABLES that phys_opt pass)
+if {[info exists ::env(SYNTH_FLATTEN)]} {
+    set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY $::env(SYNTH_FLATTEN) [get_runs synth_1]
+    puts "==> synth flatten_hierarchy: $::env(SYNTH_FLATTEN)"
+}
+if {[info exists ::env(SYNTH_RETIMING)] && $::env(SYNTH_RETIMING) eq "1"} {
+    set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
+    puts "==> synth retiming: on"
+}
+if {[info exists ::env(SYNTH_DIRECTIVE)]} {
+    set_property STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE $::env(SYNTH_DIRECTIVE) [get_runs synth_1]
+    puts "==> synth directive: $::env(SYNTH_DIRECTIVE)"
+}
+
+# ─── Implementation strategy + per-step directive overrides ──────────────────
+# A named strategy applies first; explicit per-step directives below override
+# its individual steps (predictable composition).
 if {[info exists ::env(IMPL_STRATEGY)]} {
     set_property strategy $::env(IMPL_STRATEGY) [get_runs impl_1]
     puts "==> impl_1 strategy: $::env(IMPL_STRATEGY)"
 }
+if {[info exists ::env(OPT_DIRECTIVE)]} {
+    set_property STEPS.OPT_DESIGN.ARGS.DIRECTIVE $::env(OPT_DIRECTIVE) [get_runs impl_1]
+    puts "==> opt_design directive: $::env(OPT_DIRECTIVE)"
+}
+if {[info exists ::env(PLACE_DIRECTIVE)]} {
+    set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE $::env(PLACE_DIRECTIVE) [get_runs impl_1]
+    puts "==> place_design directive: $::env(PLACE_DIRECTIVE)"
+}
+if {[info exists ::env(PHYS_OPT_DIRECTIVE)]} {
+    set_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+    set_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE $::env(PHYS_OPT_DIRECTIVE) [get_runs impl_1]
+    puts "==> phys_opt_design (pre-route): $::env(PHYS_OPT_DIRECTIVE)"
+}
+if {[info exists ::env(ROUTE_DIRECTIVE)]} {
+    set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE $::env(ROUTE_DIRECTIVE) [get_runs impl_1]
+    puts "==> route_design directive: $::env(ROUTE_DIRECTIVE)"
+}
+if {[info exists ::env(POST_ROUTE_PHYS_OPT_DIRECTIVE)]} {
+    set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+    set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE $::env(POST_ROUTE_PHYS_OPT_DIRECTIVE) [get_runs impl_1]
+    puts "==> post-route phys_opt directive: $::env(POST_ROUTE_PHYS_OPT_DIRECTIVE)"
+}
+
 puts "==> launch_runs impl_1 -to_step write_bitstream -jobs $jobs"
 launch_runs impl_1 -to_step write_bitstream -jobs $jobs
 wait_on_run impl_1
@@ -105,12 +152,19 @@ open_run impl_1
 
 # Timing gate: a failing-WNS bitstream still gets written by Vivado, which was
 # harmless at 100 MHz but real risk at the 250 MHz PL_CLK_MHZ builds — fail
-# loudly instead of deploying a flaky bitstream.
+# loudly instead of deploying a flaky bitstream. ALLOW_TIMING_FAIL=1 downgrades
+# this to a warning so a marginally-failing build still produces a bitstream for
+# empirical on-hardware testing (silicon often runs faster than the timing model
+# — use only for experiments, never for a trusted deploy).
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
 puts "==> post-route WNS: $wns ns"
 if {$wns < 0} {
-    puts stderr "ERROR: timing FAILED (WNS=$wns ns). Lower PL_CLK_MHZ or fix the critical path."
-    exit 1
+    if {[info exists ::env(ALLOW_TIMING_FAIL)] && $::env(ALLOW_TIMING_FAIL) eq "1"} {
+        puts "WARNING: timing FAILED (WNS=$wns ns) — writing bitstream anyway (ALLOW_TIMING_FAIL=1, experimental; validate on hardware before trusting results)."
+    } else {
+        puts stderr "ERROR: timing FAILED (WNS=$wns ns). Lower PL_CLK_MHZ or fix the critical path."
+        exit 1
+    }
 }
 set bit_in_run [glob -nocomplain [file join $proj_dir "$design_name.runs" impl_1 "*.bit"]]
 if {[llength $bit_in_run] == 0} {

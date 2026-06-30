@@ -3,11 +3,11 @@ package control
 import scala.util.Random
 import chisel3._
 import chisel3.util.log2Ceil
-import chisel3.simulator.scalatest.ChiselSim
+import testutil.SingleThreadVerilator
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
-class CoreSpec extends AnyFreeSpec with Matchers with ChiselSim {
+class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   import InstructionEncoder._
 
   // Tiny config: xDim != batchSize to exercise the asymmetric layout. Default LM-head

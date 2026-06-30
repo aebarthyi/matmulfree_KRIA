@@ -7,6 +7,10 @@ software/tests/encode_sanity
 # Deployable per-preset bundles (bitstream/.bit.bin/.dtbo + manifest). Build output of
 # scripts/build_all.sh — regenerate with `make build PRESET=...`; not versioned.
 transfer/
+# EmitCore + Vivado IP-packaging output (SystemVerilog, component.xml, preset.env/.json,
+# verification/, xgui/). Pure build product of `make build PRESET=...` — regenerated every
+# build, never hand-edited. build_all.sh re-packages the IP automatically if it's absent.
+generated/
 ### XilinxISE template
 # intermediate build files
 *.bgn

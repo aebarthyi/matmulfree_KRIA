@@ -1,7 +1,7 @@
 package control
 
 import chisel3._
-import chisel3.simulator.scalatest.ChiselSim
+import testutil.SingleThreadVerilator
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
@@ -24,7 +24,7 @@ object InstructionEncoder {
   val STORE_OUT  = BigInt(0x03)
 }
 
-class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with ChiselSim {
+class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   import InstructionEncoder._
 
   private val DATA_WIDTH = 128

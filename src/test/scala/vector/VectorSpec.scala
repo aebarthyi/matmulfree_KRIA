@@ -3,7 +3,7 @@ package vector
 import scala.util.Random
 import chisel3._
 import chisel3.util.log2Ceil
-import chisel3.simulator.scalatest.ChiselSim
+import testutil.SingleThreadVerilator
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
@@ -52,7 +52,7 @@ object VectorModel {
   }
 }
 
-class VectorSpec extends AnyFreeSpec with Matchers with ChiselSim {
+class VectorSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
 
   private def pokeWeights(dut: Vector, w: Seq[Int]): Unit = {
     w.zipWithIndex.foreach { case (v, i) => dut.input.weights_i.bits(i).poke(v.U) }

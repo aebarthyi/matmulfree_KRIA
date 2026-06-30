@@ -3,7 +3,7 @@ package control
 import scala.util.Random
 import chisel3._
 import chisel3.util.log2Ceil
-import chisel3.simulator.scalatest.ChiselSim
+import testutil.SingleThreadVerilator
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
@@ -40,7 +40,7 @@ abstract class BenchMirrorSpecBase(
     batchSize: Int = 1,
     outBeatLanes: Int = 1,
     signedAct: Boolean = false
-) extends AnyFreeSpec with Matchers with ChiselSim {
+) extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   import InstructionEncoder._
 
   private val nLanes          = aWidth / 2

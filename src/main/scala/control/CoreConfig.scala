@@ -28,9 +28,13 @@ case class CoreConfig(
     axiDataWidth: Int = 128,
     axiIdWidth:   Int = 6,
     signedAct:    Boolean = false,// sign-extend activations (real BitLinear / HGRN int16)
-    plClkMhz:     Int = 100       // PL fabric clock the bitstream targets (deployment
+    plClkMhz:     Int = 100,      // PL fabric clock the bitstream targets (deployment
                                   // policy, not Chisel hardware — emitted into the
                                   // preset manifest, consumed by build_all.sh / bench).
+    shapesHint:   String = ""     // default bench sweep for this preset (MMFREE_SHAPES);
+                                  // "" → auto (pow2, or "370m" once maxM spans the LM head).
+                                  // Model presets set this so `make bench` defaults to the
+                                  // right projection sweep without an explicit env.
 ) {
     require(aWidth >= 2 && aWidth % 2 == 0, s"aWidth=$aWidth must be even and >= 2")
     require(maxAcc >= 2,                    s"maxAcc=$maxAcc must be >= 2")
@@ -111,9 +115,13 @@ case class CoreConfig(
            |""".stripMargin
     }
 
-    /** Default bench sweep for this preset: the 370M projection set once the
-      * geometry spans the LM head (maxM=32000), else the pow2 cross sweep. */
-    def defaultShapes: String = if (maxM >= 32000) "370m" else "pow2"
+    /** Default bench sweep for this preset. An explicit `shapesHint` (set by the
+      * model presets) wins; otherwise the 370M projection set once the geometry
+      * spans the LM head (maxM=32000), else the pow2 cross sweep. */
+    def defaultShapes: String =
+        if (shapesHint.nonEmpty) shapesHint
+        else if (maxM >= 32000) "370m"
+        else "pow2"
 
     /**
       * Flat KEY=VALUE preset manifest. `source`-able in bash (build_all.sh,
@@ -370,6 +378,44 @@ object CoreConfig {
     val K26_MMFree370M_A16_B8: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 8, outBeatLanes = 4)
 
     /**
+      * Larger MMfreeLM checkpoints on the SAME a16 / 4-HP-port engine as 370M.
+      * Architecture (from the released ridger/MMfreeLM checkpoints, vocab=32000):
+      *
+      *   model  hidden  intermediate  gate_up(2I)  layers   weight traffic/token
+      *   370M    1024        2816         5632        24        85.3 MB
+      *   1.3B    2048        5632        11264        24       324.7 MB
+      *   2.7B    2560        6912        13824        32       654.9 MB
+      *
+      * Only the inner dim grows past 370M's: max(hidden,intermediate) is 5632
+      * (1.3B) / 6912 (2.7B), so maxN = nextPow2 = 8192 and maxAcc = 8192 for both
+      * (accWidth = log2(8192)+16 = 29 → 32-bit lane, m_axis format unchanged).
+      * maxM stays 32000 (the LM head dominates every gate_up). 1.3B and 2.7B
+      * therefore share an IDENTICAL bitstream geometry — they differ only in the
+      * default bench sweep — and that maxN=8192 engine also runs 370M.
+      */
+    val K26_MMFree1_3B_A16: CoreConfig =
+        forModel(hidden = 2048, intermediate = 5632, vocab = 32000, layers = 24, shapes = "1.3b")
+    val K26_MMFree2_7B_A16: CoreConfig =
+        forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32, shapes = "2.7b")
+
+    // Batched siblings (outBeatLanes=4 → 128-bit m_axis, as in the 370M batch
+    // presets). B6 is the 370M K26 sweet spot; at maxN=8192 the actBram/accum
+    // banks are ~2x deeper, so the batch ceiling may land lower — confirm OOC
+    // resource/timing on the board before trusting B6 at this scale.
+    // B6 missed 250 MHz timing at maxN=8192 (WNS −0.369 ns; the deeper actBram/URAM
+    // cascade + 77% LUT congestion lengthens the store path past the 370M B6 that
+    // closed). B4 is the fallback — less array logic, shorter cascades.
+    val K26_MMFree1_3B_A16_B4: CoreConfig = K26_MMFree1_3B_A16.copy(batchSize = 4, outBeatLanes = 4)
+    val K26_MMFree2_7B_A16_B4: CoreConfig = K26_MMFree2_7B_A16.copy(batchSize = 4, outBeatLanes = 4)
+    val K26_MMFree1_3B_A16_B6: CoreConfig = K26_MMFree1_3B_A16.copy(batchSize = 6, outBeatLanes = 4)
+    val K26_MMFree2_7B_A16_B6: CoreConfig = K26_MMFree2_7B_A16.copy(batchSize = 6, outBeatLanes = 4)
+    // B6 can't close 250 MHz (route-bound arm-RAM→accumulator broadcast, ~−0.37 ns,
+    // unmoved by the impl levers). fmax ≈ 228 MHz, so this 230 MHz variant is the
+    // throughput-max B6: 6 tokens/pass × 230 still beats B4×250 by ~38%. The
+    // manifest carries 230 so the bench bandwidth peak + PS PL0 clock agree.
+    val K26_MMFree1_3B_A16_B6_230: CoreConfig = K26_MMFree1_3B_A16_B6.copy(plClkMhz = 230)
+
+    /**
       * LM head config for matmulfree HGRN: M=32000 output (vocab size), inner dim
       * up to 4096 (covers the 370M-class model with hidden_dim=2731 and headroom).
       *
@@ -405,6 +451,13 @@ object CoreConfig {
         "k26_mmfree370m_a16_b4" -> K26_MMFree370M_A16_B4,
         "k26_mmfree370m_a16_b6" -> K26_MMFree370M_A16_B6,
         "k26_mmfree370m_a16_b8" -> K26_MMFree370M_A16_B8,
+        "k26_mmfree1_3b_a16" -> K26_MMFree1_3B_A16,
+        "k26_mmfree1_3b_a16_b4" -> K26_MMFree1_3B_A16_B4,
+        "k26_mmfree1_3b_a16_b6" -> K26_MMFree1_3B_A16_B6,
+        "k26_mmfree1_3b_a16_b6_230" -> K26_MMFree1_3B_A16_B6_230,
+        "k26_mmfree2_7b_a16" -> K26_MMFree2_7B_A16,
+        "k26_mmfree2_7b_a16_b4" -> K26_MMFree2_7B_A16_B4,
+        "k26_mmfree2_7b_a16_b6" -> K26_MMFree2_7B_A16_B6,
         "k26_lm_head" -> K26_LMHead
     )
 
@@ -452,6 +505,61 @@ object CoreConfig {
             maxN         = nUp,
             maxM         = mUp,
             outBeatLanes = outBeatLanes
+        )
+    }
+
+    /**
+      * Size a CoreConfig to run every projection of an MMfreeLM-style model with
+      * the given architecture, on the fixed a16 / 4-HP-port engine geometry.
+      *
+      * The per-token projection shapes (N inner × M out) are:
+      *   i/f/g/o_proj : hidden × hidden        (4 per layer)
+      *   gate_up      : hidden × 2*intermediate (fused gate+up)
+      *   down_proj    : intermediate × hidden
+      *   lm_head      : hidden × vocab
+      *
+      * so the engine must span:
+      *   maxN  = nextPow2(max(hidden, intermediate))   — largest inner dim
+      *   maxM  = ceilTo(max(2*intermediate, vocab), outLanesPerTile)
+      *   maxAcc = max(maxAccHint, maxN)
+      *
+      * Only maxN/maxAcc grow with model size; geometry (xDim, aWidth, ports) and
+      * the 32-bit m_axis lane format are unchanged. One maxN=8192 bitstream thus
+      * covers 370M, 1.3B and 2.7B — the bench just streams a smaller N for the
+      * smaller models. `shapes` names the default bench sweep for the preset.
+      */
+    def forModel(
+        hidden:       Int,
+        intermediate: Int,
+        vocab:        Int,
+        layers:       Int,
+        aWidth:       Int     = 16,
+        xDim:         Int     = 32,
+        batchSize:    Int     = 1,
+        maxAccHint:   Int     = 4096,
+        outBeatLanes: Int     = 1,
+        signedAct:    Boolean = true,
+        plClkMhz:     Int     = 250,
+        shapes:       String  = ""
+    ): CoreConfig = {
+        require(hidden > 0 && intermediate > 0 && vocab > 0 && layers > 0,
+            s"model dims must be positive (hidden=$hidden inter=$intermediate vocab=$vocab layers=$layers)")
+        val nLanes          = aWidth / 2
+        val outLanesPerTile = xDim * nLanes
+        val maxN            = nextPow2(math.max(hidden, intermediate))
+        val maxM            = ceilTo(math.max(2 * intermediate, vocab), outLanesPerTile)
+        val maxAcc          = math.max(maxAccHint, maxN)
+        CoreConfig(
+            aWidth       = aWidth,
+            maxAcc       = maxAcc,
+            xDim         = xDim,
+            batchSize    = batchSize,
+            maxN         = maxN,
+            maxM         = maxM,
+            outBeatLanes = outBeatLanes,
+            signedAct    = signedAct,
+            plClkMhz     = plClkMhz,
+            shapesHint   = shapes
         )
     }
 

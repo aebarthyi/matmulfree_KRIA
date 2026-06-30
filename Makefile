@@ -8,7 +8,7 @@
 #   make sim [SPEC=CoreConfig]                  # mill tests (SPEC = name substring)
 #   make build PRESET=k26_mmfree370m_a16        # Chisel → bitstream → transfer/<preset>/
 #   make pack BLOB=model.mmfree OUT=packed      # pack weights (geometry from manifest)
-#   make deploy PRESET=... BOARD=ubuntu@kria    # scp overlay + reload + verify udmabufs
+#   make deploy PRESET=... BOARD=ubuntu@kria    # scp bundle into the board's repo (no remote exec)
 #   make bench PRESET=... [BATCH=N] [ARGS=...]  # build native bench + run (on the board)
 #   make gate  PRESET=... ARGS="--blob ..."     # fpga_runner exact-match gate (CPU==FPGA)
 #   make run   PRESET=... ARGS="--blob ..."     # fpga_runner FPGA decode (--bench --profile)
@@ -22,6 +22,10 @@
 
 PRESET     ?= k26_mmfree370m_a16
 BOARD      ?= ubuntu@kria
+# Path to this repo's checkout ON THE BOARD (relative to the board user's home,
+# or absolute). `make deploy` drops the bundle into $(BOARD_REPO)/transfer/ there,
+# so the board-side verbs (bench/run/gate) find it exactly where they expect.
+BOARD_REPO ?= matmulfree_KRIA
 CORE_PHYS  ?= 0xA0010000
 DMA_PHYS   ?= 0xA0000000
 UIO_DEV    ?= /dev/uio4
@@ -29,7 +33,11 @@ ACT_UDMA   ?= /dev/udmabuf-act
 WT_UDMA    ?= /dev/udmabuf-wt
 OUT_UDMA   ?= /dev/udmabuf-out
 
-MANIFEST     := generated/$(PRESET)/preset.env
+# Manifest resolution: a fresh HOST build emits generated/<preset>/preset.env; a
+# deployed BOARD checkout only carries the bundle copy in transfer/<preset>/ (no
+# generated/ — it's a build product, not versioned). Prefer whichever exists so the
+# same verbs work in both places; fall back to the generated path for error text.
+MANIFEST     := $(firstword $(wildcard generated/$(PRESET)/preset.env transfer/$(PRESET)/preset.env) generated/$(PRESET)/preset.env)
 MANIFEST_ABS := $(abspath $(MANIFEST))
 BENCH_BIN    := software/build/bench
 RUNNER_DIR   := software/integration/fpga_runner
@@ -38,14 +46,18 @@ RUNNER_BIN   := $(RUNNER_DIR)/build/mmfree-cli-fpga
 POS_ARGS = $(CORE_PHYS) $(DMA_PHYS) $(UIO_DEV) $(ACT_UDMA) $(WT_UDMA) $(OUT_UDMA)
 
 # Geometry env for a board run: every MMFREE_*/NUM_DMA line from the manifest,
-# plus the manifest path (for the runtime cross-check) and an optional BATCH
-# override. sudo strips the environment, so we hand it through `sudo env`.
+# plus the manifest path (for the runtime cross-check) and optional BATCH/SHAPES
+# overrides. sudo strips the environment, so we hand it through `sudo env`.
+# A trailing assignment wins under `env`, so SHAPES=370m|1.3b|2.7b re-sweeps a
+# different model on the SAME deployed bitstream (the maxN=8192 a16 engine spans
+# every checkpoint up to 2.7B) without a rebuild.
 GEOM_ENV = $$(grep -E '^(MMFREE_|NUM_DMA|MM2S_WIDTH|S2MM_WIDTH)' $(MANIFEST) | tr '\n' ' ') \
-           MMFREE_MANIFEST=$(MANIFEST_ABS) $(if $(BATCH),MMFREE_BATCH=$(BATCH),)
+           MMFREE_MANIFEST=$(MANIFEST_ABS) \
+           $(if $(BATCH),MMFREE_BATCH=$(BATCH),) $(if $(SHAPES),MMFREE_SHAPES=$(SHAPES),)
 
 # Fail early with a clear message if the manifest is missing.
 define need_manifest
-	@[ -f "$(MANIFEST)" ] || { echo "ERROR: $(MANIFEST) missing — run 'make build PRESET=$(PRESET)' first (it emits the manifest)." >&2; exit 1; }
+	@[ -f "$(MANIFEST)" ] || { echo "ERROR: no manifest for '$(PRESET)' (looked in generated/ and transfer/). On the host run 'make build PRESET=$(PRESET)'; on the board run 'make deploy PRESET=$(PRESET)' from the host first." >&2; exit 1; }
 endef
 
 .PHONY: help sim build pack deploy udmabuf bench gate run
@@ -58,7 +70,7 @@ help:
 	@echo "  make sim    [SPEC=substr]                     mill tests"
 	@echo "  make build  PRESET=<preset>                   Chisel -> bitstream -> transfer/<preset>/"
 	@echo "  make pack   BLOB=<f>|CKPT=<id> OUT=<dir>      pack weights (geometry from manifest)"
-	@echo "  make deploy PRESET=<p> BOARD=user@host        scp overlay + reload + verify udmabufs"
+	@echo "  make deploy PRESET=<p> BOARD=user@host        scp bundle into <board>:$(BOARD_REPO)/transfer/ (run deploy_kria.sh yourself on the board)"
 	@echo "  make udmabuf                                  build + load the vendored u-dma-buf driver (on board)"
 	@echo "  make bench  PRESET=<p> [BATCH=N] [ARGS=...]   build + run native bench (on board)"
 	@echo "  make gate   PRESET=<p> ARGS=\"--blob ...\"      fpga_runner exact-match gate"
@@ -88,15 +100,24 @@ pack:
 	    $(if $(BLOB),--blob $(abspath $(BLOB)),--checkpoint $(CKPT)) \
 	    --out-dir $(abspath $(OUT)) --manifest $(MANIFEST_ABS) $(ARGS)
 
-# ─── host: deploy a built overlay to the board ───────────────────────────────
-# Copies transfer/<preset>/ (incl. the manifest), reloads the overlay, and
-# verifies the udmabuf node sizes match the manifest (see scripts/deploy_kria.sh).
+# ─── host: ship a built bundle to the board's repo checkout ──────────────────
+# scp transfer/<preset>/ into $(BOARD):$(BOARD_REPO)/transfer/ — the same place the
+# board-side Makefile (bench/run/gate) and deploy_kria.sh expect it, NOT a loose
+# ~/transfer/ in $HOME. Pure file transfer: this does not load the overlay or run
+# anything on the board (that's deploy_kria.sh, which you run yourself on the KRIA).
 deploy:
 	$(need_manifest)
 	@[ -d "transfer/$(PRESET)" ] || { echo "ERROR: transfer/$(PRESET)/ missing — run 'make build PRESET=$(PRESET)' first." >&2; exit 1; }
-	cp $(MANIFEST) generated/$(PRESET)/preset.json transfer/$(PRESET)/ 2>/dev/null || true
-	scp -r transfer/$(PRESET) $(BOARD):~/transfer/
-	ssh $(BOARD) "sudo ~/transfer/$(PRESET)/deploy_kria.sh"
+	@cp $(MANIFEST) transfer/$(PRESET)/ 2>/dev/null || true
+	@cp generated/$(PRESET)/preset.json transfer/$(PRESET)/ 2>/dev/null || true
+	scp -r transfer/$(PRESET) $(BOARD):$(BOARD_REPO)/transfer/
+	@echo
+	@echo "# Shipped transfer/$(PRESET)/ -> $(BOARD):$(BOARD_REPO)/transfer/$(PRESET)/"
+	@echo "# (If scp errored 'No such file or directory', $(BOARD_REPO)/transfer/ doesn't"
+	@echo "#  exist yet — on the KRIA run once: mkdir -p ~/$(BOARD_REPO)/transfer , then redeploy.)"
+	@echo "# Now, ON THE KRIA (from ~/$(BOARD_REPO)):"
+	@echo "#   sudo ./transfer/$(PRESET)/deploy_kria.sh   # install overlay + load app + verify udmabufs"
+	@echo "#   make bench PRESET=$(PRESET)                # manifest is read from the bundle"
 
 # ─── board: build + load the vendored u-dma-buf kernel module ────────────────
 # Needs kernel headers (linux-headers-$(uname -r)). `make deploy` does this too,

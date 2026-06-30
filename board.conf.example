@@ -15,6 +15,11 @@
 # user@host for `make deploy`
 BOARD=ubuntu@kria
 
+# Path to this repo's checkout ON THE BOARD (relative to the board user's $HOME, or
+# absolute). `make deploy` scp's the bundle into $(BOARD_REPO)/transfer/ there — the
+# same place the board-side make verbs and deploy_kria.sh expect it, not loose in $HOME.
+BOARD_REPO=matmulfree_KRIA
+
 # Core CSR window + DMA0 register base (from the Vivado address map).
 CORE_PHYS=0xA0010000
 DMA_PHYS=0xA0000000

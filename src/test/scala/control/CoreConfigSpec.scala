@@ -110,6 +110,66 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       }
     }
 
+    "K26_MMFree1_3B_A16 / 2_7B_A16 span the larger checkpoints on the a16 engine" in {
+      // (hidden, intermediate, vocab, layers) per ridger/MMfreeLM checkpoint.
+      val arch = Map(
+        CoreConfig.K26_MMFree1_3B_A16 -> (2048, 5632, 32000, 24),
+        CoreConfig.K26_MMFree2_7B_A16 -> (2560, 6912, 32000, 32)
+      )
+      arch.foreach { case (c, (h, inter, vocab, _)) =>
+        withClue(s"preset shapes=${c.shapesHint}") {
+          // Same engine geometry as the 370M a16 preset — only maxN/maxAcc grow.
+          c.aWidth          mustBe 16
+          c.xDim            mustBe 32
+          c.signedAct       mustBe true
+          c.numInPorts      mustBe 4
+          c.axisDataWidth   mustBe 512
+          c.outLanesPerTile mustBe 256
+          c.outBeatWidth    mustBe 32           // 32-bit m_axis lane unchanged
+          c.outLaneWidth    mustBe 32           // nextPow2(log2(8192)+16 = 29)
+          c.maxN            mustBe 8192          // nextPow2(intermediate)
+          c.maxAcc          mustBe 8192
+          c.maxM            mustBe 32000         // vocab dominates gate_up
+          // Every projection (N inner, M out) fits and lands tile-aligned.
+          val projs = Seq(
+            (h, h),            // i/f/g/o_proj
+            (h, 2 * inter),    // fused gate_up
+            (inter, h),        // down_proj
+            (h, vocab)         // lm_head
+          )
+          projs.foreach { case (n, m) =>
+            withClue(s"projection ${n}x$m") {
+              n must be <= c.maxN
+              n must be <= c.maxAcc
+              m must be <= c.maxM
+              m % c.outLanesPerTile mustBe 0
+            }
+          }
+        }
+      }
+    }
+
+    "1.3B and 2.7B share one bitstream geometry (differ only in default sweep)" in {
+      val a = CoreConfig.K26_MMFree1_3B_A16
+      val b = CoreConfig.K26_MMFree2_7B_A16
+      a.copy(shapesHint = "") mustBe b.copy(shapesHint = "")   // identical HW
+      a.shapesHint mustBe "1.3b"
+      b.shapesHint mustBe "2.7b"
+      // …and that maxN=8192 engine still covers the 370M projections.
+      Seq((1024, 1024), (1024, 5632), (2816, 1024), (1024, 32000)).foreach { case (n, m) =>
+        withClue(s"370M ${n}x$m on the large engine") {
+          n must be <= a.maxN; m must be <= a.maxM; (m % a.outLanesPerTile) mustBe 0
+        }
+      }
+    }
+
+    "the larger model presets carry their default bench sweep in the manifest" in {
+      def shapes(c: CoreConfig, n: String) =
+        c.presetEnv(n).linesIterator.find(_.startsWith("MMFREE_SHAPES=")).get
+      shapes(CoreConfig.K26_MMFree1_3B_A16, "k26_mmfree1_3b_a16") mustBe "MMFREE_SHAPES=1.3b"
+      shapes(CoreConfig.K26_MMFree2_7B_A16, "k26_mmfree2_7b_a16") mustBe "MMFREE_SHAPES=2.7b"
+    }
+
     "rejects maxN > maxAcc" in {
       assertThrows[IllegalArgumentException] {
         CoreConfig(maxAcc = 16, maxN = 32)

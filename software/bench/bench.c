@@ -1,12 +1,14 @@
 /*
  * bench.c — Ternary matmul benchmark sweep for the mmfree Core on KRIA.
  *
- * Two sweep modes (MMFREE_SHAPES env, default per BENCH_PRESET):
- *   pow2 : power-of-two N x M cross sweep within maxN / maxM (legacy)
- *   370m : every distinct projection of MMfreeLM-370M (i/f/g/o_proj, fused
- *          gate_up, down_proj, lm_head), plus a per-token cost summary and
- *          compute-phase efficiency vs the HP-port stream peak
- *          (MMFREE_CLK_MHZ, default 100, sets the peak).
+ * Sweep modes (MMFREE_SHAPES env, default per BENCH_PRESET):
+ *   pow2          : power-of-two N x M cross sweep within maxN / maxM (legacy)
+ *   370m|1.3b|2.7b: every distinct projection of that MMfreeLM checkpoint
+ *                   (i/f/g/o_proj, fused gate_up, down_proj, lm_head), plus a
+ *                   per-token cost summary and compute-phase efficiency vs the
+ *                   HP-port stream peak (MMFREE_CLK_MHZ, default 100, sets it).
+ *   <arbitrary>   : set MMFREE_HIDDEN / MMFREE_INTER / MMFREE_VOCAB /
+ *                   MMFREE_LAYERS to sweep any MMfreeLM-shaped model.
  *
  * For each shape:
  *   1. Pack random activations + ternary weights into the prepared udmabuf
@@ -256,20 +258,38 @@ typedef struct {
     uint32_t    count;  /* instances per forward pass (token); 0 = n/a */
 } bench_shape_t;
 
-/* MMfreeLM-370M (hidden=1024, GLU intermediate=2816, vocab=32000, 24 layers):
- * every distinct BitLinear shape for single-token inference. All M are
- * multiples of the k26_mmfree370m geometry's 256-lane col tile, so no shape
- * carries padding lanes.
- *   i/f/g/o_proj : 1024 x 1024   (4 per layer x 24 layers)
- *   gate_up      : 1024 x 5632   (fused gate+up = 2 x 2816)
- *   down_proj    : 2816 x 1024
- *   lm_head      : 1024 x 32000  (vocab; untied from the embedding) */
-static const bench_shape_t shapes_370m[] = {
-    { "ifgo_proj", 1024,  1024, 96 },
-    { "gate_up",   1024,  5632, 24 },
-    { "down_proj", 2816,  1024, 24 },
-    { "lm_head",   1024, 32000,  1 },
+/* MMfreeLM architecture table. The per-token BitLinear shapes are fully
+ * determined by (hidden H, GLU intermediate I, vocab V, layers L):
+ *   i/f/g/o_proj : H x H        (4 per layer x L layers)
+ *   gate_up      : H x 2I       (fused gate+up)
+ *   down_proj    : I x H        (L per pass)
+ *   lm_head      : H x V        (vocab; untied from the embedding)
+ * Every M is a multiple of the a16 geometry's 256-lane col tile (H,2I,V all
+ * 256-aligned for these checkpoints), so no shape carries padding lanes.
+ * Values are the released ridger/MMfreeLM checkpoints (vocab=32000). Select at
+ * runtime with MMFREE_SHAPES=370m|1.3b|2.7b, or override an arbitrary model with
+ * MMFREE_HIDDEN / MMFREE_INTER / MMFREE_VOCAB / MMFREE_LAYERS. */
+typedef struct {
+    const char *name;
+    uint32_t    hidden, inter, vocab, layers;
+} model_cfg_t;
+
+static const model_cfg_t models[] = {
+    { "370m", 1024, 2816, 32000, 24 },
+    { "1.3b", 2048, 5632, 32000, 24 },
+    { "2.7b", 2560, 6912, 32000, 32 },
 };
+
+/* Expand a model config into its 4 distinct projection shapes (compute order). */
+static size_t model_shapes(const model_cfg_t *mc, bench_shape_t *out)
+{
+    const uint32_t H = mc->hidden, I = mc->inter, V = mc->vocab, L = mc->layers;
+    out[0] = (bench_shape_t){ "ifgo_proj", H,    H,   4u * L };
+    out[1] = (bench_shape_t){ "gate_up",   H,    2u * I, L };
+    out[2] = (bench_shape_t){ "down_proj", I,    H,      L };
+    out[3] = (bench_shape_t){ "lm_head",   H,    V,      1 };
+    return 4;
+}
 
 /* ---------- core bench loop ---------- */
 
@@ -585,10 +605,36 @@ int main(int argc, char **argv) {
     bench_shape_t sweep[128]; size_t nsweep = 0;
     const char *mode = getenv("MMFREE_SHAPES");
     if (!mode || !*mode) mode = BENCH_SHAPES_DEFAULT;
-    int model_mode = (strcmp(mode, "370m") == 0);
-    if (model_mode) {
-        for (size_t k = 0; k < sizeof(shapes_370m) / sizeof(shapes_370m[0]); k++) {
-            const bench_shape_t *s = &shapes_370m[k];
+
+    /* Resolve `mode` to a named model, an env-described arbitrary model, or the
+     * pow2 cross sweep. `model_name` non-NULL => named-model rollup. */
+    const char *model_name = NULL;
+    model_cfg_t custom;
+    const model_cfg_t *mc = NULL;
+    for (size_t k = 0; k < sizeof(models) / sizeof(models[0]); k++)
+        if (strcmp(mode, models[k].name) == 0) { mc = &models[k]; break; }
+    if (!mc && getenv("MMFREE_HIDDEN")) {
+        /* Arbitrary model from the environment (MMFREE_SHAPES names the label). */
+        custom = (model_cfg_t){
+            .name   = (strcmp(mode, "pow2") == 0) ? "custom" : mode,
+            .hidden = env_u32("MMFREE_HIDDEN", 0),
+            .inter  = env_u32("MMFREE_INTER",  0),
+            .vocab  = env_u32("MMFREE_VOCAB",  32000),
+            .layers = env_u32("MMFREE_LAYERS", 1),
+        };
+        if (!custom.hidden || !custom.inter) {
+            fprintf(stderr, "MMFREE_HIDDEN and MMFREE_INTER are required for a "
+                    "custom model sweep\n");
+            return 2;
+        }
+        mc = &custom;
+    }
+
+    if (mc) {
+        bench_shape_t ms[8];
+        size_t nm = model_shapes(mc, ms);
+        for (size_t k = 0; k < nm; k++) {
+            const bench_shape_t *s = &ms[k];
             if (s->N > geom.maxN || s->N > geom.maxAcc || s->M > geom.maxM) {
                 fprintf(stderr, "skipping %s (%ux%u): exceeds geometry "
                         "maxN=%u maxAcc=%u maxM=%u\n", s->name, s->N, s->M,
@@ -598,10 +644,13 @@ int main(int argc, char **argv) {
             sweep[nsweep++] = *s;
         }
         if (nsweep == 0) {
-            fprintf(stderr, "no 370m projection fits this geometry — use the "
-                    "k26_mmfree370m preset (maxN=4096 maxM=32000)\n");
+            fprintf(stderr, "no %s projection fits this geometry (maxN=%u maxM=%u)"
+                    " — build a bitstream whose maxN spans intermediate=%u and "
+                    "maxM spans the vocab\n", mc->name, geom.maxN, geom.maxM,
+                    mc->inter);
             return 2;
         }
+        model_name = mc->name;
     } else {
         /* Power-of-two cross sweep up to maxN x maxM (legacy behavior). */
         uint32_t ns[16], ms[16]; size_t nn = 0, nm = 0;
@@ -705,8 +754,8 @@ int main(int argc, char **argv) {
            mode, clk_mhz, g_peak_gbps, nports, nports == 1 ? "" : "s", geom.portBytes);
     printf("# verify=%d  activations=%s  timing=best-of-%u rep%s\n", verify,
            g_signed ? "signed" : "unsigned",
-           env_u32("MMFREE_REPS", model_mode ? 5 : 1),
-           env_u32("MMFREE_REPS", model_mode ? 5 : 1) == 1 ? "" : "s");
+           env_u32("MMFREE_REPS", model_name ? 5 : 1),
+           env_u32("MMFREE_REPS", model_name ? 5 : 1) == 1 ? "" : "s");
 
     /* For split streams, prove the DMA->s_axis_i wiring/order before the
      * sweep: a reversed port Cat corrupts results silently rather than
@@ -738,10 +787,10 @@ int main(int argc, char **argv) {
                "--------------------------------------------------------------");
     }
 
-    /* Per-token rollup (370m mode): time for ALL projections of one forward
-     * pass = sum of count_i * t_i over the distinct shapes. */
+    /* Per-token rollup (named-model mode): time for ALL projections of one
+     * forward pass = sum of count_i * t_i over the distinct shapes. */
     double tok_us = 0, tok_cmp_us = 0, tok_wt_bytes = 0;
-    int tok_valid = model_mode;
+    int tok_valid = (model_name != NULL);
 
     uint32_t prevN = 0;
     for (size_t i = 0; i < nsweep; i++) {
@@ -759,7 +808,7 @@ int main(int argc, char **argv) {
                     sweep[i].N, sweep[i].M);
             goto out;
         }
-        if (model_mode && rc == 0) {
+        if (model_name && rc == 0) {
             uint32_t t = (sweep[i].M + geom.outLanesPerTile - 1) / geom.outLanesPerTile;
             tok_us       += (double)sweep[i].count * us_tot;
             tok_cmp_us   += (double)sweep[i].count * us_cmp;
@@ -774,9 +823,9 @@ int main(int argc, char **argv) {
          * whole point of batching: same weight bandwidth, B tokens. */
         double Bf = (double)g_batch;
         double floor_us = tok_wt_bytes / (g_peak_gbps * 1e3);
-        printf("\n# 370M projection cost (batch=%d): %.0f us total, %.0f us compute-only"
+        printf("\n# %s projection cost (batch=%d): %.0f us total, %.0f us compute-only"
                " for %d token%s -> %.1f tok/s (%.1f on compute alone)\n",
-               g_batch, tok_us, tok_cmp_us, g_batch, g_batch == 1 ? "" : "s",
+               model_name, g_batch, tok_us, tok_cmp_us, g_batch, g_batch == 1 ? "" : "s",
                Bf * 1e6 / tok_us, Bf * 1e6 / tok_cmp_us);
         printf("# weight traffic %.1f MiB/token; floor at %.2f GB/s stream peak = %.0f us"
                " -> token-level stream efficiency %.1f%% (compute phases only: %.1f%%)\n",
