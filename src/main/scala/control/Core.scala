@@ -2,6 +2,8 @@ package control
 
 import chisel3._
 import chisel3.util._
+import chisel3.experimental.annotate
+import firrtl.AttributeAnnotation
 import systolic.SystolicArray
 
 /** AXI4-Stream slave (input side). Flat bundle so Vivado IP packager infers `s_axis_*`. */
@@ -68,7 +70,17 @@ class Core(
     val axiAddrWidth: Int = 32,
     val axiDataWidth: Int = 128,
     val axiIdWidth:   Int = 6,
-    val signedAct:    Boolean = false  // sign-extend activations (real BitLinear / HGRN int16)
+    val signedAct:    Boolean = false, // sign-extend activations (real BitLinear / HGRN int16)
+    val accHeadroomBits: Int = -1,     // accumulator overflow headroom; -1 = auto (log2Ceil(maxAcc))
+    val actMaxFanout:    Int = 0,      // max_fanout attr on the batched array-feed register
+                                       // (0 = off, exact legacy Queue). Forces synth to
+                                       // replicate the activation-broadcast reg near each
+                                       // column — the route-bound 250 MHz path at B>=6.
+    val dspAccum:        Boolean = false, // map the per-lane PE accumulators onto DSP48E2
+                                         // slices (use_dsp attr) instead of LUT/CARRY8.
+    val colBankSize:     Int = 0         // systolic column banking: broadcast within a bank
+                                         // of this many columns, pipeline between banks to
+                                         // cut activation fanout. 0 = no banking (broadcast).
 ) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0,        "aWidth must be even and >= 2")
     require(maxAcc >= 2,                           "maxAcc must be >= 2")
@@ -76,11 +88,17 @@ class Core(
     require(maxN <= maxAcc,                        s"maxN=$maxN must be <= maxAcc=$maxAcc (no inner-dim tiling yet)")
     require(maxN >= 1,                             "maxN must be >= 1")
     require(maxM >= 1,                             "maxM must be >= 1")
+    require(accHeadroomBits == -1 || accHeadroomBits >= 0,
+        s"accHeadroomBits=$accHeadroomBits must be -1 (auto) or >= 0")
 
     val yDim            = batchSize
     val nLanes          = aWidth / 2
     val outLanesPerTile = xDim * nLanes
-    val tileAccWidth    = log2Ceil(maxAcc) + aWidth
+    // Accumulator data width = aWidth + headroom. Auto (-1) = legacy log2Ceil(maxAcc)
+    // headroom (worst-case growth); a smaller headroom trims every accumulator flop,
+    // the drain shift register (tileAccums) and outBram — see accHeadroomBits.
+    val accHeadroom     = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+    val tileAccWidth    = aWidth + accHeadroom
     val numColTilesMax  = (maxM + outLanesPerTile - 1) / outLanesPerTile
     val outAccWidth     = tileAccWidth
     val outLaneWidth    = 1 << log2Ceil(outAccWidth)
@@ -114,7 +132,7 @@ class Core(
     // ─── Systolic array with Core-local reset (PE counter quirk workaround) ──
     val arrLocalReset = WireDefault(false.B)
     val arr = withReset(this.reset.asBool || arrLocalReset) {
-        Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct))
+        Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, accHeadroomBits, dspAccum, colBankSize))
     }
 
     // ─── On-chip storage ──────────────────────────────────────────────────────
@@ -164,11 +182,25 @@ class Core(
     // keeps the direct path (validated, closes timing) untouched. The uniform
     // 1-cycle delay on every beat is functionally transparent (nAcc unchanged).
     // Flushed with inQ (below) so stray streamed beats can't cross into the next op.
-    val armSlice = if (batchSize > 1)
-      Some(Module(new Queue(new StreamBeat, entries = 1, pipe = true, flow = false, hasFlush = true)))
-    else None
-    armSlice.foreach { s => s.io.enq <> inQ.io.deq; s.io.deq.ready := false.B }
-    val armSrc = armSlice.map(_.io.deq).getOrElse(inQ.io.deq)
+    // actMaxFanout>0 swaps the Queue for a functionally-identical ReplicatedPipeSkid
+    // whose data register carries max_fanout, so synth replicates the activation
+    // broadcast per column (the route-bound 250 MHz path at B>=6). actMaxFanout==0
+    // keeps the exact legacy Queue → existing presets emit byte-identical SV. The
+    // Option holds (deq port, flush-setter) so the two module types share the wiring.
+    val armSlice: Option[(DecoupledIO[StreamBeat], Bool => Unit)] =
+      if (batchSize <= 1) None
+      else if (actMaxFanout > 0) {
+        val s = Module(new ReplicatedPipeSkid(new StreamBeat, actMaxFanout))
+        s.io.enq <> inQ.io.deq
+        s.io.deq.ready := false.B
+        Some((s.io.deq, (b: Bool) => s.io.flush := b))
+      } else {
+        val s = Module(new Queue(new StreamBeat, entries = 1, pipe = true, flow = false, hasFlush = true))
+        s.io.enq <> inQ.io.deq
+        s.io.deq.ready := false.B
+        Some((s.io.deq, (b: Bool) => s.io.flush.get := b))
+      }
+    val armSrc = armSlice.map(_._1).getOrElse(inQ.io.deq)
 
     // `outQ` decouples the store path; it keeps draining to m_axis after the
     // FSM returns to sIdle (the runtime waits for S2MM idle, not just the
@@ -203,7 +235,7 @@ class Core(
     outQ.io.deq.ready := m_axis.tready
 
     inQ.io.flush.get := (state === sIdle)
-    armSlice.foreach { _.io.flush.get := (state === sIdle) }
+    armSlice.foreach { _._2(state === sIdle) }
 
     arr.input.weights_i.valid    := false.B
     arr.input.weights_i.bits     := VecInit(Seq.fill(outLanesPerTile)(0.U(2.W)))
@@ -224,6 +256,24 @@ class Core(
     val numColTiles     = Reg(UInt(log2Ceil(numColTilesMax + 1).W))
     val colTileCtr      = RegInit(0.U(log2Ceil(numColTilesMax + 1).W))
     val activeIdx       = RegInit(0.U(log2Ceil(maxN + 1).W))      // enq-side stream row (wraps at cmpRows per col tile)
+    // cmpRows-1 and a registered "activeIdx is the last row" flag, kept as the
+    // invariant activeIsLast == (activeIdx === cmpRowsM1). The old live compare
+    // `activeIdx === (cmpRows-1)` put cmpRows (and a wide subtract+compare) in the
+    // combinational cone that feeds the actBram/inQ read-address ENABLE — the
+    // route-dominated 6-LUT path that walls the 250 MHz builds. Precomputing both
+    // pulls cmpRows out of that cone: the remaining `(activeIdx+1)===cmpRowsM1`
+    // compare feeds only the activeIsLast flop, not the BRAM enable, so the enqueue
+    // address path shortens to reg→mux→BRAM.
+    val cmpRowsM1       = Reg(UInt(log2Ceil(maxN + 1).W))         // cmpRows - 1 (precomputed)
+    val activeIsLast    = RegInit(false.B)                       // activeIdx === cmpRowsM1
+    // Runtime active batch count for THIS compute — how many of the built `batchSize`
+    // PE rows the drain actually writes out. Latched from the instruction's batch
+    // field (0 or >batchSize → full batchSize, so a legacy flags=0 host is unchanged).
+    // Lets a high-B bitstream serve a low-batch call: the weight stream is already
+    // batch-count-independent, and this stops the drain from writing (batchSize-b)
+    // dead rows — which is what makes the drain hide at small N and touches only b/B
+    // of outBram. batchSize==1 makes it a constant no-op.
+    val cmpBatch        = Reg(UInt(log2Ceil(batchSize + 1).W))
 
     // Captured tile, held flat (batch-major) so the drain engine can shift it
     // down by effOutBeatLanes lanes per cycle instead of dynamically indexing.
@@ -303,10 +353,16 @@ class Core(
             state          := sLoad
         }.elsewhen(handler.compute.fire) {
             cmpRows     := handler.compute.bits.rows
+            cmpRowsM1   := handler.compute.bits.rows - 1.U
             cmpCols     := handler.compute.bits.cols
             numColTiles := (handler.compute.bits.cols + (outLanesPerTile - 1).U) / outLanesPerTile.U
+            // Clamp the requested batch to [1, batchSize]; 0 (legacy) → full batchSize.
+            val reqBatch = handler.compute.bits.batch
+            val effBatch = Mux(reqBatch === 0.U || reqBatch > batchSize.U, batchSize.U, reqBatch)
+            cmpBatch    := effBatch(log2Ceil(batchSize + 1) - 1, 0)
             colTileCtr  := 0.U
             activeIdx   := 0.U
+            activeIsLast := handler.compute.bits.rows === 1.U   // activeIdx=0 is last iff N==1
             cState      := cInit
             state       := sCompute
         }.elsewhen(handler.store.fire) {
@@ -352,11 +408,14 @@ class Core(
         inQ.io.enq.bits.act     := actRdData
         s_axis.tready           := inQ.io.enq.ready
 
-        val lastRow = activeIdx === (cmpRows - 1.U)
+        val lastRow = activeIsLast                       // registered; == activeIdx === cmpRowsM1
         val nextRow = Mux(lastRow, 0.U, activeIdx + 1.U)
         actRdAddr := Mux(inQ.io.enq.fire, nextRow, activeIdx)(log2Ceil(maxN) - 1, 0)
         when(inQ.io.enq.fire) {
             activeIdx := nextRow
+            // Maintain the invariant for the NEXT activeIdx (= nextRow). The
+            // compare ends at this flop, off the BRAM-enable path.
+            activeIsLast := Mux(lastRow, cmpRowsM1 === 0.U, (activeIdx + 1.U) === cmpRowsM1)
         }
     }
 
@@ -365,9 +424,10 @@ class Core(
             is(cInit) {
                 // Drive read addr for inner-dim 0 so the enqueue side sees
                 // mem[0] next cycle.
-                actRdAddr  := 0.U
-                activeIdx  := 0.U
-                cState     := cStream
+                actRdAddr    := 0.U
+                activeIdx    := 0.U
+                activeIsLast := cmpRowsM1 === 0.U                // activeIdx=0 is last iff N==1
+                cState       := cStream
             }
 
             is(cStream) {
@@ -454,7 +514,7 @@ class Core(
         when(subNext === outSubBeats.U) {
             drainSubCtr := 0.U
             val batchNext = drainBatchCtr + 1.U
-            when(batchNext === batchSize.U) {
+            when(batchNext === cmpBatch) {
                 drainBatchCtr := 0.U
                 drainBusy     := false.B
             }.otherwise {
@@ -546,4 +606,35 @@ object Core {
         outer.rlast   := inner.rlast
         outer.rvalid  := inner.rvalid
     }
+}
+
+/**
+  * 1-deep pipelined skid buffer — functionally identical to
+  * `Queue(entries=1, pipe=true, flow=false, hasFlush=true)` — whose single data
+  * register carries a `max_fanout` synthesis attribute.
+  *
+  * Used for the batched array-feed register, which broadcasts the activation to
+  * every column's PEs (fanout ≈ xDim·nLanes). At B>=6 that broadcast is the
+  * route-bound path that keeps the design off 250 MHz; forcing synth to physically
+  * replicate the register places a copy near each column and shortens the routes.
+  * (With SYNTH_FLATTEN=full — already set for the batched presets — the replication
+  * crosses into the array where the fanout expands.)
+  */
+class ReplicatedPipeSkid[T <: Data](gen: T, maxFanout: Int) extends Module {
+  val io = IO(new Bundle {
+    val enq   = Flipped(Decoupled(gen))
+    val deq   = Decoupled(gen)
+    val flush = Input(Bool())
+  })
+  val full = RegInit(false.B)
+  val data = Reg(gen)
+  if (maxFanout > 0)
+    annotate(Seq(data))(Seq(AttributeAnnotation(data.toNamed, s"max_fanout = $maxFanout")))
+  io.enq.ready := !full || io.deq.ready   // pipe=true: accept when empty, or while draining
+  io.deq.valid := full
+  io.deq.bits  := data
+  when(io.enq.fire) { data := io.enq.bits }
+  when(io.flush)         { full := false.B }   // flush wins (== hasFlush)
+    .elsewhen(io.enq.fire) { full := true.B }
+    .elsewhen(io.deq.fire) { full := false.B }
 }

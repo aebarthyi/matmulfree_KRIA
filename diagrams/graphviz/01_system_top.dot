@@ -1,0 +1,98 @@
+// ============================================================================
+// LEVEL 1 — System top: CPU (PS) + FPGA (PL) + MEMORY (DDR4)
+// and where each part of a MMfreeLM decoder layer is computed.
+//
+// The FPGA does exactly ONE thing: the ternary BitLinear matmul PROJECTIONS
+// (ternary weights {-1,0,+1} x int8/int16 activations). Everything sequential,
+// elementwise, or nonlinear (RMSNorm, quantize, the MLGRU recurrence, SiLU/
+// sigmoid gating, residual adds, sampling) stays on the ARM CPU.
+//
+//   render:  dot -Tsvg 01_system_top.dot -o system_top.svg
+// ============================================================================
+digraph system_top {
+    rankdir=LR;
+    labelloc="t";
+    fontname="Helvetica-Bold"; fontsize=20;
+    label="MMfreeLM on KRIA — System Architecture & LLM-Layer Compute Mapping";
+    node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", penwidth=1.2];
+    edge  [fontname="Helvetica", fontsize=9];
+    compound=true;
+    nodesep=0.35; ranksep=1.1;
+
+    // ---------------------------------------------------------------- CPU (PS)
+    subgraph cluster_cpu {
+        label="ARM CPU  —  Zynq UltraScale+ PS (quad Cortex-A53)";
+        fontname="Helvetica-Bold"; fontsize=14;
+        style="rounded,filled"; fillcolor="#e8f0fe"; color="#4285f4"; penwidth=2;
+
+        cpu_norm  [label="RMSNorm\n(pre-mix, per sublayer)", fillcolor="#c9dcfb"];
+        cpu_quant [label="activation quantize\nfp → int8 / int16", fillcolor="#c9dcfb"];
+        cpu_tok   [label="MLGRU recurrence\nsigmoid gates · SiLU · elementwise\nsequential hidden-state scan", fillcolor="#c9dcfb"];
+        cpu_glu   [label="GLU activation\nSiLU(gate) ⊙ up  (elementwise)", fillcolor="#c9dcfb"];
+        cpu_res   [label="residual adds\nlayer plumbing", fillcolor="#c9dcfb"];
+        cpu_samp  [label="final RMSNorm + sampling\nsoftmax / top-k / temperature", fillcolor="#c9dcfb"];
+
+        cpu_drv   [label="fpga_runner driver\n• builds 128-bit instructions\n• sets up AXI-DMA descriptors\n• polls status / IRQ", fillcolor="#aecbfa", shape=box, style="filled"];
+    }
+
+    // ------------------------------------------------------------- MEMORY DDR4
+    subgraph cluster_mem {
+        label="MEMORY  —  DDR4 (PS DRAM, u-dma-buf regions)";
+        fontname="Helvetica-Bold"; fontsize=14;
+        style="rounded,filled"; fillcolor="#fef7e0"; color="#f9ab00"; penwidth=2;
+
+        mem_wt  [label="ternary weight blobs\npacked 2-bit, per-HP-port\n(resident working set)", fillcolor="#fde293"];
+        mem_act [label="activation buffers\nudmabuf-act (int8/int16)", fillcolor="#fde293"];
+        mem_out [label="output buffers\nudmabuf-out (int32 lanes)", fillcolor="#fde293"];
+    }
+
+    // --------------------------------------------------------------- FPGA (PL)
+    subgraph cluster_fpga {
+        label="FPGA  —  Programmable Logic (CoreTop @ 250 MHz)";
+        fontname="Helvetica-Bold"; fontsize=14;
+        style="rounded,filled"; fillcolor="#e6f4ea"; color="#34a853"; penwidth=2;
+
+        fpga_core [label="Ternary Matmul Core\nsystolic array of ternary-MAC PEs\nO[b][m] = Σ_n W[n][m] · A[b][n]", fillcolor="#a8dab5", shape=box3d, penwidth=2];
+
+        subgraph cluster_proj {
+            label="BitLinear projections offloaded here";
+            fontname="Helvetica"; fontsize=11; color="#34a853"; style="rounded,dashed";
+            p_tok  [label="token-mix projections\nf · i · g · o_proj", fillcolor="#ceead6"];
+            p_glu  [label="channel-mix projections\ngate · up · down_proj", fillcolor="#ceead6"];
+            p_head [label="lm_head\nhidden → vocab (32000)", fillcolor="#ceead6"];
+        }
+    }
+
+    // ----------------------------------------------------------- interconnect
+    dma  [label="AXI-DMA engines\n4 × MM2S (weights/act)  +  S2MM (out)", shape=box, fillcolor="#f1f3f4", color="#5f6368"];
+    hpm  [label="M_AXI_HPM0\n(instruction MMIO, 128-bit)", shape=box, fillcolor="#f1f3f4", color="#5f6368"];
+
+    // ------------------------------------------------- logical layer sequence
+    // (dotted grey = order of ops within one decoder layer; colour = where it runs)
+    edge [style=dotted, color="#9aa0a6", constraint=false, fontcolor="#5f6368"];
+    cpu_norm  -> cpu_quant [label="①"];
+    cpu_quant -> p_tok     [label="② project", lhead=cluster_proj, style=dotted, color="#34a853"];
+    p_tok     -> cpu_tok   [label="③ recur", style=dotted, color="#34a853"];
+    cpu_tok   -> p_glu     [label="④ project", style=dotted, color="#34a853"];
+    p_glu     -> cpu_glu   [label="⑤ SiLU⊙", style=dotted, color="#34a853"];
+    cpu_glu   -> cpu_res   [label="⑥"];
+    cpu_res   -> cpu_samp  [label="⑦ ×L layers → head"];
+    cpu_samp  -> p_head    [label="⑧ lm_head", style=dotted, color="#34a853"];
+
+    // --------------------------------------------------- physical dataflow
+    edge [style=solid, color="#1a73e8", fontcolor="#1a73e8", penwidth=1.6, constraint=true];
+    cpu_drv -> hpm    [label="push instruction"];
+    hpm     -> fpga_core [label="LOAD_ACT / COMPUTE_MM / STORE_OUT\n(opcode+ptr+dims)", lhead=cluster_fpga];
+    fpga_core -> hpm  [label="IRQ / status", dir=back, style=solid, color="#1a73e8"];
+
+    edge [color="#e37400", fontcolor="#e37400", penwidth=1.8];
+    cpu_quant -> mem_act [label="quantized act → DDR"];
+    mem_act -> dma       [label="LOAD_ACT"];
+    mem_wt  -> dma       [label="COMPUTE_MM\nweights stream every cycle"];
+    dma -> fpga_core     [label="4 × 128-bit HP\n= 512-bit weight beat", lhead=cluster_fpga];
+    fpga_core -> dma     [label="STORE_OUT\nresult beats", ltail=cluster_fpga];
+    dma -> mem_out       [label="results → DDR"];
+    mem_out -> cpu_res   [label="read back", color="#e37400"];
+
+    { rank=same; hpm; dma; }
+}

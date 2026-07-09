@@ -1,24 +1,24 @@
 #-----------------------------------------------------------
-# Vivado v2024.1 (64-bit)
-# SW Build 5076996 on Wed May 22 18:36:09 MDT 2024
-# IP Build 5075265 on Wed May 22 21:45:21 MDT 2024
-# SharedData Build 5076995 on Wed May 22 18:29:18 MDT 2024
-# Start of session at: Thu May 21 16:46:45 2026
-# Process ID: 242841
-# Current directory: /home/aebarthyi/matmulfree_KRIA
-# Command line: vivado -mode batch -source scripts/ooc_synth.tcl -tclargs k26_bench
-# Log file: /home/aebarthyi/matmulfree_KRIA/vivado.log
-# Journal file: /home/aebarthyi/matmulfree_KRIA/vivado.jou
-# Running On        :shawty
-# Platform          :Ubuntu
-# Operating System  :Ubuntu 24.04.4 LTS
-# Processor Detail  :Intel(R) Xeon(R) W-2155 CPU @ 3.30GHz
-# CPU Frequency     :1200.105 MHz
-# CPU Physical cores:10
-# CPU Logical cores :20
-# Host memory       :67118 MB
-# Swap memory       :8589 MB
-# Total Virtual     :75708 MB
-# Available Virtual :69529 MB
+# Vivado v2025.2 (64-bit)
+# SW Build 6299465 on Fri Nov 14 12:34:56 MST 2025
+# IP Build 6300035 on Fri Nov 14 10:48:45 MST 2025
+# SharedData Build 6298862 on Thu Nov 13 04:50:51 MST 2025
+# Start of session at: Tue Jul  7 22:10:31 2026
+# Process ID         : 2362395
+# Current directory  : /home/aebarthyi/matmulfree_KRIA
+# Command line       : vivado -mode batch -notrace -source /tmp/claude-1000/-home-aebarthyi-matmulfree-KRIA/fc98a706-d67b-4212-bb87-9a496d645d00/scratchpad/rpt3.tcl
+# Log file           : /home/aebarthyi/matmulfree_KRIA/vivado.log
+# Journal file       : /home/aebarthyi/matmulfree_KRIA/vivado.jou
+# Running On         : shawty
+# Platform           : Ubuntu
+# Operating System   : Ubuntu 24.04.4 LTS
+# Processor Detail   : Intel(R) Xeon(R) W-2155 CPU @ 3.30GHz
+# CPU Frequency      : 1200.000 MHz
+# CPU Physical cores : 10
+# CPU Logical cores  : 20
+# Host memory        : 67118 MB
+# Swap memory        : 8589 MB
+# Total Virtual      : 75708 MB
+# Available Virtual  : 66915 MB
 #-----------------------------------------------------------
-source scripts/ooc_synth.tcl
+source /tmp/claude-1000/-home-aebarthyi-matmulfree-KRIA/fc98a706-d67b-4212-bb87-9a496d645d00/scratchpad/rpt3.tcl -notrace

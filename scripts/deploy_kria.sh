@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy_kria.sh — run ON the KRIA, from inside the transfer/ directory.
+# deploy_kria.sh — run ON the KRIA, from the root of the transfer/ bundle.
 #
 # Installs the core_bench overlay app where xmutil expects it, ensures the
 # PL clock isn't gated by the kernel, and (re)loads the app:
@@ -10,7 +10,12 @@
 #      gating causes bus errors / hard hangs on PL MMIO — needs reboot once)
 #   3. xmutil unloadapp + loadapp core_bench
 #
-# Usage:  sudo ./deploy_kria.sh
+# The HW files for a given preset live in presets/<preset>/; the u-dma-buf driver
+# source is shared at udmabuf/. Both are resolved relative to this script's dir, so
+# the bundle is fully self-contained.
+#
+# Usage:  sudo ./deploy_kria.sh <preset>     (e.g. sudo ./deploy_kria.sh k26_mmfree1_3b_a16_b4)
+#         or via the bundle Makefile:  sudo make deploy-hw PRESET=<preset>
 
 set -euo pipefail
 
@@ -20,14 +25,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run with sudo." >&2; exit 1; }
 
+PRESET="${1:-}"
+[ -n "$PRESET" ] || { echo "ERROR: usage: sudo ./deploy_kria.sh <preset>   (bundled: $(ls "$HERE/presets" 2>/dev/null | tr '\n' ' '))" >&2; exit 1; }
+PRESET_DIR="$HERE/presets/$PRESET"
+[ -d "$PRESET_DIR" ] || { echo "ERROR: $PRESET_DIR missing — '$PRESET' is not in this bundle (have: $(ls "$HERE/presets" 2>/dev/null | tr '\n' ' '))." >&2; exit 1; }
+
 for f in $APP.bit.bin $APP.dtbo shell.json; do
-    [ -f "$HERE/$f" ] || { echo "ERROR: $HERE/$f missing." >&2; exit 1; }
+    [ -f "$PRESET_DIR/$f" ] || { echo "ERROR: $PRESET_DIR/$f missing." >&2; exit 1; }
 done
 
 # ─── 1. Install firmware files ───────────────────────────────────────────
 mkdir -p "$FW_DIR"
-cp "$HERE/$APP.bit.bin" "$HERE/$APP.dtbo" "$HERE/shell.json" "$FW_DIR/"
-echo "==> Installed $FW_DIR/{$APP.bit.bin, $APP.dtbo, shell.json}"
+cp "$PRESET_DIR/$APP.bit.bin" "$PRESET_DIR/$APP.dtbo" "$PRESET_DIR/shell.json" "$FW_DIR/"
+echo "==> Installed $FW_DIR/{$APP.bit.bin, $APP.dtbo, shell.json}  (preset $PRESET)"
 
 # ─── 2. PL clock gating fix ──────────────────────────────────────────────
 # The overlay's generic-uio node lists pl0_ref but never claims it; without
@@ -92,9 +102,9 @@ xmutil loadapp "$APP"
 # Directly prevents the stale-overlay footgun (an old overlay's smaller udmabuf
 # silently truncating the new geometry's transfers). preset.env ships in the
 # transfer dir; the overlay's nodes must be at least the manifest's sizes.
-if [ -f "$HERE/preset.env" ]; then
+if [ -f "$PRESET_DIR/preset.env" ]; then
     # shellcheck disable=SC1091
-    . "$HERE/preset.env"
+    . "$PRESET_DIR/preset.env"
     udmabuf_size() {            # $1=node name → prints size in bytes, or empty
         local cls
         for cls in u-dma-buf udmabuf; do
@@ -131,7 +141,7 @@ if [ -f "$HERE/preset.env" ]; then
     [ "$rc" -eq 0 ] && echo "==> udmabuf sizes OK" \
                     || echo "WARN: udmabuf verification found problems (see above)."
 else
-    echo "==> (no preset.env in transfer dir — skipping udmabuf size verification)"
+    echo "==> (no preset.env in $PRESET_DIR — skipping udmabuf size verification)"
 fi
 
 if [ "$REBOOT_NEEDED" -eq 1 ]; then

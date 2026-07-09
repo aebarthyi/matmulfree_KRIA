@@ -1,0 +1,25 @@
+{ "signal": [
+  { "name": "clk",             "wave": "p................" },
+  ["s_axis (weights)",
+    { "name": "tvalid",        "wave": "01.......0.1....." },
+    { "name": "tready (inQ)",  "wave": "1........0.1....." },
+    { "name": "tdata beat",    "wave": "x2.2.2.2.x.2.2...", "data": ["W0","W1","W..","WN-1","W0'","W1'"] }
+  ],
+  {},
+  ["array pass (tile t)",
+    { "name": "arm act+wt",    "wave": "0.1......0.1....." },
+    { "name": "accumCounter",  "wave": "x.3.3.3.3.x.3.3..", "data": ["0","1","..","N-1","0","1"] },
+    { "name": "output.valid",  "wave": "0.......10......." }
+  ],
+  {},
+  ["capture + drain (overlaps tile t+1)",
+    { "name": "capture",       "wave": "0........10......" },
+    { "name": "arrLocalReset", "wave": "0........10......" },
+    { "name": "drainBusy",     "wave": "0........1.....0." },
+    { "name": "outWrEn",       "wave": "0.........1....0." }
+  ]
+  ],
+  "head": { "text": "COMPUTE_MM  —  stream N weight+act beats  →  array accumulates (0..N-1)  →  output.valid  →  capture (valid && !drainBusy)  →  drain to outBram overlaps tile t+1's stream" },
+  "foot": { "text": "tready drops on the capture cycle so no beat is lost; drainBusy hides the store under the next tile's N-cycle pass" },
+  "config": { "hscale": 1 }
+}

@@ -1,0 +1,55 @@
+# ============================================================================
+# LEVEL 3a — Control-plane structure: instruction dispatch + the two FSMs.
+# (The 128-bit instruction WORD layout lives in the WaveDrom bit-field diagram.)
+#   render:  d2 --layout dagre 03_fsms.d2 fsms.svg
+# ============================================================================
+
+title: "Core Control — Instruction Dispatch + FSMs" {
+  near: top-center
+  shape: text
+  style: { font-size: 28; bold: true }
+}
+
+handler: AxiInstructionHandler {
+  style: { fill: "#eaf1fd"; stroke: "#1a73e8"; font-size: 16 }
+  regmap:  "AXI4 reg map\nINSTR_WRITE / STATUS" { style: { fill: "#d2e3fc"; stroke: "#1a73e8" } }
+  decode:  "decode 128b\nopcode·ptr·dim0·dim1·flags" { style: { fill: "#d2e3fc"; stroke: "#1a73e8" } }
+  dispatch: "dispatch (Decoupled)\nload · compute · store" { style: { fill: "#aecbfa"; stroke: "#1a73e8" } }
+  status:  "StatusReg\nbusy·irq·err·lastOpcode" { style: { fill: "#aecbfa"; stroke: "#1a73e8" } }
+  regmap -> decode -> dispatch
+  decode -> status: "bad opcode →\nINVALID_OPCODE" { style.stroke: "#c5221f" }
+}
+
+top_fsm: Top-level FSM {
+  style: { fill: "#e6f4ea"; stroke: "#34a853"; font-size: 16 }
+  sIdle:    "sIdle" { shape: circle; style: { fill: "#a8dab5"; stroke: "#137333" } }
+  sLoad:    "sLoad" { shape: circle; style: { fill: "#a8dab5"; stroke: "#137333" } }
+  sCompute: "sCompute" { shape: circle; style: { fill: "#a8dab5"; stroke: "#137333" } }
+  sStore:   "sStore" { shape: circle; style: { fill: "#a8dab5"; stroke: "#137333" } }
+
+  sIdle -> sLoad: "LOAD_ACT.fire"
+  sIdle -> sCompute: "COMPUTE_MM.fire"
+  sIdle -> sStore: "STORE_OUT.fire"
+  sLoad -> sIdle: "beats==len → loadDone"
+  sCompute -> sIdle: "tiles drained → computeDone"
+  sStore -> sIdle: "beats==total → storeDone"
+}
+
+cmp_fsm: "inner COMPUTE FSM (cState) — one pass per column tile" {
+  style: { fill: "#fef7e0"; stroke: "#e37400"; font-size: 16 }
+  cInit:   "cInit" { shape: circle; style: { fill: "#fde293"; stroke: "#e37400" } }
+  cStream: "cStream" { shape: circle; style: { fill: "#fde293"; stroke: "#e37400" } }
+  cReset:  "cReset" { shape: circle; style: { fill: "#fde293"; stroke: "#e37400" } }
+  cDone:   "cDone" { shape: circle; style: { fill: "#fde293"; stroke: "#e37400" } }
+
+  cInit -> cStream: "prime actRdAddr=0"
+  cStream -> cStream: "stream N beats\n(weights+act → array)"
+  cStream -> cReset: "output.valid && !drainBusy\n→ capture tile"
+  cReset -> cStream: "colTile+1 < numTiles\n(local array reset)"
+  cReset -> cDone: "last tile"
+  cDone -> cDone: "wait drainBusy=0 && drainFlush=0"
+}
+
+handler.dispatch -> top_fsm.sIdle: "commands" { style.stroke: "#5f6368" }
+top_fsm.sCompute -> cmp_fsm.cInit: "drives inner FSM" { style: { stroke: "#e37400"; stroke-dash: 4 } }
+cmp_fsm.cDone -> handler.status: "computeDone → IRQ" { style: { stroke: "#1a73e8"; stroke-dash: 4 } }

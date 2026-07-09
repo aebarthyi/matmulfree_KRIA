@@ -11,6 +11,9 @@ transfer/
 # verification/, xgui/). Pure build product of `make build PRESET=...` — regenerated every
 # build, never hand-edited. build_all.sh re-packages the IP automatically if it's absent.
 generated/
+# Per-build resource-utilization reports (build_project.tcl), one .rpt per CoreConfig
+# geometry. Build product of `make build PRESET=...`; regenerate any time. Not versioned.
+reports/
 ### XilinxISE template
 # intermediate build files
 *.bgn

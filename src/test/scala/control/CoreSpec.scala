@@ -462,6 +462,58 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Runtime batch count (instruction flags field). A high-B bitstream must
+    // serve a low-batch call by draining only the requested rows. Proven
+    // deterministically: a full-batch compute seeds BOTH outBram rows, then a
+    // batch=1 compute with different weights must overwrite ONLY row 0 and
+    // leave row 1 stale — so the drain bound is genuinely runtime, not batchSize.
+    // ──────────────────────────────────────────────────────────────────
+
+    "runtime batch: batch=1 compute drains only row 0, leaving row 1 stale" in {
+      simulate(mkCore) { dut =>
+        resetDut(dut)
+        val n = 4
+        val m = outLanesPerTile                 // single col tile (numColTiles = 1)
+        val acts = Seq.fill(n)(Seq(2, 3))       // batch0 act=2, batch1 act=3 per cycle
+        val w1   = Seq.fill(n)(Seq.fill(outLanesPerTile)(1))  // +sum
+        val w2   = Seq.fill(n)(Seq.fill(outLanesPerTile)(3))  // -sum
+
+        // LOAD once — activations persist across both computes.
+        axiWrite(dut, OFF_INSTR, encode(LOAD_ACT, BigInt(0x100), BigInt(n), 0)) mustBe OKAY
+        pushAxisBeats(dut, acts.map(packActivations))
+        waitForIrq(dut); ackIrq(dut)
+
+        // COMPUTE #1: full batch (flags=0). Seeds outBram row0=+8, row1=+12.
+        axiWrite(dut, OFF_INSTR,
+          encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(m), flags = 0)) mustBe OKAY
+        pushAxisBeats(dut, w1.map(packWeights), maxCyclesPerBeat = 100)
+        waitForIrq(dut); ackIrq(dut)
+
+        // COMPUTE #2: runtime batch=1 (flags=1) with w2. Only row 0 is drained.
+        axiWrite(dut, OFF_INSTR,
+          encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(m), flags = 1)) mustBe OKAY
+        pushAxisBeats(dut, w2.map(packWeights), maxCyclesPerBeat = 100)
+        waitForIrq(dut); ackIrq(dut)
+
+        // STORE both rows and inspect.
+        val totalOutputs = batchSize * m
+        axiWrite(dut, OFF_INSTR,
+          encode(STORE_OUT, BigInt(0x400), BigInt(totalOutputs), 0)) mustBe OKAY
+        val raw = pullAxisBeats(dut, totalOutputs / effOutBeatLanes)
+        waitForIrq(dut); ackIrq(dut)
+        val actual = unpackOutputs(raw)
+
+        val refW1 = referenceCompute(acts, w1, n, m)   // batch0=+8, batch1=+12
+        val refW2 = referenceCompute(acts, w2, n, m)   // batch0=-8 mod
+        // Row 0 = fresh w2 result; row 1 = stale w1 result from compute #1.
+        val expected = refW2.slice(0, m) ++ refW1.slice(m, 2 * m)
+        actual mustBe expected
+        (0 until m).foreach { c => actual(c)     mustBe ((BigInt(-8) % outAccModulus) + outAccModulus) % outAccModulus }
+        (0 until m).foreach { c => actual(m + c) mustBe BigInt(12) }
+      }
+    }
+
     "edge: LOAD at full BRAM depth (n = maxN) works end-to-end" in {
       simulate(mkCore) { dut =>
         resetDut(dut)
@@ -473,6 +525,52 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
         val actual   = runPipeline(dut, acts, weights, n, m)
         val expected = referenceCompute(acts, weights, n, m)
         actual mustBe expected
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Column banking — systolic pipeline inside the array. End-to-end result
+  // must be identical to the broadcast Core (the banking only retimes the
+  // array; Core's capture/drain waits on completion, so the extra per-bank
+  // latency is transparent). colBankSize=1 with xDim=2 → 2 banks.
+  // ──────────────────────────────────────────────────────────────────
+
+  "Core with column banking (colBankSize=1)" - {
+    def mkBankedCore = new Core(
+      aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
+      maxN = maxN, maxM = maxM, outBeatLanes = 0,
+      axiAddrWidth = ADDR_WIDTH, axiDataWidth = DATA_WIDTH, axiIdWidth = ID_WIDTH,
+      colBankSize = 1
+    )
+
+    "numeric: random workloads match reference (5 seeds)" in {
+      Seq(1L, 7L, 42L, 99L, 256L).foreach { seed =>
+        simulate(mkBankedCore) { dut =>
+          resetDut(dut)
+          val rng = new Random(seed)
+          val n   = 4 + rng.nextInt(maxN - 3)
+          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
+          val m = numColTiles * outLanesPerTile
+          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
+          val weights = Seq.fill(numColTiles * n) {
+            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
+          }
+          val actual   = runPipeline(dut, acts, weights, n, m)
+          val expected = referenceCompute(acts, weights, n, m)
+          withClue(s"banked seed=$seed n=$n m=$m") { actual mustBe expected }
+        }
+      }
+    }
+
+    "edge: back-to-back COMPUTE tiles drain correctly with per-bank skew" in {
+      simulate(mkBankedCore) { dut =>
+        resetDut(dut)
+        val n = maxN
+        val m = 2 * outLanesPerTile   // 2 col tiles: exercises capture→reset→next-tile
+        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 1) & ((1 << aWidth) - 1)))
+        val weights = Seq.fill((m / outLanesPerTile) * n)(Seq.fill(outLanesPerTile)(1))
+        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
       }
     }
   }

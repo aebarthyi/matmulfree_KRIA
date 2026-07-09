@@ -1,0 +1,77 @@
+# ============================================================================
+# LEVEL 3b — Compute plane: SystolicArray grid + PE datapath (word level).
+#   values for the 2.7B a16 B6 preset: aWidth=16 (nLanes=8), xDim=32,
+#   yDim=batch=6, maxAcc=8192, accWidth = 16 + headroom(11) = 27.
+#   render:  d2 --layout elk 04_systolic_pe.d2 systolic_pe.svg
+# ============================================================================
+
+title: "Compute Plane — SystolicArray + PE datapath (word level)" {
+  near: top-center
+  shape: text
+  style: { font-size: 28; bold: true }
+}
+
+feed: "array feed / cycle (from armSlice)\nweights_i: Vec(xDim·nLanes)×2b = 256 ternary\nactivation_i: Vec(yDim)×aWidth = 6×16b\nnAcc: log2(maxAcc)b one-shot" {
+  style: { fill: "#ceead6"; stroke: "#137333"; border-radius: 8 }
+}
+
+array: "SystolicArray  (yDim rows × xDim cols) — weights broadcast, no delay chain" {
+  style: { fill: "#e6f4ea"; stroke: "#34a853"; font-size: 16 }
+  grid-columns: 3
+
+  afsm: "array FSM (lockstep)\nidle→running→done\nstartable = weights.valid\n&& act.valid && nAcc.valid" {
+    style: { fill: "#ceead6"; stroke: "#137333" }
+  }
+  pe00: "PE(0,0)"    { style: { fill: "#a8dab5"; stroke: "#137333" } }
+  pe01: "PE(0,1)"    { style: { fill: "#a8dab5"; stroke: "#137333" } }
+  pe0x: "PE(0,xDim-1)" { style: { fill: "#a8dab5"; stroke: "#137333" } }
+  pe10: "PE(1,0)"    { style: { fill: "#a8dab5"; stroke: "#137333" } }
+  pe11: "PE(1,1)"    { style: { fill: "#a8dab5"; stroke: "#137333" } }
+  pe1x: "PE(1,·)"    { style: { fill: "#a8dab5"; stroke: "#137333" } }
+  pey:  "PE(yDim-1,·)" { style: { fill: "#ceead6"; stroke: "#137333" } }
+
+  pe00 -> pe01 -> pe0x: "weight beat broadcast →" { style.stroke: "#137333" }
+  pe10 -> pe11 -> pe1x: { style.stroke: "#137333" }
+  pe00 -> pe10: "act[row] per row" { style.stroke: "#e37400" }
+}
+
+pe: "PE datapath (one PE = nLanes independent ternary MACs)" {
+  style: { fill: "#f1f8f4"; stroke: "#137333"; font-size: 16 }
+
+  pin: "PE input\nweights_i: Vec(nLanes)×2b\nactivation_i: aWidth (16b)\nnAcc: log2(maxAcc)b" {
+    style: { fill: "#ceead6"; stroke: "#137333" }
+  }
+  dec: "2-bit ternary decode (per lane)\n01(+1): acc += act\n11(−1): acc −= act\nelse: hold (weight 0)" {
+    style: { fill: "#d7ede0"; stroke: "#137333" }
+  }
+  ext: "sign/zero extend\nact aWidth → accWidth\n(signedAct picks)" {
+    style: { fill: "#d7ede0"; stroke: "#137333" }
+  }
+  add: "± adder\n(no multiplier)" { shape: circle; style: { fill: "#b7ddc6"; stroke: "#137333" } }
+  acc: "accumReg\nVec(nLanes)×accWidth\naccWidth = aWidth+headroom = 27" {
+    style: { fill: "#a8dab5"; stroke: "#137333"; stroke-width: 2 }
+  }
+  cnt: "accumCounter\nCounter(maxAcc) + nAccReg" { style: { fill: "#d7ede0"; stroke: "#137333" } }
+  pfsm: "PE FSM\nidle→running→done\nready=(state≠done)\nvalid=(state==done)\nself-clears on done→idle" {
+    style: { fill: "#ceead6"; stroke: "#137333" }
+  }
+  pout: "PE output\naccum: Vec(nLanes)×accWidth" { style: { fill: "#a8dab5"; stroke: "#137333" } }
+
+  pin -> dec: "weight lane"
+  pin -> ext: "activation"
+  dec -> add
+  ext -> add
+  acc -> add: "feedback" { style.stroke-dash: 4 }
+  add -> acc: "acc′"
+  cnt -> pfsm: "count==nAcc-1 → done"
+  pfsm -> acc: "clear on done" { style.stroke-dash: 2 }
+  acc -> pout
+}
+
+outb: "output.accum\nVec(yDim) × Vec(xDim·nLanes) × accWidth\nall rows exposed → tileAccums" {
+  style: { fill: "#fde293"; stroke: "#e37400"; border-radius: 8 }
+}
+
+feed -> array.afsm: "Decoupled rendezvous" { style.stroke: "#5f6368" }
+array.pe00 -> pe.pin: "zoom into one PE" { style: { stroke: "#137333"; stroke-dash: 4 } }
+pe.pout -> outb: "per (row,col,lane)" { style.stroke: "#e37400" }

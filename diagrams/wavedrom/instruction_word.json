@@ -1,0 +1,7 @@
+[
+  { "name": "opcode", "bits": 8,  "attr": "LOAD / COMPUTE / STORE", "type": 2 },
+  { "name": "ptr",    "bits": 40, "attr": "40-bit physical / bus address",          "type": 3 },
+  { "name": "dim0",   "bits": 32, "attr": "rows N  (or LOAD/STORE len)",            "type": 4 },
+  { "name": "dim1",   "bits": 32, "attr": "cols M",                                  "type": 5 },
+  { "name": "flags",  "bits": 16, "attr": "reserved",                                "type": 6 }
+]

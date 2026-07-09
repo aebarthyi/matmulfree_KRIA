@@ -152,12 +152,15 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     "1.3B and 2.7B share one bitstream geometry (differ only in default sweep)" in {
       val a = CoreConfig.K26_MMFree1_3B_A16
       val b = CoreConfig.K26_MMFree2_7B_A16
-      // Identical HW: shapesHint and residentWtBytes are deployment metadata (default
-      // bench sweep + resident udmabuf-wt sizing), not bitstream geometry — normalize
-      // both out before comparing.
-      a.copy(shapesHint = "", residentWtBytes = 0) mustBe b.copy(shapesHint = "", residentWtBytes = 0)
+      // Identical HW: shapesHint, modelName and residentWtBytes are deployment metadata
+      // (default bench sweep + target checkpoint + resident udmabuf-wt sizing), not
+      // bitstream geometry — normalize all three out before comparing.
+      a.copy(shapesHint = "", modelName = "", residentWtBytes = 0) mustBe
+        b.copy(shapesHint = "", modelName = "", residentWtBytes = 0)
       a.shapesHint mustBe "1.3b"
       b.shapesHint mustBe "2.7b"
+      a.modelName mustBe "ridger/MMfreeLM-1.3B"
+      b.modelName mustBe "ridger/MMfreeLM-2.7B"
       // …but the resident weight set (-> UDMABUF_WT_SZ) DOES scale with model size,
       // so the same bitstream needs a bigger wt buffer for 2.7B than for 1.3B.
       b.residentWtBytes must be > a.residentWtBytes

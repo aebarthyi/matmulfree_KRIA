@@ -52,6 +52,12 @@ class ComputeMatmulCmd extends Bundle {
     val weightsPtr = UInt(40.W)
     val rows       = UInt(32.W)
     val cols       = UInt(32.W)
+    // Runtime active batch count, carried in the instruction's flags field.
+    // 0 → "full" (Core clamps to the built batchSize), so an existing host that
+    // leaves flags=0 is byte-behaviour-identical. A value 1..batchSize drains only
+    // that many batch rows — lets one high-B bitstream serve a b=1 decode without
+    // the wasted (B-1)-row drain.
+    val batch      = UInt(16.W)
 }
 
 class StoreOutputCmd extends Bundle {
@@ -345,6 +351,7 @@ class AxiInstructionHandler(
                     compute.bits.weightsPtr := instReg.ptr
                     compute.bits.rows       := instReg.dim0
                     compute.bits.cols       := instReg.dim1
+                    compute.bits.batch      := instReg.flags
                     when(compute.fire) { dispState := awaitingDone }
                 }
                 is(Opcode.STORE_OUT) {

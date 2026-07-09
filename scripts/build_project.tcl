@@ -158,6 +158,53 @@ open_run impl_1
 # — use only for experiments, never for a trusted deploy).
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
 puts "==> post-route WNS: $wns ns"
+
+# ─── Concise resource-utilization report, named by the CoreConfig params ─────
+# Written for EVERY build (including a timing-failing one — placed before the gate
+# below — so a parameter sweep still records the resource cost of every point).
+# The params come from the preset manifest env that build_all.sh's load_manifest
+# exports (MMFREE_AWIDTH, MMFREE_XDIM, …); each falls back to 'x' when this script
+# is run standalone without the manifest. Lands in reports/<tag>.rpt at the repo
+# root, one file per distinct CoreConfig geometry so a sweep collects them side by side.
+proc _rpt_env {k} { return [expr {[info exists ::env($k)] ? $::env($k) : "x"}] }
+set cfg_preset [expr {[info exists ::env(MMFREE_PRESET)] ? $::env(MMFREE_PRESET) : [file tail $ip_repo]}]
+set cfg_tag [format "%s_a%s_x%s_b%s_n%s_m%s_acc%s_acw%s_%sMHz" \
+    $cfg_preset [_rpt_env MMFREE_AWIDTH] [_rpt_env MMFREE_XDIM] [_rpt_env MMFREE_BATCH] \
+    [_rpt_env MMFREE_MAXN] [_rpt_env MMFREE_MAXM] [_rpt_env MMFREE_MAXACC] \
+    [_rpt_env MMFREE_ACC_WIDTH] [_rpt_env PL_CLK_MHZ]]
+set rpt_dir [file join $repo_root reports]
+file mkdir $rpt_dir
+set rpt_file [file join $rpt_dir "$cfg_tag.rpt"]
+
+set fh [open $rpt_file w]
+puts $fh "# Resource utilization — preset $cfg_preset"
+puts $fh "# CoreConfig: aWidth=[_rpt_env MMFREE_AWIDTH] xDim=[_rpt_env MMFREE_XDIM] batch=[_rpt_env MMFREE_BATCH] maxN=[_rpt_env MMFREE_MAXN] maxM=[_rpt_env MMFREE_MAXM] maxAcc=[_rpt_env MMFREE_MAXACC] accWidth=[_rpt_env MMFREE_ACC_WIDTH] headroom=[_rpt_env MMFREE_ACC_HEADROOM] signed=[_rpt_env MMFREE_SIGNED]"
+set _clk [_rpt_env PL_CLK_MHZ]
+puts $fh "# Target clock: $_clk MHz   post-route WNS: $wns ns"
+if {[string is double -strict $_clk] && $_clk > 0} {
+    set _period [expr {1000.0 / $_clk}]
+    if {$wns < $_period} {
+        puts $fh [format "# Est. Fmax: %.1f MHz" [expr {1000.0 / ($_period - $wns)}]]
+    }
+}
+puts $fh ""
+# Concise table: pull only the headline site types out of report_utilization.
+# The util summary rows are `| Site Type | Used | Fixed | Prohibited | Available | Util% |`,
+# so splitting a data line on '|' gives name@1, used@2, available@5, util@6.
+set _want [list "CLB LUTs" "CLB Registers" "CARRY8" "Block RAM Tile" "RAMB36/FIFO" "RAMB18" "URAM" "DSPs"]
+puts $fh [format "  %-16s %12s %12s %8s" "Resource" "Used" "Available" "Util%"]
+foreach _line [split [report_utilization -return_string] "\n"] {
+    if {![string match "|*" $_line]} continue
+    set _cols [split $_line "|"]
+    if {[llength $_cols] < 7} continue
+    set _name [string trim [lindex $_cols 1]]
+    if {[lsearch -exact $_want $_name] < 0} continue
+    puts $fh [format "  %-16s %12s %12s %8s" $_name \
+        [string trim [lindex $_cols 2]] [string trim [lindex $_cols 5]] [string trim [lindex $_cols 6]]]
+}
+close $fh
+puts "==> resource report: $rpt_file"
+
 if {$wns < 0} {
     if {[info exists ::env(ALLOW_TIMING_FAIL)] && $::env(ALLOW_TIMING_FAIL) eq "1"} {
         puts "WARNING: timing FAILED (WNS=$wns ns) — writing bitstream anyway (ALLOW_TIMING_FAIL=1, experimental; validate on hardware before trusting results)."

@@ -23,14 +23,19 @@ class CoreTop(
     val axiAddrWidth: Int = 32,
     val axiDataWidth: Int = 128,
     val axiIdWidth:   Int = 6,
-    val signedAct:    Boolean = false
+    val signedAct:    Boolean = false,
+    val accHeadroomBits: Int = -1,
+    val actMaxFanout:    Int = 0,
+    val dspAccum:        Boolean = false,
+    val colBankSize:     Int = 0
 ) extends RawModule {
 
     // Width math (mirrors Core.scala) — required so the IO bundles can size themselves.
     private val nLanes          = aWidth / 2
     private val outLanesPerTile = xDim * nLanes
     private val effOutBeatLanes = if (outBeatLanes == 0) outLanesPerTile else outBeatLanes
-    private val tileAccWidth    = log2Ceil(maxAcc) + aWidth
+    private val accHeadroom      = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+    private val tileAccWidth    = aWidth + accHeadroom
     private val outAccWidth     = tileAccWidth
     private val outLaneWidth    = 1 << log2Ceil(outAccWidth)
 
@@ -72,7 +77,11 @@ class CoreTop(
             axiAddrWidth = axiAddrWidth,
             axiDataWidth = axiDataWidth,
             axiIdWidth   = axiIdWidth,
-            signedAct    = signedAct
+            signedAct    = signedAct,
+            accHeadroomBits = accHeadroomBits,
+            actMaxFanout    = actMaxFanout,
+            dspAccum        = dspAccum,
+            colBankSize     = colBankSize
         ))
 
         Core.connectAxiSlave(outer = s_axi, inner = core.s_axi)

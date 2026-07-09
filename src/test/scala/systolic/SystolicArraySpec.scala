@@ -263,4 +263,70 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
       }
     }
   }
+
+  // ---------------------------------------------------------------
+  // Column banking (systolic pipeline) — must be numerically identical
+  // to the broadcast array, just finishing (numBanks-1) cycles later.
+  // ---------------------------------------------------------------
+
+  /** Like runAndCheck, but tolerates the per-bank pipeline latency: after the last
+    * beat it polls output.valid for up to `maxSkew` cycles before checking. */
+  private def runAndCheckBanked(
+      dut: SystolicArray,
+      aWidth: Int, maxAcc: Int, xDim: Int, yDim: Int,
+      weights: Seq[Seq[Int]], activations: Seq[Seq[Int]], maxSkew: Int
+  ): Unit = {
+    val nAcc     = weights.length
+    val expected = SystolicArrayModel.compute(aWidth, maxAcc, xDim, yDim, weights, activations)
+
+    dut.input.weights_i.valid.poke(true.B)
+    dut.input.activation_i.valid.poke(true.B)
+    dut.input.nAcc.valid.poke(true.B)
+    dut.input.nAcc.bits.poke(nAcc.U)
+    dut.output.ready.poke(false.B)
+
+    for (t <- 0 until nAcc) {
+      pokeWeights(dut, weights(t))
+      pokeActivations(dut, activations(t))
+      dut.clock.step()
+    }
+    dut.input.weights_i.valid.poke(false.B)
+    dut.input.activation_i.valid.poke(false.B)
+    dut.input.nAcc.valid.poke(false.B)
+
+    // Drain the pipeline: the deepest bank finishes up to maxSkew cycles later.
+    var waited = 0
+    while (dut.output.valid.peek().litToBoolean == false && waited < maxSkew) {
+      dut.clock.step(); waited += 1
+    }
+    dut.output.valid.expect(true.B, s"output valid should be high within $maxSkew drain cycles")
+    for (row <- 0 until yDim; idx <- expected(row).indices) {
+      dut.output.bits.accum(row)(idx).expect(expected(row)(idx).U,
+        s"accum[$row][$idx]: expected ${expected(row)(idx)}")
+    }
+    dut.output.ready.poke(true.B)
+    dut.clock.step()
+  }
+
+  "SystolicArray column banking matches broadcast" - {
+    // (aWidth, maxAcc, xDim, yDim, colBankSize) — bank sizes that both divide and
+    // do NOT divide xDim, to exercise the partial deepest bank.
+    Seq((8, 64, 4, 2, 2), (4, 64, 6, 3, 2), (8, 64, 5, 2, 2), (8, 128, 8, 2, 3)).foreach {
+      case (aw, mA, xD, yD, bank) =>
+        val numBanks = (xD + bank - 1) / bank
+        s"random ops on (aWidth=$aw, xDim=$xD, yDim=$yD, colBankSize=$bank, numBanks=$numBanks)" in {
+          simulate(new SystolicArray(aw, mA, xD, yD, colBankSize = bank)) { dut =>
+            val rng   = new Random(0xBEEF + xD * 31 + yD + bank)
+            val flatW = xD * (aw / 2)
+            for (_ <- 0 until 8) {
+              resetDut(dut)
+              val nAcc        = 2 + rng.nextInt(math.min(8, mA - 2))
+              val weights     = Seq.fill(nAcc)(Seq.fill(flatW)(randWeight(rng)))
+              val activations = Seq.fill(nAcc)(Seq.fill(yD)(rng.nextInt(1 << aw)))
+              runAndCheckBanked(dut, aw, mA, xD, yD, weights, activations, maxSkew = numBanks + 2)
+            }
+          }
+        }
+    }
+  }
 }

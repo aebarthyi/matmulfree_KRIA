@@ -4,6 +4,8 @@ package systolic
 
 import chisel3._
 import chisel3.util._
+import chisel3.experimental.annotate
+import firrtl.AttributeAnnotation
 
 class PEInputBundle(val aWidth: Int, val maxAcc: Int) extends Bundle {
   val weights_i = Vec(aWidth/2, UInt(2.W))          //weights input
@@ -11,8 +13,8 @@ class PEInputBundle(val aWidth: Int, val maxAcc: Int) extends Bundle {
   val nAcc = UInt(log2Ceil(maxAcc).W)                   //number of accumulations to do (handshakes)
 }
 
-class PEOutputBundle(val aWidth: Int, val maxAcc: Int) extends Bundle {
-  val accum = Vec(aWidth/2, UInt((log2Ceil(maxAcc) + aWidth).W)) //accumulator output (adds log2(N) bits to prevent overflow)
+class PEOutputBundle(val aWidth: Int, val accWidth: Int) extends Bundle {
+  val accum = Vec(aWidth/2, UInt(accWidth.W)) //accumulator output (aWidth + headroom bits to prevent overflow)
 }
 
 /**
@@ -25,12 +27,32 @@ class PEOutputBundle(val aWidth: Int, val maxAcc: Int) extends Bundle {
   * 16-bit fixed-point the HGRN carries). For non-negative activations the two
   * paths are identical, so this only matters once negative values are streamed.
 */
-class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false) extends Module {
+class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false,
+         val accHeadroomBits: Int = -1, val useDspAccum: Boolean = false) extends Module {
   require(maxAcc >= 2, "PE requires maxAcc >= 2 (hardware counter limitation)")
-  val accWidth = log2Ceil(maxAcc) + aWidth
+  require(accHeadroomBits == -1 || accHeadroomBits >= 0,
+          s"accHeadroomBits=$accHeadroomBits must be -1 (auto = log2Ceil(maxAcc)) or >= 0")
+  // Accumulator = aWidth data + headroom overflow bits. Default (-1) keeps the
+  // legacy log2Ceil(maxAcc) headroom (worst-case growth over maxAcc accumulations);
+  // a smaller value trims the accumulator once the model's real dynamic range is
+  // known (the counter still counts to maxAcc — only the data width shrinks).
+  val accHeadroom = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+  val accWidth = aWidth + accHeadroom
   val input = IO(Flipped(Decoupled(new PEInputBundle(aWidth, maxAcc))))
-  val output = IO(Decoupled(new PEOutputBundle(aWidth, maxAcc)))
+  val output = IO(Decoupled(new PEOutputBundle(aWidth, accWidth)))
   val accumReg = RegInit(VecInit(Seq.fill(aWidth/2)(0.U(accWidth.W))))
+  // Map each lane's ±activation accumulator onto a DSP48E2 slice instead of
+  // LUT/CARRY8 fabric. The `use_dsp = "yes"` attribute forces Vivado to
+  // implement the add/sub feeding accumReg in the DSP ALU (P-register feedback
+  // = accumulate, dynamic ALUMODE = the ternary sign, CE = the weight==0 hold).
+  // Synthesis-only metadata: Verilator ignores it, so every PESpec/array test is
+  // byte-for-byte unchanged. Costs one DSP per lane per PE, so it only makes
+  // sense where DSP slices are the slack resource (fabric/route-bound builds).
+  if (useDspAccum) {
+    accumReg.foreach { lane =>
+      annotate(Seq(lane))(Seq(AttributeAnnotation(lane.toNamed, "use_dsp = \"yes\"")))
+    }
+  }
   val accumCounter = Counter(maxAcc)
   val nAccReg = Reg(UInt(log2Ceil(maxAcc).W))
 

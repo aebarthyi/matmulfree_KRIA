@@ -1,32 +1,16 @@
-# board.conf — per-board addresses + device paths for the root Makefile.
+# board.conf — deploy target for the BUILD-SERVER Makefile (`make deploy`).
 #
-# Copy to ./board.conf and edit for your KRIA. The root Makefile -includes it
-# (and falls back to these same defaults when it is absent). KEY=VAL only, so it
-# is both make-includable and bash-sourceable — no spaces around '=', literals
-# only (no $-expansion).
+# Copy to ./board.conf and edit for your KRIA. The root Makefile -includes it (and
+# falls back to these defaults when it is absent). KEY=VAL only — make-includable and
+# bash-sourceable; no spaces around '=', literals only (no $-expansion).
 #
-# Discover the real values on the board:
-#   ls /dev/uio*                       # UIO node bound to the Core IRQ
-#   ls /dev/udmabuf-*                  # u-dma-buf nodes (bare or -act0.. suffixed)
-#   cat /sys/class/u-dma-buf/*/phys_addr
-#   # CSR / DMA base = the CoreTop + axi_dma addresses from the Vivado address map
-#   #                  (also printed by build_all.sh / in the generated dts).
+# (Board-local device paths — CORE_PHYS, /dev/uio4, udmabuf nodes — now live in the
+# BUNDLE's own board.conf, sourced by transfer/Makefile on the board. See
+# scripts/board.conf.example, which ships as transfer/board.conf.example.)
 
-# user@host for `make deploy`
+# user@host for `make deploy`.
 BOARD=ubuntu@kria
 
-# Path to this repo's checkout ON THE BOARD (relative to the board user's $HOME, or
-# absolute). `make deploy` scp's the bundle into $(BOARD_REPO)/transfer/ there — the
-# same place the board-side make verbs and deploy_kria.sh expect it, not loose in $HOME.
-BOARD_REPO=matmulfree_KRIA
-
-# Core CSR window + DMA0 register base (from the Vivado address map).
-CORE_PHYS=0xA0010000
-DMA_PHYS=0xA0000000
-
-# UIO + u-dma-buf base device paths. For NUM_DMA>1 the bench/runner append the
-# port index to ACT_UDMA/WT_UDMA (udmabuf-act0, udmabuf-act1, …); OUT stays bare.
-UIO_DEV=/dev/uio4
-ACT_UDMA=/dev/udmabuf-act
-WT_UDMA=/dev/udmabuf-wt
-OUT_UDMA=/dev/udmabuf-out
+# Remote dir that will CONTAIN transfer/ on the board. `make deploy` rsyncs the bundle
+# into $(BOARD_DEST)/transfer/, and the board works from there (`cd ~/transfer`).
+BOARD_DEST=~
