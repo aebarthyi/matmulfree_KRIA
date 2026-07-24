@@ -24,6 +24,7 @@ struct Manifest {
   std::vector<ProjEntry> projections;
   uint64_t total_bytes_per_port = 0;
   uint32_t num_ports = 0;
+  std::string weight_format;       // "ternary-1p6" / "ternary-2bit"; empty = pre-tag (2-bit) blob
   uint32_t max_N() const;          // largest inner dim across projections
   uint32_t max_n_outputs() const;  // largest padded output across projections
 };

@@ -39,15 +39,20 @@ def main(argv=None) -> int:
     ap.add_argument("--manifest", default=None,
                     help="preset.json/.env from control.EmitCore — geometry is read "
                          "from it (overrides --awidth/--xdim). Defaults to $MMFREE_MANIFEST.")
+    ap.add_argument("--packed", action="store_true",
+                    help="emit 1.6-bit (5 trits/byte) weights for a packedWeights "
+                         "bitstream (only for --awidth/--xdim; a manifest carries its own flag)")
     args = ap.parse_args(argv)
 
     mpath = manifest_path(args.manifest)
-    geom = Geometry.from_manifest(mpath) if mpath else Geometry.derive(args.awidth, args.xdim)
+    geom = (Geometry.from_manifest(mpath) if mpath
+            else Geometry.derive(args.awidth, args.xdim, packed=args.packed))
     if mpath:
         print(f"geometry from manifest: {mpath}", file=sys.stderr)
     print(f"geometry: aWidth={geom.aWidth} xDim={geom.xDim} "
           f"numPorts={geom.numPorts} outLanesPerTile={geom.outLanesPerTile} "
-          f"portBytes={geom.portBytes}", file=sys.stderr)
+          f"portBytes={geom.portBytes} "
+          f"format={'ternary-1p6' if geom.packed else 'ternary-2bit'}", file=sys.stderr)
 
     packer = WeightPacker(geom)
     if args.blob:

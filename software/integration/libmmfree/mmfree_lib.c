@@ -140,7 +140,8 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
      * batch activations into the low batch*aWidth bits of each LOAD beat, so it
      * must fit one port's slice — i.e. batch <= xDim (port math is xDim-derived;
      * see mmfree_geom_init note). */
-    h->ctx.geom.batch = cfg->batch ? cfg->batch : 1u;
+    h->ctx.geom.batch  = cfg->batch ? cfg->batch : 1u;
+    h->ctx.geom.packed = cfg->packed ? 1u : 0u;
     if (h->ctx.geom.batch > cfg->xDim) {
         fprintf(stderr, "mmfree_lib_open: batch=%u must be <= xDim=%u\n",
                 h->ctx.geom.batch, cfg->xDim);
@@ -254,8 +255,8 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
 
     uint32_t col_tiles = (M + g->outLanesPerTile - 1) / g->outLanesPerTile;
     uint32_t n_outputs = col_tiles * g->outLanesPerTile;
-    /* Validate the projection's weight slice fits the resident buffer. */
-    size_t blob_bytes = (size_t)col_tiles * N * g->portBytes;
+    /* Validate the projection's weight slice fits the resident buffer (honors packed). */
+    size_t blob_bytes = mmfree_wt_port_bytes(g, N, M);
     if (byte_offset + blob_bytes > h->wt[0].size) {
         fprintf(stderr, "register: offset %llu + %zu > weight buf %zu\n",
                 (unsigned long long)byte_offset, blob_bytes, h->wt[0].size);
@@ -281,6 +282,35 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
  * engine's PE rows are independent, so their slots are don't-care AND stay at
  * the open-time zero (nothing writes them) — bit-identical to the old zero-fill,
  * but cuts the scatter B:b. Shared by mmfree_bitlinear_batch and the seq driver. */
+/* Sign-expand b rows of M accumulators from the OUT udmabuf into `acc` (row-major,
+ * n_outputs stride per drained row -> M-stride packed output). OUT is a cached mapping
+ * already invalidated by sync_for_cpu before this runs, so the fast path reads it as
+ * normal memory (non-volatile) with a branchless 32-bit arithmetic-shift sign-extend the
+ * compiler can auto-vectorize (NEON) — the per-element volatile read + mmfree_expand_acc
+ * call blocked that. Bit-identical to mmfree_expand_acc for accWidth<=32 (the left shift
+ * discards the same high garbage the mask did; the arithmetic >> sign-extends). The
+ * volatile fallback covers non-cached / wider-than-32-bit lane mappings. */
+static void readback_rows(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint32_t b) {
+    const mmfree_geom_t *g = &h->ctx.geom;
+    if (h->out.cached && g->outLaneBytes == 4 && g->accWidth <= 32) {
+        const uint32_t sh = 32u - g->accWidth;
+        const uint32_t *ob = (const uint32_t *)h->out.vaddr;
+        for (uint32_t i = 0; i < b; i++) {
+            const uint32_t *row = ob + (size_t)i * pr->n_outputs;
+            int32_t *ar = acc + (size_t)i * pr->M;
+            for (uint32_t m = 0; m < pr->M; m++)
+                ar[m] = (int32_t)(row[m] << sh) >> sh;
+        }
+        return;
+    }
+    const volatile uint32_t *ob = (const volatile uint32_t *)h->out.vaddr;
+    for (uint32_t i = 0; i < b; i++) {
+        const volatile uint32_t *row = ob + (size_t)i * pr->n_outputs;
+        for (uint32_t m = 0; m < pr->M; m++)
+            acc[(size_t)i * pr->M + m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
+    }
+}
+
 static void pack_act_port0(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
     const mmfree_geom_t *g = &h->ctx.geom;
     const uint32_t abytes = g->aWidth / 8u;
@@ -333,9 +363,14 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
      *    Each blocks on its own completion IRQ. */
     if (mmfree_load(&h->ctx, h->act, pr->N) < 0)                               return -EIO;
     uint64_t t2 = now_ns();
-    if (mmfree_compute_off(&h->ctx, h->wt, pr->N, pr->M, pr->byte_offset) < 0) return -EIO;
+    /* flags=b: the engine drains only the b active rows, so a b<B call costs
+     * ~B1 (the weight stream is batch-count-independent). Legacy bitstreams that
+     * don't decode flags fall back to a full-B drain, which stays correct since
+     * we store/read only the first b rows below. */
+    if (mmfree_compute_off_b(&h->ctx, h->wt, pr->N, pr->M, pr->byte_offset, b) < 0) return -EIO;
     uint64_t t3 = now_ns();
-    const uint32_t total_outputs = B * pr->n_outputs;
+    /* Drain wrote rows 0..b-1 (contiguous, row-major); store/read only those. */
+    const uint32_t total_outputs = b * pr->n_outputs;
     if (mmfree_store(&h->ctx, &h->out, total_outputs) < 0)                     return -EIO;
     uint64_t tos = now_ns();
     /* Output is cacheable: invalidate the drained lanes so the readback sees the
@@ -346,12 +381,7 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
     /* 5. Sign-expand the first M lanes of each requested row. Output is
      *    batch-major: row i occupies lanes [i*n_outputs, i*n_outputs + M)
      *    (Core.scala drain rowAddr = (batch*numColTiles + colTile)*outSubBeats). */
-    const volatile uint32_t *ob = (const volatile uint32_t *)h->out.vaddr;
-    for (uint32_t i = 0; i < b; i++) {
-        const volatile uint32_t *row = ob + (size_t)i * pr->n_outputs;
-        for (uint32_t m = 0; m < pr->M; m++)
-            acc[(size_t)i * pr->M + m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
-    }
+    readback_rows(h, pr, acc, b);
     uint64_t t5 = now_ns();
 
     h->stats.calls++;
@@ -395,18 +425,20 @@ int mmfree_seq_load(mmfree_lib_t *h, uint32_t N) {
     return 0;
 }
 
-int mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id) {
+int mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
     const proj_t *pr = &h->projs[proj_id];
     const mmfree_geom_t *g = &h->ctx.geom;
-    uint32_t col_tiles = (pr->M + g->outLanesPerTile - 1u) / g->outLanesPerTile;
-    uint32_t bytes = pr->N * col_tiles * g->portBytes;
+    if (b == 0 || b > g->batch) return -EINVAL;
+    /* Per-port weight DMA length (batch-count-independent; honors packed). */
+    uint32_t bytes = mmfree_wt_port_bytes(g, pr->N, pr->M);
     for (uint32_t i = 0; i < h->ctx.num_dma; i++)
         if (mmfree_dma_mm2s_start(h->ctx.dma_regs[i], h->wt[i].paddr + pr->byte_offset,
                                   bytes) < 0)
             return -EIO;
-    mmfree_push_instr(&h->ctx, mmfree_inst_compute(h->wt[0].paddr + pr->byte_offset,
-                                                   pr->N, pr->M));
+    /* flags=b: drain only the b active rows (see mmfree_inst_compute_b). */
+    mmfree_push_instr(&h->ctx, mmfree_inst_compute_b(h->wt[0].paddr + pr->byte_offset,
+                                                     pr->N, pr->M, (uint16_t)b));
     return 0;
 }
 
@@ -419,35 +451,31 @@ int mmfree_seq_compute_wait(mmfree_lib_t *h) {
     return 0;
 }
 
-int mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id) {
+int mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
     const proj_t *pr = &h->projs[proj_id];
     const mmfree_geom_t *g = &h->ctx.geom;
-    uint32_t total = g->batch * pr->n_outputs;
+    if (b == 0 || b > g->batch) return -EINVAL;
+    /* Store only the b rows the drain wrote (rows 0..b-1, row-major). */
+    uint32_t total = b * pr->n_outputs;
     uint32_t bytes = total * g->outLaneBytes;
     if (mmfree_dma_s2mm_start(h->ctx.dma_regs[0], h->out.paddr, bytes) < 0) return -EIO;
     mmfree_push_instr(&h->ctx, mmfree_inst_store(h->out.paddr, total));
     return 0;
 }
 
-int mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id) {
+int mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
     const proj_t *pr = &h->projs[proj_id];
     const mmfree_geom_t *g = &h->ctx.geom;
+    if (b == 0 || b > g->batch) return -EINVAL;
     uint32_t st = mmfree_wait_done(&h->ctx);
     if (MMFREE_STATUS_ERR(st) != MMFREE_ERR_NONE) return -EIO;
     if (mmfree_dma_s2mm_wait(h->ctx.dma_regs[0]) < 0) return -EIO;
-    mmfree_buf_sync_for_cpu(&h->out, (size_t)g->batch * pr->n_outputs * g->outLaneBytes);
+    mmfree_buf_sync_for_cpu(&h->out, (size_t)b * pr->n_outputs * g->outLaneBytes);
     return 0;
 }
 
 void mmfree_seq_readback(mmfree_lib_t *h, int proj_id, int32_t *acc, uint32_t b) {
-    const proj_t *pr = &h->projs[proj_id];
-    const mmfree_geom_t *g = &h->ctx.geom;
-    const volatile uint32_t *ob = (const volatile uint32_t *)h->out.vaddr;
-    for (uint32_t i = 0; i < b; i++) {
-        const volatile uint32_t *row = ob + (size_t)i * pr->n_outputs;
-        for (uint32_t m = 0; m < pr->M; m++)
-            acc[(size_t)i * pr->M + m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
-    }
+    readback_rows(h, &h->projs[proj_id], acc, b);
 }

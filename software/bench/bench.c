@@ -593,6 +593,14 @@ int main(int argc, char **argv) {
         return 2;
     }
     geom.batch = (uint32_t)g_batch;
+    /* The bench packs its synthetic weights 2-bit inline; it has no 1.6-bit packer,
+     * so refuse a packedWeights bitstream rather than stream garbage to it. The
+     * model path (fpga_runner + mmfree_pack) is what exercises packed weights. */
+    if (env_u32("MMFREE_PACKED_WEIGHTS", 0)) {
+        fprintf(stderr, "MMFREE_PACKED_WEIGHTS=1 but bench packs 2-bit only; "
+                        "use the fpga_runner (gate/run) for packed weights\n");
+        return 2;
+    }
 
     /* Cross-check the resolved geometry against the loaded bitstream's preset
      * manifest ($MMFREE_MANIFEST), if set. WARN-only unless MMFREE_STRICT=1. */

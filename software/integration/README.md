@@ -73,8 +73,9 @@ cd software && make lib        # build/libmmfree.so  (build natively on KRIA to 
 cd software && make test-lib   # board-free unit test: act pack + acc sign-expand
 ```
 
-Not yet wired: `MMFREE_POLL=1` polling completion (deferred to Phase F perf —
-correctness uses the proven UIO IRQ path).
+Completion is polled by default (userspace spin on the Core status word), which
+cuts IRQ round-trip latency out of the short decode ops (+~40% tok/s at B=1). Set
+`MMFREE_POLL=0` to fall back to the UIO IRQ path.
 
 ## Phase D — `mmfree_bridge` (done, board-free tested)
 

@@ -27,7 +27,8 @@ class CoreTop(
     val accHeadroomBits: Int = -1,
     val actMaxFanout:    Int = 0,
     val dspAccum:        Boolean = false,
-    val colBankSize:     Int = 0
+    val colBankSize:     Int = 0,
+    val packedWeights:   Boolean = false
 ) extends RawModule {
 
     // Width math (mirrors Core.scala) — required so the IO bundles can size themselves.
@@ -81,7 +82,8 @@ class CoreTop(
             accHeadroomBits = accHeadroomBits,
             actMaxFanout    = actMaxFanout,
             dspAccum        = dspAccum,
-            colBankSize     = colBankSize
+            colBankSize     = colBankSize,
+            packedWeights   = packedWeights
         ))
 
         Core.connectAxiSlave(outer = s_axi, inner = core.s_axi)

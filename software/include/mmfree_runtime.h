@@ -54,6 +54,7 @@ typedef struct mmfree_geom {
     uint32_t outLaneBytes;      /* outLaneWidth / 8 = bytes per output lane */
     uint32_t numPorts;          /* s_axis port count = min(4, ceil(bits/128)) — mirrors CoreConfig */
     uint32_t portBytes;         /* sAxisBytes / numPorts = bytes per port per beat */
+    uint32_t packed;            /* 1 => weights stream 1.6-bit (5 trits/byte), for a packedWeights bitstream. geom_init seeds 0; a caller running a packed bitstream sets it (like batch). Blob format MUST match. */
 } mmfree_geom_t;
 
 /* Fill the derived fields of `g` from the five inputs. Returns 0 on success,
@@ -65,6 +66,13 @@ typedef struct mmfree_geom {
  * at 32 at aWidth=16 anyway). */
 int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
                      uint32_t maxAcc, uint32_t maxN, uint32_t maxM);
+
+/* Per-port COMPUTE weight bytes for an (rows x cols) projection — the single
+ * source of truth for the weight DMA length (mirror of mmfree_pack's
+ * Geometry.port_blob_bytes). 2-bit: rows*col_tiles*portBytes. Packed (g->packed):
+ * the 1.6-bit blob, trits packed 5/byte then padded to a whole wire beat so the
+ * DMA moves exactly the beats the on-chip gearbox consumes (~0.8x the 2-bit size). */
+uint32_t mmfree_wt_port_bytes(const mmfree_geom_t *g, uint32_t rows, uint32_t cols);
 
 /* Cross-check the resolved geometry `g` against a preset.env manifest emitted by
  * control.EmitCore (the single source of truth for the loaded bitstream). Catches
@@ -213,6 +221,16 @@ int mmfree_compute(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
  * for streaming ops). byte_offset=0 is identical to mmfree_compute. */
 int mmfree_compute_off(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
                        uint32_t rows, uint32_t cols, uint64_t byte_offset);
+
+/* As mmfree_compute_off, but stamps the active-row count `batch` into the
+ * COMPUTE flags field (see mmfree_inst_compute_b). The engine drains only
+ * `batch` of B rows, so a low-batch call on a high-B bitstream pays ~B1 cost.
+ * batch==0 clamps to the bitstream's full batchSize (legacy behaviour, so
+ * mmfree_compute_off is exactly mmfree_compute_off_b with batch=0). The weight
+ * stream length is batch-count-independent, so `bytes` is unchanged. */
+int mmfree_compute_off_b(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
+                         uint32_t rows, uint32_t cols, uint64_t byte_offset,
+                         uint32_t batch);
 
 /* STORE n_outputs accumulated lanes back to `buf`. For K26_Bench with
  * outBeatLanes=1 + outLaneWidth=32: bytes = n_outputs * 4. */

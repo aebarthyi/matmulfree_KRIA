@@ -77,7 +77,7 @@ void FpgaBackend::matmul_seq(const int* proj_ids, const std::int8_t* const* wqs,
     throw std::runtime_error("mmfree_seq_load failed");
 
   for (int n = 0; n < k; ++n) {
-    if (mmfree_seq_compute_issue(h_, proj_ids[n]) < 0)
+    if (mmfree_seq_compute_issue(h_, proj_ids[n], static_cast<std::uint32_t>(b)) < 0)
       throw std::runtime_error("mmfree_seq_compute_issue failed");
 
     // --- CPU work hidden under COMPUTE(n) ---
@@ -93,9 +93,9 @@ void FpgaBackend::matmul_seq(const int* proj_ids, const std::int8_t* const* wqs,
 
     if (mmfree_seq_compute_wait(h_) < 0)
       throw std::runtime_error("mmfree_seq_compute_wait failed");
-    if (mmfree_seq_store_issue(h_, proj_ids[n]) < 0)
+    if (mmfree_seq_store_issue(h_, proj_ids[n], static_cast<std::uint32_t>(b)) < 0)
       throw std::runtime_error("mmfree_seq_store_issue failed");
-    if (mmfree_seq_store_wait(h_, proj_ids[n]) < 0)
+    if (mmfree_seq_store_wait(h_, proj_ids[n], static_cast<std::uint32_t>(b)) < 0)
       throw std::runtime_error("mmfree_seq_store_wait failed");
     if (n + 1 < k && mmfree_seq_load(h_, static_cast<std::uint32_t>(N)) < 0)
       throw std::runtime_error("mmfree_seq_load failed");

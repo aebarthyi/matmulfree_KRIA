@@ -41,6 +41,12 @@ Manifest read_manifest_tsv(const std::string& path) {
       grab("numPorts=", np);
       man.total_bytes_per_port = tbp;
       man.num_ports = static_cast<uint32_t>(np);
+      // weight_format=<token> (blob packing format; cross-checked against the bitstream).
+      std::size_t k = line.find("weight_format=");
+      if (k != std::string::npos) {
+        std::istringstream ws(line.substr(k + std::string("weight_format=").size()));
+        ws >> man.weight_format;   // first whitespace-delimited token
+      }
       continue;
     }
     std::istringstream ss(line);

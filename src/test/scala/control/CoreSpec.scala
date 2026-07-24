@@ -3,6 +3,7 @@ package control
 import scala.util.Random
 import chisel3._
 import chisel3.util.log2Ceil
+import systolic.TernaryPack
 import testutil.SingleThreadVerilator
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
@@ -57,6 +58,33 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     axiDataWidth = DATA_WIDTH,
     axiIdWidth   = ID_WIDTH
   )
+
+  private def mkCorePacked = new Core(
+    aWidth       = aWidth,
+    maxAcc       = maxAcc,
+    xDim         = xDim,
+    batchSize    = batchSize,
+    maxN         = maxN,
+    maxM         = maxM,
+    outBeatLanes = 0,
+    axiAddrWidth = ADDR_WIDTH,
+    axiDataWidth = DATA_WIDTH,
+    axiIdWidth   = ID_WIDTH,
+    packedWeights = true
+  )
+
+  /** Dense 1.6-bit weight stream: flatten the col-tile-major weight beats into one
+    * trit sequence (lane order == the gearbox's), base-3 pack 5/byte, then chunk into
+    * axisDataWidth-bit wire beats (last beat zero-padded). Mirrors what the offline
+    * packer must emit for a packedWeights bitstream. */
+  private def packWeightStreamDense(weightStream: Seq[Seq[Int]]): Seq[BigInt] = {
+    require(axisDataWidth % 8 == 0)
+    val bytes        = TernaryPack.packCodes(weightStream.flatten)
+    val bytesPerBeat = axisDataWidth / 8
+    bytes.grouped(bytesPerBeat).map { g =>
+      g.zipWithIndex.foldLeft(BigInt(0)) { case (acc, (b, j)) => acc | (BigInt(b) << (8 * j)) }
+    }.toSeq
+  }
 
   private def resetDut(dut: Core): Unit = {
     dut.s_axi.awvalid.poke(false.B)
@@ -258,7 +286,8 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       acts:         Seq[Seq[Int]],          // [n][batchSize]
       weightStream: Seq[Seq[Int]],          // numColTiles*n beats
       n:            Int,
-      m:            Int
+      m:            Int,
+      packed:       Boolean = false         // stream weights 1.6-bit (needs a packedWeights dut)
   ): Seq[BigInt] = {
     val numColTiles = m / outLanesPerTile
     require(weightStream.length == numColTiles * n)
@@ -268,9 +297,11 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     pushAxisBeats(dut, acts.map(packActivations))
     waitForIrq(dut); ackIrq(dut)
 
-    // COMPUTE: rows=n, cols=m
+    // COMPUTE: rows=n, cols=m. Weights go out either 2-bit-per-beat (legacy) or as
+    // the dense 1.6-bit stream the gearbox unpacks — same numeric result.
+    val weightBeats = if (packed) packWeightStreamDense(weightStream) else weightStream.map(packWeights)
     axiWrite(dut, OFF_INSTR, encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(m))) mustBe OKAY
-    pushAxisBeats(dut, weightStream.map(packWeights), maxCyclesPerBeat = 200)
+    pushAxisBeats(dut, weightBeats, maxCyclesPerBeat = 200)
     waitForIrq(dut, maxCycles = 4000); ackIrq(dut)
 
     // STORE: emit batchSize * m total outputs
@@ -410,6 +441,53 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
           val expected = referenceCompute(acts, weights, n, m)
           withClue(s"seed=$seed n=$n m=$m") { actual mustBe expected }
         }
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 1.6-bit packed weights (packedWeights): identical results to the
+    // 2-bit path — the config lever is numerically transparent.
+    // ──────────────────────────────────────────────────────────────────
+
+    "packed: random workloads match the 2-bit path and the reference (5 seeds)" in {
+      val seeds = Seq(1L, 7L, 42L, 99L, 256L)
+      seeds.foreach { seed =>
+        val rng = new Random(seed)
+        val n   = 4 + rng.nextInt(maxN - 3)
+        val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
+        val m = numColTiles * outLanesPerTile
+        val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
+        val weights = Seq.fill(numColTiles * n) {
+          Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
+        }
+        val expected = referenceCompute(acts, weights, n, m)
+        // ~20% fewer weight bytes on the wire (regrouped, still-full beats).
+        val packedBeats   = packWeightStreamDense(weights).length
+        val unpackedBeats = weights.length
+        withClue(s"seed=$seed: packed beats $packedBeats should be < unpacked $unpackedBeats") {
+          (packedBeats <= unpackedBeats) mustBe true
+        }
+        simulate(mkCorePacked) { dut =>
+          resetDut(dut)
+          val actual = runPipeline(dut, acts, weights, n, m, packed = true)
+          withClue(s"seed=$seed n=$n m=$m (packed)") { actual mustBe expected }
+        }
+      }
+    }
+
+    "packed: back-to-back COMPUTEs stay aligned (buffer flush between ops)" in {
+      simulate(mkCorePacked) { dut =>
+        resetDut(dut)
+        val n = 5                                  // 5*4=20 trits/tile → 4 bytes, non-5-aligned tail
+        val m = outLanesPerTile
+        def rndWeights(r: Random) = Seq.fill(n)(Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(r.nextInt(3))))
+        val acts = Seq.fill(n)(Seq.fill(batchSize)(1 + Random.nextInt(3)))
+        // Two full passes with different weights: the second COMPUTE must not inherit
+        // stale padding trits left in the gearbox by the first (flush at sIdle).
+        val w1 = rndWeights(new Random(11))
+        val w2 = rndWeights(new Random(22))
+        runPipeline(dut, acts, w1, n, m, packed = true) mustBe referenceCompute(acts, w1, n, m)
+        runPipeline(dut, acts, w2, n, m, packed = true) mustBe referenceCompute(acts, w2, n, m)
       }
     }
 

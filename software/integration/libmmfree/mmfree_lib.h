@@ -40,6 +40,7 @@ typedef struct mmfree_lib_cfg {
     /* geometry (mirror CoreConfig K26_MMFree370M_A16: 16, 32, 4096, 4096, 32000) */
     uint32_t aWidth, xDim, maxAcc, maxN, maxM;
     uint32_t batch;                      /* CoreConfig.batchSize (yDim); 0/1 = unbatched. Must be <= xDim. */
+    uint32_t packed;                     /* 1 => 1.6-bit weight stream (packedWeights bitstream + 1.6-bit blob). 0 = 2-bit. */
 
     /* Core + DMA register windows */
     uint64_t core_phys;
@@ -113,10 +114,10 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
  * All return 0 / negative (errno-style); b is 1..geom.batch. */
 int  mmfree_seq_pack(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b);
 int  mmfree_seq_load(mmfree_lib_t *h, uint32_t N);
-int  mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id);
+int  mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id, uint32_t b);
 int  mmfree_seq_compute_wait(mmfree_lib_t *h);
-int  mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id);
-int  mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id);
+int  mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id, uint32_t b);
+int  mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id, uint32_t b);
 void mmfree_seq_readback(mmfree_lib_t *h, int proj_id, int32_t *acc, uint32_t b);
 
 /* Per-phase timing accumulated across every mmfree_bitlinear call, in

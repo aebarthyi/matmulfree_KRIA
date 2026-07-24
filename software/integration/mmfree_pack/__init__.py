@@ -11,7 +11,9 @@ from .packer import (
     ProjEntry,
     quantize_weight,
     codes_to_2bit,
+    codes_to_trit_digits,
     pack_projection,
+    pack_projection_packed,
 )
 from .model import iter_projections, iter_blob_projections, load_checkpoint
 from .blob import read_mmfree_blob
@@ -19,7 +21,8 @@ from .blob import read_mmfree_blob
 __all__ = [
     "Geometry", "A16", "manifest_path",
     "WeightPacker", "ProjEntry",
-    "quantize_weight", "codes_to_2bit", "pack_projection",
+    "quantize_weight", "codes_to_2bit", "codes_to_trit_digits",
+    "pack_projection", "pack_projection_packed",
     "iter_projections", "iter_blob_projections", "load_checkpoint",
     "read_mmfree_blob",
 ]

@@ -284,15 +284,17 @@ static int wait_timeout_ms(void) {
     return ms;
 }
 
-/* MMFREE_POLL=1 trades the UIO IRQ round-trip (poll()+read()+ack+re-arm, tens of
- * us of kernel/interrupt latency) for a userspace spin on the Core status word.
- * Worth it for the short LOAD/STORE ops that dominate the decode loop; costs one
- * busy core for the op's duration. Default 0 = IRQ path. */
+/* Polling trades the UIO IRQ round-trip (poll()+read()+ack+re-arm, tens of us of
+ * kernel/interrupt latency) for a userspace spin on the Core status word. The
+ * decode loop is dominated by short LOAD/STORE ops where that IRQ latency, not
+ * the op itself, sets the pace — polling measured +~40% tok/s at B=1 (26->37).
+ * Cost is one busy core for the op's duration, which is the right trade on a
+ * dedicated inference box. Default 1 = poll; set MMFREE_POLL=0 for the IRQ path. */
 static int poll_mode(void) {
     static int p = -1;
     if (p < 0) {
         const char *e = getenv("MMFREE_POLL");
-        p = (e && atoi(e) != 0) ? 1 : 0;
+        p = (e && atoi(e) == 0) ? 0 : 1;
     }
     return p;
 }
@@ -448,6 +450,7 @@ int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
     g->aWidth = aWidth; g->xDim = xDim; g->maxAcc = maxAcc;
     g->maxN = maxN; g->maxM = maxM;
     g->batch = 1u;     /* unbatched default; batched callers set g->batch (<= xDim) */
+    g->packed = 0u;    /* 2-bit default; a packedWeights-bitstream caller sets g->packed */
 
     g->nLanes          = aWidth / 2u;
     g->outLanesPerTile = xDim * g->nLanes;
@@ -469,7 +472,22 @@ int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
         g->numPorts = bits / 128u;
     }
     g->portBytes = g->sAxisBytes / g->numPorts;
+    g->packed    = 0u;
     return 0;
+}
+
+uint32_t mmfree_wt_port_bytes(const mmfree_geom_t *g, uint32_t rows, uint32_t cols)
+{
+    uint32_t olt = g->outLanesPerTile;
+    uint32_t col_tiles = (cols + olt - 1u) / olt;
+    if (!g->packed) return rows * col_tiles * g->portBytes;
+    /* 1.6-bit: pack trits 5/byte, pad up to a whole wire beat (sAxisBytes) — that
+     * padded byte count is exactly ceil(trits / (5*sAxisBytes)) wire beats, so the
+     * DMA moves precisely what the gearbox consumes (the flush drops the tail). */
+    uint64_t trits  = (uint64_t)rows * col_tiles * olt;
+    uint64_t raw    = (trits + 4u) / 5u;                       /* ceil(trits/5) */
+    uint64_t padded = ((raw + g->sAxisBytes - 1u) / g->sAxisBytes) * g->sAxisBytes;
+    return (uint32_t)(padded / g->numPorts);
 }
 
 /* ---------- preset manifest cross-check ---------- */
@@ -491,6 +509,7 @@ int mmfree_geom_check_manifest(const mmfree_geom_t *g, const char *path) {
         { "MMFREE_MAXM",   g->maxM,     0, 0 },
         { "MMFREE_BATCH",  g->batch,    0, 0 },
         { "NUM_DMA",       g->numPorts, 0, 0 },
+        { "MMFREE_PACKED_WEIGHTS", g->packed, 0, 0 },
     };
     const size_t nchk = sizeof(chk) / sizeof(chk[0]);
     char preset[64] = "?";
@@ -595,18 +614,25 @@ int mmfree_compute(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
 int mmfree_compute_off(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
                        uint32_t rows, uint32_t cols, uint64_t byte_offset)
 {
+    return mmfree_compute_off_b(ctx, bufs, rows, cols, byte_offset, 0);
+}
+
+int mmfree_compute_off_b(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
+                         uint32_t rows, uint32_t cols, uint64_t byte_offset,
+                         uint32_t batch)
+{
     /* One beat per col-tile-cycle: each wide beat carries outLanesPerTile
      * ternary weights, port p holding lanes [p*64, (p+1)*64). Total beats =
      * rows * ceil(cols / outLanesPerTile). Caller is responsible for the
      * col-tile-major / per-port-slice layout (see bench.c). `byte_offset` is
      * the per-port start of this projection's slice within a resident weight
-     * buffer; 0 reproduces the legacy single-projection behavior. */
-    uint32_t lanes_per_tile = ctx->geom.outLanesPerTile;
-    uint32_t col_tiles = (cols + lanes_per_tile - 1) / lanes_per_tile;
-    uint32_t total_beats = rows * col_tiles;
-    uint32_t bytes = total_beats * ctx->geom.portBytes;
+     * buffer; 0 reproduces the legacy single-projection behavior. The weight
+     * stream is batch-count-independent, so `batch` changes only the drain
+     * bound (COMPUTE flags), never `bytes`. */
+    uint32_t bytes = mmfree_wt_port_bytes(&ctx->geom, rows, cols);
     return input_op(ctx, bufs, bytes, byte_offset,
-                    mmfree_inst_compute(bufs[0].paddr + byte_offset, rows, cols), "COMPUTE");
+                    mmfree_inst_compute_b(bufs[0].paddr + byte_offset, rows, cols,
+                                          (uint16_t)batch), "COMPUTE");
 }
 
 int mmfree_store(mmfree_ctx_t *ctx, const mmfree_buf_t *buf, uint32_t n_outputs) {

@@ -208,6 +208,22 @@ int main(int argc, char** argv) {
     cfg.aWidth = g.aWidth; cfg.xDim = g.xDim;
     cfg.maxAcc = g.maxAcc; cfg.maxN = g.maxN; cfg.maxM = g.maxM;
     cfg.batch = batch;
+    cfg.packed = env_u32("MMFREE_PACKED_WEIGHTS", 0);  // 1.6-bit weight stream (must match bitstream + blob)
+    // Guardrail: a 1.6-bit blob fed to a 2-bit engine (or vice versa) is silent
+    // garbage. The blob's weight_format tag MUST match the bitstream's packing.
+    // Empty tag = pre-tag blob, which is necessarily 2-bit.
+    {
+      const std::string want = cfg.packed ? "ternary-1p6" : "ternary-2bit";
+      const std::string got = man.weight_format.empty() ? "ternary-2bit" : man.weight_format;
+      if (got != want) {
+        std::fprintf(stderr,
+            "FATAL: weight blob format '%s' != bitstream format '%s' "
+            "(MMFREE_PACKED_WEIGHTS=%u). Re-pack with the matching preset.\n",
+            man.weight_format.empty() ? "(untagged/2-bit)" : man.weight_format.c_str(),
+            want.c_str(), cfg.packed);
+        return 1;
+      }
+    }
     cfg.core_phys = core_phys; cfg.core_size = 0x1000;
     cfg.num_dma = P; cfg.dma_size = 0x10000;
     cfg.uio_dev = uio_dev;

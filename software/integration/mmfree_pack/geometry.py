@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+TRITS_PER_BYTE = 5      # 1.6-bit packing: 3^5 = 243 <= 256 (see packer / WeightUnpack.scala)
+
+
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -44,6 +47,7 @@ class Geometry:
     numPorts: int = 0            # min(4, ceil(bits/128)) — HP-port split
     portBytes: int = 0           # sAxisBytes / numPorts — bytes per port per beat
     lanesPerPort: int = 0        # outLanesPerTile / numPorts
+    packed: bool = False         # weights stream 1.6-bit (bitstream packedWeights=true)
 
     MAX_PORTS = 4
     PORT_BITS = 128
@@ -54,10 +58,11 @@ class Geometry:
         packed blob matches the loaded bitstream without hand-passing aWidth/xDim."""
         with open(path) as f:
             m = json.load(f)
-        return cls.derive(aWidth=int(m["aWidth"]), xDim=int(m["xDim"]))
+        return cls.derive(aWidth=int(m["aWidth"]), xDim=int(m["xDim"]),
+                          packed=bool(m.get("packedWeights", False)))
 
     @classmethod
-    def derive(cls, aWidth: int, xDim: int) -> "Geometry":
+    def derive(cls, aWidth: int, xDim: int, packed: bool = False) -> "Geometry":
         bits = xDim * aWidth
         if bits % 8 != 0:
             raise ValueError(f"xDim*aWidth = {bits} bits is not a whole number of bytes")
@@ -80,6 +85,7 @@ class Geometry:
             aWidth=aWidth, xDim=xDim, nLanes=nLanes,
             outLanesPerTile=outLanesPerTile, sAxisBytes=sAxisBytes,
             numPorts=numPorts, portBytes=portBytes, lanesPerPort=lanesPerPort,
+            packed=packed,
         )
 
     def acc_width(self, maxAcc: int) -> int:
@@ -106,8 +112,26 @@ class Geometry:
         return self.num_col_tiles(M) * self.outLanesPerTile
 
     def port_blob_bytes(self, N: int, M: int) -> int:
-        """Bytes one port's slice occupies for an (N x M) projection."""
+        """Bytes one port's slice occupies for an (N x M) projection.
+
+        Honors `packed`: the 1.6-bit blob is ~0.8x the 2-bit blob. This is the
+        single source of truth for the runtime's per-port COMPUTE DMA length.
+        """
+        if self.packed:
+            return self.packed_port_blob_bytes(N, M)
         return self.num_col_tiles(M) * N * self.portBytes
+
+    def packed_port_blob_bytes(self, N: int, M: int) -> int:
+        """Per-port bytes for the 1.6-bit blob of an (N x M) projection.
+
+        trits = num_col_tiles*N*outLanesPerTile packed 5/byte, then padded up to a
+        whole wire beat (sAxisBytes) so the COMPUTE DMA moves exactly the beats the
+        gearbox consumes. ceil(bytes/sAxisBytes) beats == ceil(trits/(5*sAxisBytes)).
+        """
+        trits = self.num_col_tiles(M) * N * self.outLanesPerTile
+        raw = _ceil_div(trits, TRITS_PER_BYTE)
+        padded = _ceil_div(raw, self.sAxisBytes) * self.sAxisBytes
+        return padded // self.numPorts
 
 
 # The verified signed-int16 engine (CoreConfig K26_MMFree370M_A16).

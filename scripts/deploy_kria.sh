@@ -98,6 +98,35 @@ fi
 xmutil unloadapp >/dev/null 2>&1 || true
 xmutil loadapp "$APP"
 
+# ─── 4b. Program the PL fabric clock to the built rate ───────────────────
+# fclk0 (PL0_REF) drives CoreTop directly, but an overlay reload does NOT
+# reprogram it — once an earlier overlay claimed it at some rate it stays pinned,
+# so a bitstream STA-closed for a higher clock silently runs at the stale rate
+# unless we set it here. PL_CLK_MHZ from the manifest is the rate the design was
+# built and timing-closed for. The PS PLL yields only discrete rates, so the
+# achieved value may snap to the nearest available — read it back and report it.
+FCLK=/sys/devices/platform/fclk0/set_rate
+if [ -f "$PRESET_DIR/preset.env" ]; then
+    # shellcheck disable=SC1091
+    . "$PRESET_DIR/preset.env"
+fi
+if [ -w "$FCLK" ] && [ -n "${PL_CLK_MHZ:-}" ]; then
+    want=$((PL_CLK_MHZ * 1000000))
+    if echo "$want" > "$FCLK" 2>/dev/null; then
+        got=$(cat "$FCLK" 2>/dev/null)
+        printf "==> fclk0 set to PL_CLK_MHZ=%s: requested %s Hz, achieved %s Hz\n" \
+               "$PL_CLK_MHZ" "$want" "$got"
+        if [ -n "$got" ] && [ "$got" -lt $((want - want / 50)) ]; then
+            echo "WARN: fclk0 achieved $got Hz is below the built $want Hz — the design" >&2
+            echo "      will run slower than it was timed for (stale/clamped clock)." >&2
+        fi
+    else
+        echo "WARN: could not write $want to $FCLK — fabric clock left as-is." >&2
+    fi
+else
+    echo "==> (fclk0 set_rate not writable or PL_CLK_MHZ unset — leaving fabric clock as-is)"
+fi
+
 # ─── 5. Verify u-dma-buf nodes match the deployed preset manifest ─────────
 # Directly prevents the stale-overlay footgun (an old overlay's smaller udmabuf
 # silently truncating the new geometry's transfers). preset.env ships in the

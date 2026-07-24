@@ -5,6 +5,7 @@ import chisel3.util._
 import chisel3.experimental.annotate
 import firrtl.AttributeAnnotation
 import systolic.SystolicArray
+import systolic.WeightUnpackGearbox
 
 /** AXI4-Stream slave (input side). Flat bundle so Vivado IP packager infers `s_axis_*`. */
 class AxisSlaveIO(val dataWidth: Int) extends Bundle {
@@ -78,9 +79,17 @@ class Core(
                                        // column — the route-bound 250 MHz path at B>=6.
     val dspAccum:        Boolean = false, // map the per-lane PE accumulators onto DSP48E2
                                          // slices (use_dsp attr) instead of LUT/CARRY8.
-    val colBankSize:     Int = 0         // systolic column banking: broadcast within a bank
+    val colBankSize:     Int = 0,        // systolic column banking: broadcast within a bank
                                          // of this many columns, pipeline between banks to
                                          // cut activation fanout. 0 = no banking (broadcast).
+    val packedWeights:   Boolean = false // stream ternary weights at 1.6 bits/trit (5 trits/
+                                         // byte) and unpack them on-chip through a regroup
+                                         // gearbox (WeightUnpackGearbox) into the native 2-bit
+                                         // weight beat. ~20% fewer weight bytes on the HP-port
+                                         // stream — fewer, still-full wire beats, so no port/
+                                         // geometry change. false = legacy 2-bit slice (SV
+                                         // byte-identical). The DDR blob must be packed to
+                                         // match (base-3, LSB-first lanes); see TernaryPack.
 ) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0,        "aWidth must be even and >= 2")
     require(maxAcc >= 2,                           "maxAcc must be >= 2")
@@ -175,6 +184,18 @@ class Core(
     inQ.io.enq.bits  := DontCare
     inQ.io.deq.ready := false.B
 
+    // Optional 1.6-bit weight unpacker (see packedWeights). Sits between s_axis and
+    // the inQ enqueue during COMPUTE streaming: it consumes densely packed bytes off
+    // the beat and regroups them into native outLanesPerTile-wide 2-bit weight beats,
+    // so each still-full wire beat carries ~1.25 weight beats' worth of trits (fewer
+    // wire beats → ~20% fewer weight bytes) with no change to the beat width or the
+    // enqueue handshake. flush/defaults are set with the other defaults below.
+    require(!packedWeights || axisDataWidth % 8 == 0,
+        s"packedWeights needs a byte-aligned s_axis (axisDataWidth=$axisDataWidth)")
+    val wtGearbox =
+        if (packedWeights) Some(Module(new WeightUnpackGearbox(axisDataWidth, outLanesPerTile)))
+        else None
+
     // Array-feed source. Batched cores (yDim=B) double the PE grid, lengthening
     // the inQ-read -> PE-accumulate path (the -0.39 ns path at B=2). A 1-deep
     // registered slice (pipe=true keeps full throughput) terminates the inQ
@@ -236,6 +257,15 @@ class Core(
 
     inQ.io.flush.get := (state === sIdle)
     armSlice.foreach { _._2(state === sIdle) }
+
+    // Gearbox defaults: idle unless the COMPUTE enqueue block drives it, and flushed
+    // whenever idle so residual padding trits never carry into the next matmul.
+    wtGearbox.foreach { gb =>
+        gb.io.in.valid  := false.B
+        gb.io.in.bits   := 0.U
+        gb.io.out.ready := false.B
+        gb.io.flush     := (state === sIdle)
+    }
 
     arr.input.weights_i.valid    := false.B
     arr.input.weights_i.bits     := VecInit(Seq.fill(outLanesPerTile)(0.U(2.W)))
@@ -400,13 +430,29 @@ class Core(
     // only reset when a new COMPUTE is accepted, because inQ may legitimately
     // hold the first beats of tile t+1 while the array is still merging tile t.
     when(state === sCompute && cState =/= cInit && cState =/= cDone) {
-        val weightVec = VecInit(Seq.tabulate(outLanesPerTile) { i =>
-            s_axis.tdata((i + 1) * 2 - 1, i * 2)
-        })
-        inQ.io.enq.valid        := s_axis.tvalid
-        inQ.io.enq.bits.weights := weightVec
+        // Weight-beat source. Both branches present a Decoupled of outLanesPerTile
+        // 2-bit lanes; the inQ enqueue handshake below is identical either way.
+        val (wtValid, wtBits) = wtGearbox match {
+            case Some(gb) =>
+                // Packed: s_axis (dense bytes) feeds the gearbox; its regrouped
+                // output feeds inQ. s_axis is throttled by gearbox room, decoupling
+                // wire beats from weight beats.
+                gb.io.in.valid  := s_axis.tvalid
+                gb.io.in.bits   := s_axis.tdata
+                s_axis.tready   := gb.io.in.ready
+                gb.io.out.ready := inQ.io.enq.ready
+                (gb.io.out.valid, gb.io.out.bits)
+            case None =>
+                // Legacy: 2-bit lanes sliced straight off the beat (byte-identical SV).
+                val weightVec = VecInit(Seq.tabulate(outLanesPerTile) { i =>
+                    s_axis.tdata((i + 1) * 2 - 1, i * 2)
+                })
+                s_axis.tready := inQ.io.enq.ready
+                (s_axis.tvalid, weightVec)
+        }
+        inQ.io.enq.valid        := wtValid
+        inQ.io.enq.bits.weights := wtBits
         inQ.io.enq.bits.act     := actRdData
-        s_axis.tready           := inQ.io.enq.ready
 
         val lastRow = activeIsLast                       // registered; == activeIdx === cmpRowsM1
         val nextRow = Mux(lastRow, 0.U, activeIdx + 1.U)

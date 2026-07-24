@@ -54,6 +54,13 @@ case class CoreConfig(
                                   // that route-bounds the 250 MHz path. Numerically identical to
                                   // the broadcast array (only retimed); adds +(ceil(xDim/colBankSize)
                                   // -1) cycles latency/op. 0 → no banking (broadcast, unchanged).
+    packedWeights: Boolean = false,// stream ternary weights DDR-side at 1.6 bits/trit (5 trits
+                                  // per byte, base-3) instead of 2, and unpack on-chip through a
+                                  // 256-entry ROM (systolic.WeightUnpackGearbox). ~20% fewer weight
+                                  // bytes on the HP-port stream that bounds decode. false → the
+                                  // legacy 2-bit weight beat (byte-identical SV). See TernaryPack.
+                                  // NOTE: config plumbing only so far — Core does not yet consume
+                                  // it (the gearbox is unit-tested standalone); wiring is step 2.
     plClkMhz:     Int = 100,      // PL fabric clock the bitstream targets (deployment
                                   // policy, not Chisel hardware — emitted into the
                                   // preset manifest, consumed by build_all.sh / bench).
@@ -111,12 +118,35 @@ case class CoreConfig(
     val axisDataWidth: Int = math.max(xDim, batchSize) * aWidth
     val outBeatWidth:  Int = effOutBeatLanes * outLaneWidth
 
+    // 1.6-bit weight packing (see packedWeights): the outLanesPerTile trits of one
+    // weight beat cost this many DDR bytes at 5 trits/byte, vs outLanesPerTile/4 at
+    // 2 bits/trit. Ratio is the fraction of weight bytes the packed stream moves.
+    val weightPackedBeatBytes:   Int    = (outLanesPerTile + 4) / 5
+    val weightUnpackedBeatBytes: Int    = (outLanesPerTile * 2 + 7) / 8
+    val weightPackRatio:         Double = weightPackedBeatBytes.toDouble / weightUnpackedBeatBytes
+
     // Input-stream port split: one PS HP port carries at most 128 bits, so wider
     // streams are split across N parallel s_axis ports (joined inside CoreTop).
     val numInPorts:  Int = if (axisDataWidth <= 128) 1 else math.min(4, (axisDataWidth + 127) / 128)
     val inPortWidth: Int = axisDataWidth / numInPorts
     val portBytes:   Int = inPortWidth / 8           // s_axis bytes per HP port per beat
+    val sAxisBytes:  Int = axisDataWidth / 8         // whole assembled wire beat (= portBytes*numInPorts)
     val outLaneBytes:Int = outLaneWidth / 8          // bytes per m_axis output lane
+
+    /** Per-port weight bytes for one (rows x cols) COMPUTE — the sizing/emit mirror
+      * of mmfree_wt_port_bytes (C) / Geometry.port_blob_bytes (Python). Packed: trits
+      * packed 5/byte, padded to a whole wire beat so the DMA moves exactly the beats
+      * the gearbox consumes (~0.8x the 2-bit size). */
+    def wtPortBytes(rows: Long, cols: Int): Long = {
+        val tiles = ((cols + outLanesPerTile - 1) / outLanesPerTile).toLong
+        if (!packedWeights) rows * tiles * portBytes
+        else {
+            val trits  = rows * tiles * outLanesPerTile
+            val raw    = (trits + 4L) / 5L                                  // ceil(trits/5)
+            val padded = ((raw + sAxisBytes - 1L) / sAxisBytes) * sAxisBytes // whole wire beat
+            padded / numInPorts
+        }
+    }
 
     // u-dma-buf node sizes (bytes), derived from geometry to match the worst-case
     // transfer the runtime issues, page-rounded.
@@ -129,7 +159,7 @@ case class CoreConfig(
     // but the resident full-model runner keeps the whole per-port working set mapped at
     // once. Size to whichever is larger so ONE overlay serves both — a model preset
     // (residentWtBytes>0) gets the resident size; a bench preset keeps the slice size.
-    val udmabufWtSliceBytes:    Long = pageUp(maxN.toLong * numColTilesMax * portBytes)
+    val udmabufWtSliceBytes:    Long = pageUp(wtPortBytes(maxN.toLong, maxM))
     val udmabufWtResidentBytes: Long = if (residentWtBytes > 0) pageUp(residentWtBytes / numInPorts) else 0L
     val udmabufWtBytes:  Long = math.max(udmabufWtSliceBytes, udmabufWtResidentBytes)
     val udmabufOutBytes: Long = pageUp(batchSize.toLong * numColTilesMax * outLanesPerTile * outLaneBytes)
@@ -146,12 +176,14 @@ case class CoreConfig(
 
     def buildCore: Core = new Core(
         aWidth, maxAcc, xDim, batchSize, maxN, maxM, outBeatLanes,
-        axiAddrWidth, axiDataWidth, axiIdWidth, signedAct, accHeadroomBits, actMaxFanout, dspAccum, colBankSize
+        axiAddrWidth, axiDataWidth, axiIdWidth, signedAct, accHeadroomBits, actMaxFanout, dspAccum, colBankSize,
+        packedWeights
     )
 
     def buildTop: CoreTop = new CoreTop(
         aWidth, maxAcc, xDim, batchSize, maxN, maxM, outBeatLanes,
-        axiAddrWidth, axiDataWidth, axiIdWidth, signedAct, accHeadroomBits, actMaxFanout, dspAccum, colBankSize
+        axiAddrWidth, axiDataWidth, axiIdWidth, signedAct, accHeadroomBits, actMaxFanout, dspAccum, colBankSize,
+        packedWeights
     )
 
     /** Estimated bandwidth consumed by one cycle of COMPUTE_MM weight streaming. */
@@ -220,6 +252,8 @@ case class CoreConfig(
            |MMFREE_ACT_MAX_FANOUT=$actMaxFanout
            |MMFREE_DSP_ACCUM=${if (dspAccum) 1 else 0}
            |MMFREE_COL_BANK_SIZE=$colBankSize
+           |# 1 => weights stream 1.6-bit (5 trits/byte); the packed blob format MUST match.
+           |MMFREE_PACKED_WEIGHTS=${if (packedWeights) 1 else 0}
            |MMFREE_OUT_LANE_WIDTH=$outLaneWidth
            |MMFREE_OUT_LANE_BYTES=$outLaneBytes
            |MMFREE_OUT_BEAT_LANES=$effOutBeatLanes
@@ -266,6 +300,7 @@ case class CoreConfig(
            |  "outLaneBytes": $outLaneBytes,
            |  "outBeatLanes": $effOutBeatLanes,
            |  "numColTilesMax": $numColTilesMax,
+           |  "packedWeights": $packedWeights,
            |  "axisDataWidth": $axisDataWidth,
            |  "numPorts": $numInPorts,
            |  "mm2sWidth": $inPortWidth,
@@ -556,6 +591,29 @@ object CoreConfig {
     // Numerically identical, +3 cyc latency/op. A/B against K26_MMFree2_7B_A16_B4_DSP.
     val K26_MMFree2_7B_A16_B4_DSP_S8: CoreConfig = K26_MMFree2_7B_A16_B4_DSP.copy(colBankSize = 8)
 
+    // 1.6-bit weight packing (packedWeights): a 256-entry unpack ROM + elastic gearbox
+    // on the s_axis→inQ path streams ternary weights at 5 trits/byte, ~20% fewer weight
+    // bytes on the DDR/HP-port wire — the binding resource for the bandwidth-bound decode
+    // (see [[fclk_runtime_vs_sta_clock]]). forModel(packedWeights=true) also sizes udmabuf-wt
+    // to the exact packed resident set (~0.8x). The 1.6-bit weight BLOB format MUST match
+    // this bitstream (weight_format=ternary-1p6; the runtime cross-checks MMFREE_PACKED_WEIGHTS).
+    //   _PACKED       — B1 base, for correctness bring-up + `make gate` bit-exactness.
+    //   _B4_DSP_S8_PACKED — the workhorse on the known-closing B4+DSP+S8 stack, for tok/s.
+    // CLOCK: the workhorse runs at 230 MHz, NOT 250. The 2.7B B4_DSP_S8 base closes 250
+    // at only +0.001 ns; its critical path is the maxN=8192 activation-BRAM 8-deep
+    // RAMB36E2 cascade → inQ (NOT the gearbox — LUT util ~43%, no congestion). Adding the
+    // unpack gearbox perturbs placement ~0.1 ns and tips that razor-thin path (packed 250
+    // build: WNS −0.097, Est Fmax 244). 250 was never sustainable here with added logic.
+    // Dropping to 230 is free on tok/s: decode is bandwidth-bound (see
+    // [[fclk_runtime_vs_sta_clock]] — +33% clock bought only +2.5%), and packing already
+    // cut the binding weight bandwidth 20%, so 230-packed should still beat 250-unpacked.
+    val K26_MMFree2_7B_A16_PACKED: CoreConfig =
+        forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
+                 shapes = "2.7b", model = "ridger/MMfreeLM-2.7B", packedWeights = true)
+    val K26_MMFree2_7B_A16_B4_DSP_S8_PACKED: CoreConfig =
+        K26_MMFree2_7B_A16_PACKED.copy(batchSize = 4, outBeatLanes = 4, plClkMhz = 230,
+            dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
+
     // B6 on the same DSP-accum + column-banking (S8) lever stack, targeting 250 MHz.
     // The runtime-batch drain (COMPUTE flags field → cmpBatch) makes this ONE bitstream
     // serve both regimes: b=6 amortizes the 654 MB/token weight stream (the real lever
@@ -568,6 +626,18 @@ object CoreConfig {
     // or the B4_DSP_S8 clean base. A full impl build is the only real timing test.
     val K26_MMFree2_7B_A16_B6_DSP_S8: CoreConfig =
         K26_MMFree2_7B_A16_B6.copy(dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
+
+    // Banking-only B6 @ 250 — the DSP_S8 fallback. B6_DSP_S8 missed 250 at WNS −0.376 ns
+    // with the critical path on actBram/inQ reads: the 1248-DSP + LUT/CARRY8 spill (1536
+    // needed, only 1248 available) congested the BRAM read paths. This drops dspAccum so
+    // the accumulators go back to LUT/CARRY8 (no spill-driven congestion) while KEEPING
+    // colBankSize=8, which cuts the activation-broadcast fanout 32→8 — the exact route-
+    // bound arm-RAM→accumulator broadcast that holds plain B6 at ~−0.37 ns / fmax ≈ 228
+    // (see _B6_230, which gave up and dropped to 230). Banking targets that path directly
+    // and it's untried on B6 without the DSP congestion on top; if it still misses 250,
+    // fall back to the clean B4_DSP_S8 base. Full impl build is the only real timing test.
+    val K26_MMFree2_7B_A16_B6_S8: CoreConfig =
+        K26_MMFree2_7B_A16_B6.copy(colBankSize = 8, implDirectives = b4TimingLevers250)
 
     // ── combined-lever B6 @ 250: the default candidate ────────────────────────
     // Both levers on the 2.7B B6 at once — the first attempt to actually CLOSE the
@@ -639,7 +709,10 @@ object CoreConfig {
         "k26_mmfree2_7b_a16_b4" -> K26_MMFree2_7B_A16_B4,
         "k26_mmfree2_7b_a16_b4_dsp" -> K26_MMFree2_7B_A16_B4_DSP,
         "k26_mmfree2_7b_a16_b4_dsp_s8" -> K26_MMFree2_7B_A16_B4_DSP_S8,
+        "k26_mmfree2_7b_a16_packed" -> K26_MMFree2_7B_A16_PACKED,
+        "k26_mmfree2_7b_a16_b4_dsp_s8_packed" -> K26_MMFree2_7B_A16_B4_DSP_S8_PACKED,
         "k26_mmfree2_7b_a16_b6_dsp_s8" -> K26_MMFree2_7B_A16_B6_DSP_S8,
+        "k26_mmfree2_7b_a16_b6_s8" -> K26_MMFree2_7B_A16_B6_S8,
         "k26_mmfree2_7b_a16_b6" -> K26_MMFree2_7B_A16_B6,
         "k26_mmfree2_7b_a16_b6_h11" -> K26_MMFree2_7B_A16_B6_H11,
         "k26_mmfree2_7b_a16_b6_h7"  -> K26_MMFree2_7B_A16_B6_H7,
@@ -730,7 +803,8 @@ object CoreConfig {
         signedAct:    Boolean = true,
         plClkMhz:     Int     = 250,
         shapes:       String  = "",
-        model:        String  = ""
+        model:        String  = "",
+        packedWeights: Boolean = false
     ): CoreConfig = {
         require(hidden > 0 && intermediate > 0 && vocab > 0 && layers > 0,
             s"model dims must be positive (hidden=$hidden inter=$intermediate vocab=$vocab layers=$layers)")
@@ -746,7 +820,26 @@ object CoreConfig {
         // Ternary weights pack at 2 bits each, so bytes = elements * 2 / 8 = elements/4.
         val perLayerElems   = 4L * hidden * hidden + hidden.toLong * (2 * intermediate) + intermediate.toLong * hidden
         val totalWtElems    = perLayerElems * layers + hidden.toLong * vocab
-        val totalWtBytes    = totalWtElems * 2L / 8L
+        // Resident weight bytes (across ports). 2-bit keeps the verified element-count
+        // sizing byte-for-byte (deployed overlays depend on it). Packed sums the EXACT
+        // per-projection 1.6-bit blob (5 trits/byte, each padded to a whole wire beat),
+        // so udmabuf-wt is sized ~0.8x without under-counting the pad — the same formula
+        // the packer/runtime use per projection.
+        val totalWtBytes =
+            if (!packedWeights) totalWtElems * 2L / 8L
+            else {
+                val sAxisBytes = xDim * aWidth / 8
+                val projs = (0 until layers).flatMap(_ =>
+                        Seq.fill(4)((hidden, hidden)) :+
+                        (hidden, 2 * intermediate) :+ (intermediate, hidden)) :+
+                    (hidden, vocab)
+                projs.map { case (n, m) =>
+                    val tiles  = ((m + outLanesPerTile - 1) / outLanesPerTile).toLong
+                    val trits  = tiles * n * outLanesPerTile
+                    val raw    = (trits + 4L) / 5L
+                    ((raw + sAxisBytes - 1L) / sAxisBytes) * sAxisBytes
+                }.sum
+            }
         CoreConfig(
             aWidth          = aWidth,
             maxAcc          = maxAcc,
@@ -759,7 +852,8 @@ object CoreConfig {
             plClkMhz        = plClkMhz,
             shapesHint      = shapes,
             modelName       = model,
-            residentWtBytes = totalWtBytes
+            residentWtBytes = totalWtBytes,
+            packedWeights   = packedWeights
         )
     }
 
