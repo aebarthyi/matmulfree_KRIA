@@ -491,6 +491,56 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
+    // The HW contract that column-tile splitting rests on: a projection can be run as
+    // several COMPUTEs over contiguous slices of its output column tiles, all sharing ONE
+    // LOAD_ACT, and the concatenated results equal the whole projection. This is what lets
+    // the host pipeline a big projection against itself (hide chunk j-1's readback under
+    // chunk j's COMPUTE) with no re-pack and no re-LOAD. Two facts make it work, and this
+    // test pins both: the weight stream is col-tile-major (beat ct*n+t), so a tile range is
+    // a CONTIGUOUS beat slice; and sCompute only READS actBram (a SyncReadMem written by
+    // sLoad), resetting nothing but its own pointers, so the activations survive.
+    // Chunk sizes are deliberately UNEVEN (1 tile then 2) — the host picks boundaries from
+    // blob alignment, not evenness, so the RTL must not assume equal chunks.
+    "split: per-column-tile-chunk COMPUTEs on one LOAD == the whole projection" in {
+      simulate(mkCore) { dut =>
+        val n = 4
+        val tiles = 3
+        val m = tiles * outLanesPerTile
+        val r = new Random(0x5A5A17)
+        val acts = Seq.fill(n)(Seq.fill(batchSize)(1 + r.nextInt(3)))
+        val weightStream =
+          Seq.fill(tiles * n)(Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(r.nextInt(3))))
+
+        resetDut(dut)
+        val whole = runPipeline(dut, acts, weightStream, n, m)
+        whole mustBe referenceCompute(acts, weightStream, n, m)
+
+        // Same projection, now as chunks: ONE LOAD, then COMPUTE+STORE per tile range.
+        resetDut(dut)
+        axiWrite(dut, OFF_INSTR, encode(LOAD_ACT, BigInt(0x100), BigInt(n), 0)) mustBe OKAY
+        pushAxisBeats(dut, acts.map(packActivations))
+        waitForIrq(dut); ackIrq(dut)
+
+        val got = Array.fill(batchSize, m)(BigInt(0))
+        for ((ct0, ct1) <- Seq((0, 1), (1, 3))) {
+          val cm = (ct1 - ct0) * outLanesPerTile
+          axiWrite(dut, OFF_INSTR,
+            encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(cm))) mustBe OKAY
+          pushAxisBeats(dut, weightStream.slice(ct0 * n, ct1 * n).map(packWeights),
+                        maxCyclesPerBeat = 100)
+          waitForIrq(dut); ackIrq(dut)
+          axiWrite(dut, OFF_INSTR,
+            encode(STORE_OUT, BigInt(0x400), BigInt(batchSize * cm), 0)) mustBe OKAY
+          val vals = unpackOutputs(pullAxisBeats(dut, batchSize * cm / effOutBeatLanes))
+          waitForIrq(dut); ackIrq(dut)
+          // Chunk output is batch-major over ITS cm lanes; scatter to absolute columns.
+          for (bb <- 0 until batchSize; l <- 0 until cm)
+            got(bb)(ct0 * outLanesPerTile + l) = vals(bb * cm + l)
+        }
+        got.flatMap(_.toSeq).toSeq mustBe whole
+      }
+    }
+
     // ──────────────────────────────────────────────────────────────────
     // Edge cases
     // ──────────────────────────────────────────────────────────────────

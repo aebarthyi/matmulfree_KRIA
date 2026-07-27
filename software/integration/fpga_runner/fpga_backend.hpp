@@ -32,6 +32,13 @@ class FpgaBackend final : public mmfree::TernaryBackend {
   void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
                     const std::int8_t* wq, std::size_t N, std::size_t M,
                     std::size_t b) override;
+  // Column-tile split with a per-range callback: the caller's per-column work (dequant)
+  // runs inside the next tile-chunk's COMPUTE window. This is the overload the model
+  // should prefer — matmul_batch above is just this one with a null callback.
+  void matmul_batch_chunked(int proj_id, const std::int32_t* x, std::int32_t* acc,
+                            const std::int8_t* wq, std::size_t N, std::size_t M,
+                            std::size_t b,
+                            const std::function<void(std::size_t, std::size_t)>& on_cols) override;
   // Pipelined cluster: quant+pack of projection n+1 and sign-expand+dequant of n-1
   // run inside the COMPUTE(n) wait window (engine ordering stays one-op-at-a-time).
   // MMFREE_NO_PIPELINE=1 forces the serial default (for token-equivalence A/B).

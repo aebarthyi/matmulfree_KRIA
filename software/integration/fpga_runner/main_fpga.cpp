@@ -35,8 +35,13 @@
 //   --seed N           RNG seed for reproducible sampling
 //   --no-eos           don't stop at EOS — always emit the full --gen length
 //   --warmup N --reps N --profile     bench controls (see mmfree/bench.hpp)
+//   --csv              also emit the run's metrics as one "#CSVH <header>" + one
+//                      "#CSVR <values>" line, for a scripted sweep (scripts/bench_batch.sh).
+//                      Covers TTFT / prefill / token latency / tok-s plus, with --profile,
+//                      the op and engine-phase breakdowns as columns.
 #include "mmfree/bench.hpp"
 #include "mmfree/model.hpp"
+#include "mmfree/profile.hpp"
 #include "mmfree/tokenizer.hpp"
 #include "mmfree/weights.hpp"
 
@@ -46,6 +51,7 @@
 #include "fpga_backend.hpp"
 #include "manifest.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -76,6 +82,121 @@ static const char* port_path(char* out, size_t n, const char* base, uint32_t i, 
   if (e && *e) return e;
   snprintf(out, n, "%s%u", base, i);
   return out;
+}
+
+static std::string getenv_or(const char* n, const char* d) {
+  const char* e = getenv(n);
+  return (e && *e) ? std::string(e) : std::string(d);
+}
+
+// ---- machine-readable metrics for the batch sweep -------------------------------------
+// A run emits one "#CSVH <header>" line and one "#CSVR <values>" line, so a driver script
+// sweeping B=1..batchSize takes the header from the first run and appends each row — no
+// parsing of the human-readable tables below, which stay exactly as they were. Columns are
+// appended in a fixed order (and the op columns sorted by label), so every run of a given
+// preset emits an identical header and the rows line up.
+struct CsvRow {
+  std::string head, vals;
+  void add(const char* k, const std::string& v) {
+    if (!head.empty()) { head += ','; vals += ','; }
+    head += k;
+    vals += v;
+  }
+  void add(const char* k, double v, int prec) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.*f", prec, v);
+    add(k, std::string(buf));
+  }
+  void emit() const { std::printf("#CSVH %s\n#CSVR %s\n", head.c_str(), vals.c_str()); }
+};
+
+// The op-level wall-clock breakdown (matmul / swiglu / rmsnorm / ...), per generation.
+static void add_profile_csv(CsvRow& row, int runs) {
+  const double n = runs > 0 ? runs : 1;
+  auto& prof = mmfree::Profiler::instance();
+  auto entries = prof.sorted();
+  const double total_ns = static_cast<double>(prof.total_ns());
+  // sorted() is by time DESCENDING, which can reorder between batch sizes. Sort by label
+  // so a sweep's CSV columns stay aligned row to row.
+  std::sort(entries.begin(), entries.end(),
+            [](const mmfree::Profiler::Entry& a, const mmfree::Profiler::Entry& b) {
+              return a.label < b.label;
+            });
+  row.add("op_total_ms", total_ns / 1e6 / n, 3);
+  double matmul_ns = 0.0;
+  for (const auto& e : entries) {
+    if (e.label == "matmul" || e.label == "lm_head") matmul_ns += static_cast<double>(e.ns);
+    row.add(("op_" + e.label + "_ms").c_str(), e.ns / 1e6 / n, 3);
+    row.add(("op_" + e.label + "_pct").c_str(), total_ns > 0 ? 100.0 * e.ns / total_ns : 0.0, 2);
+    row.add(("op_" + e.label + "_us_call").c_str(), e.count ? (e.ns / 1e3) / e.count : 0.0, 3);
+  }
+  row.add("op_matmul_incl_lmhead_pct", total_ns > 0 ? 100.0 * matmul_ns / total_ns : 0.0, 2);
+  row.add("op_other_pct", total_ns > 0 ? 100.0 * (total_ns - matmul_ns) / total_ns : 0.0, 2);
+}
+
+// ---- engine phase breakdown ----------------------------------------------------------
+// The five serialized phases of one projection (see mmfree_lib_stats_t): CPU-side
+// activation pack, the three blocking LOAD/COMPUTE/STORE round-trips, then the output
+// readback. `name` is the human table's label, `key` the CSV column stem.
+struct EnginePhase { const char* name; const char* key; std::uint64_t ns; };
+
+static std::vector<EnginePhase> engine_phases(const mmfree_lib_stats_t& s) {
+  return {{"pack", "pack", s.pack_ns},
+          {"load (IRQ)", "load", s.load_ns},
+          {"compute (IRQ)", "compute", s.compute_ns},
+          {"store (IRQ)", "store", s.store_ns},
+          {"readback", "readback", s.readback_ns}};
+}
+
+static void print_engine_profile(mmfree_lib_t* lib, int runs) {
+  mmfree_lib_stats_t s;
+  mmfree_lib_get_stats(lib, &s);
+  if (!s.calls) return;
+  const auto ph = engine_phases(s);
+  std::uint64_t tot = 0;
+  for (const auto& p : ph) tot += p.ns;
+  std::printf("\nbitlinear phase breakdown (%llu calls, %.2f ms total, %.1f us/call):\n",
+              (unsigned long long)s.calls, tot / 1e6, (double)tot / 1e3 / s.calls);
+  std::printf("  %-14s %10s %8s %10s\n", "phase", "ms", "%", "us/call");
+  for (const auto& p : ph)
+    std::printf("  %-14s %10.2f %7.1f%% %10.2f\n", p.name, p.ns / 1e6,
+                tot ? 100.0 * p.ns / tot : 0.0, (double)p.ns / 1e3 / s.calls);
+  std::printf("    (of which cache sync: act %.2f us/call, out %.2f us/call)\n",
+              (double)s.act_sync_ns / 1e3 / s.calls, (double)s.out_sync_ns / 1e3 / s.calls);
+  // Column-tile splitting moves readback OFF the wall clock rather than making it cheaper,
+  // so the phases above shrink while this grows. It is the direct measure of what splitting
+  // bought, and the signal for tuning MMFREE_SPLIT_CHUNKS.
+  if (s.readback_hidden_ns)
+    std::printf("    readback hidden under COMPUTE: %.2f ms (%.2f us/call) — %.0f%% of all "
+                "readback was free\n",
+                s.readback_hidden_ns / 1e6, (double)s.readback_hidden_ns / 1e3 / s.calls,
+                100.0 * s.readback_hidden_ns / (s.readback_hidden_ns + s.readback_ns));
+  (void)runs;  // the table is per-call / share-of-total, so it needs no per-run division
+}
+
+static void add_engine_csv(CsvRow& row, mmfree_lib_t* lib, int runs) {
+  const double n = runs > 0 ? runs : 1;
+  mmfree_lib_stats_t s;
+  mmfree_lib_get_stats(lib, &s);
+  const auto ph = engine_phases(s);
+  std::uint64_t tot = 0;
+  for (const auto& p : ph) tot += p.ns;
+  const double calls = s.calls ? (double)s.calls : 1.0;
+  row.add("bl_calls_per_run", s.calls / n, 1);
+  row.add("bl_total_ms", tot / 1e6 / n, 3);
+  row.add("bl_us_call", (double)tot / 1e3 / calls, 3);
+  for (const auto& p : ph) {
+    row.add((std::string("bl_") + p.key + "_ms").c_str(), p.ns / 1e6 / n, 3);
+    row.add((std::string("bl_") + p.key + "_pct").c_str(), tot ? 100.0 * p.ns / tot : 0.0, 2);
+    row.add((std::string("bl_") + p.key + "_us_call").c_str(), (double)p.ns / 1e3 / calls, 3);
+  }
+  row.add("bl_act_sync_us_call", (double)s.act_sync_ns / 1e3 / calls, 3);
+  row.add("bl_out_sync_us_call", (double)s.out_sync_ns / 1e3 / calls, 3);
+  // Not part of bl_total_ms (it costs no wall time) — see mmfree_lib_stats_t.
+  row.add("bl_readback_hidden_ms", s.readback_hidden_ns / 1e6 / n, 3);
+  row.add("bl_readback_hidden_pct",
+          (s.readback_hidden_ns + s.readback_ns)
+              ? 100.0 * s.readback_hidden_ns / (s.readback_hidden_ns + s.readback_ns) : 0.0, 2);
 }
 
 static std::vector<std::int64_t> parse_ids(const std::string& s) {
@@ -113,7 +234,7 @@ int main(int argc, char** argv) {
 
   std::string blob = "model.mmfree", packed_dir = ".", prefix = "weights", tok_path;
   std::string backend = "fpga", mode = "fixed", ids_arg, prompt;
-  bool bench = false, profile = false, no_eos = false;
+  bool bench = false, profile = false, no_eos = false, csv = false;
   int frac = 10, warmup = 1, reps = 3, serve = 0, top_k = 0;
   std::size_t gen = 32;
   float temperature = 0.0f;             // 0 => greedy
@@ -136,6 +257,7 @@ int main(int argc, char** argv) {
     else if (k == "--warmup") warmup = std::atoi(next());
     else if (k == "--reps") reps = std::atoi(next());
     else if (k == "--profile") profile = true;
+    else if (k == "--csv") csv = true;
     else if (k == "--serve") serve = std::atoi(next());
     else if (k == "--temp") temperature = (float)std::atof(next());
     else if (k == "--top-k") top_k = std::atoi(next());
@@ -296,30 +418,118 @@ int main(int argc, char** argv) {
     std::vector<std::vector<std::int64_t>> prompts(Bn, ids);  // same prompt across streams
     Sampling samp;  // greedy → deterministic, so every stream must match the single-stream ref
 
-    // Correctness reference: one stream decoded the existing (single-stream) way.
+    // Correctness reference: one stream decoded the existing (single-stream) way. This also
+    // warms the resident weights / udmabuf mapping before anything is timed.
     std::vector<std::int64_t> ref = model.generate(ids, gen, /*eos=*/-1, samp);
 
-    // Timed serving (best-of-reps when --bench, else one run). The first generate() above
-    // also warms the resident weights / udmabuf mapping.
     using clk = std::chrono::steady_clock;
-    double best_s = 1e30;
-    int rr = bench ? reps : 1;
+    auto secs = [](clk::duration d) { return std::chrono::duration<double>(d).count(); };
+
+    // One timed serve run, split at the token boundaries generate_serve's callback exposes:
+    //   ttft    — first token of the FIRST stream. Prefill is stream-sequential, so this is
+    //             one prompt's prefill: what the batch's first request actually waits.
+    //   prefill — first token of the LAST stream, i.e. the whole prefill phase / the point
+    //             batched decode can start. Equals ttft at B=1 and grows ~B*ttft above it.
+    //   decode  — prefill end -> last token: the steady-state batched phase, the one the
+    //             engine's weight-stream amortization actually applies to.
+    struct ServeStat { double ttft_s, prefill_s, decode_s, total_s; std::size_t gen_per, steps; };
     std::vector<std::vector<std::int64_t>> out;
+    auto run_once = [&]() -> ServeStat {
+      std::vector<char> seen(Bn, 0);
+      std::size_t firsts = 0;
+      clk::time_point t0 = clk::now(), t_first = t0, t_prefill = t0, t_last = t0;
+      auto cb = [&](std::size_t b, std::int64_t) {
+        clk::time_point now = clk::now();
+        if (b < Bn && !seen[b]) {          // a stream's FIRST token = its prefill completing
+          seen[b] = 1;
+          if (++firsts == 1) t_first = now;
+          if (firsts == Bn) t_prefill = now;
+        }
+        t_last = now;
+      };
+      out = model.generate_serve(prompts, gen, /*eos=*/-1, samp, cb);
+      const std::size_t gen_per = out.empty() ? 0 : out[0].size() - ids.size();
+      const std::size_t steps = gen_per > 1 ? gen_per - 1 : 0;   // decode steps after prefill
+      return {secs(t_first - t0), secs(t_prefill - t0),
+              steps ? secs(t_last - t_prefill) : 0.0, secs(t_last - t0), gen_per, steps};
+    };
+
+    // Untimed warmup, then the timed reps. The op profiler and the engine's phase counters
+    // accumulate across the timed reps only (warmup excluded) and are divided by reps
+    // below, so the breakdown lines up with the reported tok/s — same contract as run_bench.
+    for (int i = 0; i < (bench ? warmup : 0); ++i) run_once();
+    if (profile) { Profiler::instance().reset(); Profiler::instance().enable(true); }
+    if (lib && profile) mmfree_lib_reset_stats(lib);
+
+    const int rr = bench ? reps : 1;
+    ServeStat sum{};
+    ServeStat last{};
     for (int r = 0; r < rr; ++r) {
-      auto t0 = clk::now();
-      out = model.generate_serve(prompts, gen, /*eos=*/-1, samp);
-      double s = std::chrono::duration<double>(clk::now() - t0).count();
-      if (s < best_s) best_s = s;
+      ServeStat s = run_once();
+      last = s;
+      sum.ttft_s += s.ttft_s; sum.prefill_s += s.prefill_s;
+      sum.decode_s += s.decode_s; sum.total_s += s.total_s;
+      if (bench)
+        std::printf("  run %d: ttft %7.1f ms  prefill %7.1f ms  decode %8.2f tok/s agg\n",
+                    r + 1, s.ttft_s * 1e3, s.prefill_s * 1e3,
+                    s.decode_s > 0 ? (double)(Bn * s.steps) / s.decode_s : 0.0);
     }
+    if (profile) Profiler::instance().enable(false);
+
+    const double n = rr > 0 ? rr : 1;
+    const double ttft = sum.ttft_s / n, prefill = sum.prefill_s / n;
+    const double decode = sum.decode_s / n, total = sum.total_s / n;
+    const std::size_t gen_per = last.gen_per, steps = last.steps;
+    // Aggregate = tokens across all B streams; per-stream = one stream's own rate. On a
+    // weight-bandwidth-bound engine the aggregate is the metric batching moves.
+    const double dec_agg  = decode > 0 ? (double)(Bn * steps) / decode : 0.0;
+    const double all_agg  = total  > 0 ? (double)(Bn * gen_per) / total : 0.0;
+    const double tok_lat  = steps ? decode * 1e3 / steps : 0.0;  // ms per batched decode step
+    const double pre_tps  = prefill > 0 ? (double)(Bn * ids.size()) / prefill : 0.0;
 
     std::size_t bad = 0;
     for (const auto& st : out) if (st != ref) ++bad;
-    const std::size_t gen_per = out.empty() ? 0 : out[0].size() - ids.size();
-    const double agg = best_s > 0 ? (double)(Bn * gen_per) / best_s : 0.0;
+
     std::printf("serve B=%zu: %s\n", Bn,
                 bad ? "STREAM MISMATCH (serve != single-stream)" : "OK (all streams == single-stream)");
-    std::printf("  %zu gen tok/stream, %.3fs/run -> %.2f tok/s aggregate  (%.2f tok/s/stream)\n",
-                gen_per, best_s, agg, Bn ? agg / Bn : 0.0);
+    std::printf("  ttft (1st stream):   %8.1f ms\n", ttft * 1e3);
+    std::printf("  prefill (all %zu):    %8.1f ms  (%.2f tok/s over %zu prompt tokens)\n",
+                Bn, prefill * 1e3, pre_tps, Bn * ids.size());
+    std::printf("  token latency:       %8.2f ms/step (all %zu streams advance per step)\n",
+                tok_lat, Bn);
+    std::printf("  decode:              %8.2f tok/s aggregate  (%.2f tok/s/stream)\n",
+                dec_agg, Bn ? dec_agg / Bn : 0.0);
+    std::printf("  overall:             %8.2f tok/s aggregate  (%zu gen tok/stream, %.3f s/run)\n",
+                all_agg, gen_per, total);
+
+    if (profile) print_profile(rr);
+    if (lib && profile) print_engine_profile(lib, rr);
+
+    if (csv) {
+      CsvRow row;
+      row.add("preset", getenv_or("MMFREE_PRESET", "?"));
+      row.add("clk_mhz", getenv_or("MMFREE_CLK_MHZ", "?"));
+      row.add("hw_batch", getenv_or("MMFREE_BATCH", "?"));
+      row.add("packed_weights", getenv_or("MMFREE_PACKED_WEIGHTS", "0"));
+      row.add("model", blob);
+      row.add("batch", (double)Bn, 0);
+      row.add("prompt_tokens", (double)ids.size(), 0);
+      row.add("gen_tokens", (double)gen_per, 0);
+      row.add("reps", (double)rr, 0);
+      row.add("streams_ok", bad ? "0" : "1");
+      row.add("ttft_ms", ttft * 1e3, 3);
+      row.add("prefill_ms", prefill * 1e3, 3);
+      row.add("prefill_tok_s", pre_tps, 3);
+      row.add("token_latency_ms", tok_lat, 4);
+      row.add("decode_tok_s", dec_agg, 3);
+      row.add("decode_tok_s_per_stream", Bn ? dec_agg / Bn : 0.0, 3);
+      row.add("overall_tok_s", all_agg, 3);
+      row.add("decode_s", decode, 4);
+      row.add("total_s", total, 4);
+      if (profile) add_profile_csv(row, rr);
+      if (lib && profile) add_engine_csv(row, lib, rr);
+      row.emit();
+    }
     rc = bad ? 1 : 0;
   }
   // ---- exact-match gate: one forward pass touches every projection shape ----
@@ -339,28 +549,39 @@ int main(int argc, char** argv) {
     BenchOpts opts;
     opts.gen = gen; opts.warmup = warmup; opts.reps = reps; opts.profile = profile;
     if (lib) mmfree_lib_reset_stats(lib);   // exclude model setup; warmup is folded into reps
-    run_bench(model, ids, opts, blob.c_str(), mode.c_str(), frac);
+    BenchResult br = run_bench(model, ids, opts, blob.c_str(), mode.c_str(), frac);
 
-    if (lib && profile) {
-      mmfree_lib_stats_t s;
-      mmfree_lib_get_stats(lib, &s);
-      if (s.calls) {
-        struct { const char* name; std::uint64_t ns; } ph[] = {
-            {"pack",     s.pack_ns},     {"load (IRQ)",  s.load_ns},
-            {"compute (IRQ)", s.compute_ns}, {"store (IRQ)", s.store_ns},
-            {"readback", s.readback_ns},
-        };
-        std::uint64_t tot = s.pack_ns + s.load_ns + s.compute_ns + s.store_ns + s.readback_ns;
-        std::printf("\nbitlinear phase breakdown (%llu calls, %.2f ms total, %.1f us/call):\n",
-                    (unsigned long long)s.calls, tot / 1e6, (double)tot / 1e3 / s.calls);
-        std::printf("  %-14s %10s %8s %10s\n", "phase", "ms", "%", "us/call");
-        for (auto& p : ph)
-          std::printf("  %-14s %10.2f %7.1f%% %10.2f\n", p.name, p.ns / 1e6,
-                      tot ? 100.0 * p.ns / tot : 0.0, (double)p.ns / 1e3 / s.calls);
-        std::printf("    (of which cache sync: act %.2f us/call, out %.2f us/call)\n",
-                    (double)s.act_sync_ns / 1e3 / s.calls,
-                    (double)s.out_sync_ns / 1e3 / s.calls);
-      }
+    if (lib && profile) print_engine_profile(lib, reps);
+
+    // Single-stream row, column-compatible with the --serve sweep so a B=1 reference from
+    // the plain decode path can sit in the same CSV. Single-stream decode emits one token
+    // per step, so its token latency is just the inverse of its decode rate, and prefill
+    // IS the time to first token.
+    if (csv) {
+      CsvRow row;
+      row.add("preset", getenv_or("MMFREE_PRESET", "?"));
+      row.add("clk_mhz", getenv_or("MMFREE_CLK_MHZ", "?"));
+      row.add("hw_batch", getenv_or("MMFREE_BATCH", "?"));
+      row.add("packed_weights", getenv_or("MMFREE_PACKED_WEIGHTS", "0"));
+      row.add("model", blob);
+      row.add("batch", 1.0, 0);
+      row.add("prompt_tokens", (double)br.prompt_tokens, 0);
+      row.add("gen_tokens", (double)br.gen_tokens, 0);
+      row.add("reps", (double)reps, 0);
+      row.add("streams_ok", "1");
+      row.add("ttft_ms", br.avg_prefill_s * 1e3, 3);
+      row.add("prefill_ms", br.avg_prefill_s * 1e3, 3);
+      row.add("prefill_tok_s",
+              br.avg_prefill_s > 0 ? br.prompt_tokens / br.avg_prefill_s : 0.0, 3);
+      row.add("token_latency_ms", br.avg_decode_tps > 0 ? 1e3 / br.avg_decode_tps : 0.0, 4);
+      row.add("decode_tok_s", br.avg_decode_tps, 3);
+      row.add("decode_tok_s_per_stream", br.avg_decode_tps, 3);
+      row.add("overall_tok_s", br.avg_overall_tps, 3);
+      row.add("decode_s", br.avg_decode_tps > 0 ? br.gen_tokens / br.avg_decode_tps : 0.0, 4);
+      row.add("total_s", br.avg_overall_tps > 0 ? br.gen_tokens / br.avg_overall_tps : 0.0, 4);
+      if (profile) add_profile_csv(row, reps);
+      if (lib && profile) add_engine_csv(row, lib, reps);
+      row.emit();
     }
   } else {
     Sampling samp;                      // greedy unless --temp/--top-k given

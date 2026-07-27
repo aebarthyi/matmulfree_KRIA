@@ -92,11 +92,15 @@ MODEL_SHAPES := $(shell printf '%s' '$(notdir $(MODEL))' | sed -E 's/^MMfreeLM-/
 # sudo strips the environment, so we hand it through `sudo env`. A trailing assignment
 # wins under `env`: MODEL=<hf-id> re-points the sweep slug, and an explicit
 # SHAPES=370m|1.3b|2.7b|pow2 wins outright (bench-only override).
+# ENV="K=V K=V" is appended LAST so it wins under `env` — the only way to get a tuning
+# variable to the workload, since sudo strips the caller's environment. e.g.
+#   make run PRESET=... ENV="MMFREE_SPLIT_CHUNKS=0"     # disable column-tile splitting
 GEOM_ENV = $$(grep -E '^(MMFREE_|NUM_DMA|MM2S_WIDTH|S2MM_WIDTH)' $(MANIFEST) | tr '\n' ' ') \
            MMFREE_MANIFEST=$(MANIFEST_ABS) \
            $(if $(BATCH),MMFREE_BATCH=$(BATCH),) \
            $(if $(strip $(MODEL_SHAPES)),MMFREE_SHAPES=$(MODEL_SHAPES),) \
-           $(if $(SHAPES),MMFREE_SHAPES=$(SHAPES),)
+           $(if $(SHAPES),MMFREE_SHAPES=$(SHAPES),) \
+           $(if $(ENV),$(ENV),)
 
 define need_manifest
 	@[ -f "$(MANIFEST)" ] || { echo "ERROR: no manifest at $(MANIFEST) — '$(PRESET)' is not in this bundle. Built presets: $$(ls presets/ 2>/dev/null | tr '\n' ' ')." >&2; exit 1; }
@@ -110,7 +114,7 @@ define need_blob
 	@[ -f "$(BLOB)" ] || { echo "ERROR: blob '$(BLOB)' not found — the '$(MODEL)' model isn't in this bundle. Build it on the build server (make model PRESET=$(PRESET)) and re-deploy, or pass BLOB=<f>." >&2; exit 1; }
 endef
 
-.PHONY: help build bench-bin runner-bin deploy-hw bench gate run gen
+.PHONY: help build bench-bin runner-bin deploy-hw bench gate run gen sweep
 
 help:
 	@echo "matmulfree_KRIA board runner (PRESET=$(PRESET))"
@@ -123,6 +127,8 @@ help:
 	@echo "    (bench/run sample rail power via xlnx_platformstats -> power/<geom>_<mode>.{log,samples};"
 	@echo "     POWER=0 disables, POWER_INTERVAL / POWER_ARGS / POWER_DIR tune it)"
 	@echo "  make gen    PRESET=<p> [MODEL=<hf-id>] PROMPT=\"...\" [GEN=n]   interactive generate"
+	@echo "  make sweep  PRESET=<p> [MODEL=<hf-id>] [GEN=n] [REPS=n]      batch sweep b=1..batchSize -> CSV"
+	@echo "    (one row per batch: ttft / prefill / token latency / tok-s + op & engine breakdowns)"
 	@echo
 	@echo "  This preset's model: $(if $(strip $(MODEL)),$(MODEL),(none — bench-only))"
 	@echo
@@ -164,6 +170,23 @@ run: runner-bin
 	$(need_manifest)
 	$(need_blob)
 	$(call runwrap,run) env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) --backend fpga --bench --profile $(ARGS)
+
+# ─── batch sweep → CSV ───────────────────────────────────────────────────────
+# One `make run` per batch size b=1..MMFREE_BATCH, collected into a single CSV (one row
+# per b): ttft, prefill latency, per-step token latency, aggregate/per-stream tok/s, plus
+# the op and engine-phase breakdowns as columns. The overlay for PRESET must ALREADY be
+# loaded (sudo make deploy-hw PRESET=… first) — the sweep does not touch the hardware.
+# BATCHES="1 2 4" sweeps an explicit list; GEN/REPS/WARMUP/OUT tune the runs.
+#   make sweep PRESET=k26_mmfree370m_a16_b6 GEN=64 REPS=3
+SWEEP_VARS = $(if $(MODEL),MODEL=$(MODEL),) $(if $(GEN),GEN=$(GEN),) \
+             $(if $(REPS),REPS=$(REPS),) $(if $(WARMUP),WARMUP=$(WARMUP),) \
+             $(if $(BATCHES),BATCHES='$(BATCHES)',) $(if $(OUT),OUT=$(OUT),) \
+             $(if $(POWER),POWER=$(POWER),) $(if $(EXTRA),EXTRA='$(EXTRA)',) \
+             $(if $(TAG),TAG=$(TAG),) $(if $(ENV),ENV='$(ENV)',)
+sweep: runner-bin
+	$(need_manifest)
+	$(need_blob)
+	./bench_batch.sh PRESET=$(PRESET) $(SWEEP_VARS)
 
 # ─── fpga_runner — interactive generation (live streamed text) ───────────────
 # Single-stream decode of PROMPT=, printing each token as the engine emits it (decoded

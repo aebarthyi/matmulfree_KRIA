@@ -494,6 +494,16 @@ object CoreConfig {
     val K26_MMFree370M_A16_B6_F32: CoreConfig = K26_MMFree370M_A16_B6.copy(actMaxFanout = 32)
     val K26_MMFree370M_A16_B6_F16: CoreConfig = K26_MMFree370M_A16_B6.copy(actMaxFanout = 16)
 
+    // ── runtime-batch A/B sibling of the 370M B6 sweet spot ─────────────────
+    // CONFIG-IDENTICAL to K26_MMFree370M_A16_B6 — it exists only so a rebuild from
+    // a tree that HAS the runtime-batch drain (COMPUTE flags → cmpBatch) lands in its
+    // own preset dir instead of clobbering the deployed 2026-06-25 bitstream, which
+    // predates that RTL. Bench the two side by side: the batch sweep on _B6 shows a
+    // b<B call still draining all 6 rows (flat per-step cost), while _B6_RB should
+    // show b=1 paying ~B1 cost. Once that A/B is settled, this preset can be deleted
+    // and K26_MMFree370M_A16_B6 simply rebuilt in place.
+    val K26_MMFree370M_A16_B6_RB: CoreConfig = K26_MMFree370M_A16_B6
+
     // ── DSP48E2 accumulator experiment ──────────────────────────────────────
     // Map the per-lane PE accumulators onto DSP slices instead of LUT/CARRY8.
     // One DSP/lane if Vivado infers cleanly → xDim*batch*nLanes = 32*batch*8 DSPs.
@@ -627,6 +637,21 @@ object CoreConfig {
     val K26_MMFree2_7B_A16_B6_DSP_S8: CoreConfig =
         K26_MMFree2_7B_A16_B6.copy(dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
 
+    // B6 + DSP + banking at 230 MHz — the throughput-max maxN=8192 build, and the
+    // deployable conclusion of the B6@250 hunt. Both 250 attempts missed by a wide,
+    // lever-immune margin (DSP_S8 −0.376, S8-only −0.483), which is the same route-bound
+    // arm-RAM→accumulator broadcast that sent 1.3B B6 to 230 (see _B6_230). 230 buys
+    // ~0.35 ns over the DSP_S8 miss, so it should close where 250 cannot.
+    // Dropping the clock costs almost nothing here: decode is weight-bandwidth-bound, and
+    // the 295 MHz ceiling sweep measured +33% clock → +2.5% tok/s (see
+    // [[fclk_runtime_vs_sta_clock]]). B6 vs B4 is the lever that matters — 6 tokens per
+    // weight stream instead of 4 on a 654 MB/token stream. With the runtime-batch drain
+    // this ONE bitstream also serves b=1..5, and the maxN=8192 geometry runs 370M/1.3B/2.7B,
+    // so it is the single build a batch sweep needs. REMEMBER fclk0: PL_CLK_MHZ is
+    // STA-only, the board's fclk0 must be set to 230 explicitly or it keeps the old rate.
+    val K26_MMFree2_7B_A16_B6_DSP_S8_230: CoreConfig =
+        K26_MMFree2_7B_A16_B6_DSP_S8.copy(plClkMhz = 230)
+
     // Banking-only B6 @ 250 — the DSP_S8 fallback. B6_DSP_S8 missed 250 at WNS −0.376 ns
     // with the critical path on actBram/inQ reads: the 1248-DSP + LUT/CARRY8 spill (1536
     // needed, only 1248 available) congested the BRAM read paths. This drops dspAccum so
@@ -694,6 +719,7 @@ object CoreConfig {
         "k26_mmfree370m_a16_b6_h10" -> K26_MMFree370M_A16_B6_H10,
         "k26_mmfree370m_a16_b6_h6"  -> K26_MMFree370M_A16_B6_H6,
         "k26_mmfree370m_a16_b6_f32" -> K26_MMFree370M_A16_B6_F32,
+        "k26_mmfree370m_a16_b6_rb"  -> K26_MMFree370M_A16_B6_RB,
         "k26_mmfree370m_a16_b6_f16" -> K26_MMFree370M_A16_B6_F16,
         "k26_mmfree370m_a16_b4_dsp" -> K26_MMFree370M_A16_B4_DSP,
         "k26_mmfree370m_a16_b8" -> K26_MMFree370M_A16_B8,
@@ -712,6 +738,7 @@ object CoreConfig {
         "k26_mmfree2_7b_a16_packed" -> K26_MMFree2_7B_A16_PACKED,
         "k26_mmfree2_7b_a16_b4_dsp_s8_packed" -> K26_MMFree2_7B_A16_B4_DSP_S8_PACKED,
         "k26_mmfree2_7b_a16_b6_dsp_s8" -> K26_MMFree2_7B_A16_B6_DSP_S8,
+        "k26_mmfree2_7b_a16_b6_dsp_s8_230" -> K26_MMFree2_7B_A16_B6_DSP_S8_230,
         "k26_mmfree2_7b_a16_b6_s8" -> K26_MMFree2_7B_A16_B6_S8,
         "k26_mmfree2_7b_a16_b6" -> K26_MMFree2_7B_A16_B6,
         "k26_mmfree2_7b_a16_b6_h11" -> K26_MMFree2_7B_A16_B6_H11,

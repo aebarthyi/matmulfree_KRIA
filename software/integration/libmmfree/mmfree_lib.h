@@ -101,6 +101,57 @@ int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
 int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
                            const int16_t *x, int32_t *acc, uint32_t b);
 
+/* As mmfree_bitlinear_batch, but runs the projection as up to `want_chunks` COMPUTEs over
+ * contiguous slices of its output column tiles, sharing ONE activation pack + LOAD. Because
+ * COMPUTE never touches OUT, chunk j-1's sign-expand runs on the CPU while the engine
+ * computes chunk j — hiding the readback that is otherwise dead time (~28% of engine time
+ * on the big projections). Same results as mmfree_bitlinear_batch, bit for bit.
+ *
+ * `want_chunks` is a REQUEST, not a promise: the weight blob's encoding constrains where a
+ * chunk may start (a 1.6-bit blob only permits boundaries whose trit offset divides by 5
+ * and lands on a wire beat), so the implementation halves it until every boundary is legal
+ * and falls back to the plain blocking path at 1. Pass 0 or 1 for no splitting.
+ *
+ * Chunking is a TRADE: each chunk pays a COMPUTE issue + STORE round-trip, so the win peaks
+ * where chunk COMPUTE time ~= chunk readback time and reverses if you over-split. Tune with
+ * MMFREE_SPLIT_CHUNKS (see fpga_backend.cpp), which also selects per projection size. */
+int mmfree_bitlinear_batch_split(mmfree_lib_t *h, int proj_id, const int16_t *x,
+                                 int32_t *acc, uint32_t b, uint32_t want_chunks);
+
+/* Called once per chunk, with the output columns [col0, col0+ncols) of `acc` that have just
+ * been read back. Every invocation except the last runs INSIDE the next chunk's COMPUTE
+ * window, so the work it does is free up to the length of that window — this is how
+ * downstream per-column CPU work (dequant, and later the elementwise ops) gets hidden
+ * behind the engine instead of running after it. Rows are b, stride is the projection's M.
+ * It must touch only those columns, and must not call back into the library. */
+typedef void (*mmfree_chunk_cb_t)(void *ctx, uint32_t col0, uint32_t ncols);
+
+/* mmfree_bitlinear_batch_split with a per-chunk completion callback (NULL = the plain
+ * split). The callback is the point of splitting beyond readback: readback alone only fills
+ * part of the COMPUTE window, and whatever else the caller can express per-column-range
+ * rides along for free in the remainder. */
+int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int16_t *x,
+                                    int32_t *acc, uint32_t b, uint32_t want_chunks,
+                                    mmfree_chunk_cb_t cb, void *cb_ctx);
+
+/* One chunk of a split projection, as mmfree_bitlinear_batch_split would run it. */
+typedef struct mmfree_split_chunk {
+    uint32_t first_tile;    /* first output column tile */
+    uint32_t tiles;         /* column tiles in this chunk */
+    uint32_t first_col;     /* first output column = first_tile * outLanesPerTile */
+    uint32_t M;             /* columns this chunk asks the engine for (last may be short) */
+    uint64_t byte_offset;   /* per-port weight offset (absolute, includes the projection's) */
+    uint32_t blob_bytes;    /* per-port weight bytes this chunk streams */
+} mmfree_split_chunk_t;
+
+/* Report the split plan for `proj_id` at `want_chunks` WITHOUT running anything: the
+ * boundaries actually chosen after the blob-alignment fallback. Writes at most `max` chunks
+ * to `out` and returns the count (>=1), or negative on error. Use it to check a plan tiles
+ * the projection exactly (contiguous byte ranges summing to the whole slice) and for
+ * diagnostics — the chunk count is data-dependent, so it is worth being able to see it. */
+int mmfree_split_plan(const mmfree_lib_t *h, int proj_id, uint32_t want_chunks,
+                      mmfree_split_chunk_t *out, uint32_t max);
+
 /* ---- pipelined cluster primitives -----------------------------------------
  * mmfree_bitlinear_batch, split into non-blocking issue + blocking wait so a
  * caller can overlap CPU work (quant+pack the next projection, sign-expand the
@@ -133,7 +184,16 @@ typedef struct mmfree_lib_stats {
     uint64_t compute_ns;   /* mmfree_compute_off + wait_done (IRQ) */
     uint64_t store_ns;     /* mmfree_store  + wait_done (IRQ) + s2mm_wait (incl. out sync) */
     uint64_t out_sync_ns;  /*   ...of which: sync_for_cpu(out) invalidate (subset of store) */
-    uint64_t readback_ns;  /* sign-expand M lanes out of the udmabuf */
+    uint64_t readback_ns;  /* sign-expand M lanes out of the udmabuf — the part actually PAID
+                            * for in wall time. With column-tile splitting the overlapped
+                            * readbacks run inside a COMPUTE window and cost nothing, so they
+                            * are excluded here and counted in readback_hidden_ns instead;
+                            * pack+load+compute+store+readback therefore still sums to the
+                            * measured wall time on both the split and un-split paths. */
+    uint64_t readback_hidden_ns; /* CPU readback time that ran under a COMPUTE and so cost no
+                            * wall time (0 without splitting). NOT part of the sum above —
+                            * it is the "work you got for free", the tuning signal for how
+                            * many chunks to split into. */
 } mmfree_lib_stats_t;
 
 /* Copy the accumulated phase timers into *out (no-op if either is NULL). */

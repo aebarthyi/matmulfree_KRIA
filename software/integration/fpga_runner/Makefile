@@ -53,7 +53,13 @@ $(BUILD):
 	@mkdir -p $(BUILD)
 
 # 1. the C++ model library, built by the submodule's own CMake.
-$(CPULIB): | $(BUILD)
+# Depend on the submodule's actual sources, not just the build dir: without this the .a is
+# treated as up to date forever, so an edit to the model (or a submodule bump) links the
+# STALE archive — which shows up as a baffling undefined-reference to the function you just
+# changed, or worse, silently benchmarks the old code. The inner cmake --build still does
+# its own incremental check, so this is a no-op when nothing changed.
+CPU_SRCS := $(shell find $(SUBMOD)/src $(SUBMOD)/include -type f \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null)
+$(CPULIB): $(CPU_SRCS) $(SUBMOD)/CMakeLists.txt | $(BUILD)
 	cmake -S $(SUBMOD) -B $(BUILD)/cpp -DMMFREE_SIMD=$(MMFREE_SIMD) -DCMAKE_BUILD_TYPE=Release >/dev/null
 	cmake --build $(BUILD)/cpp --target mmfreecpu -j
 	cp $(BUILD)/cpp/libmmfreecpu.a $@

@@ -192,7 +192,15 @@ stage_shared() {
     cp "$SCRIPT_DIR/transfer.mk"        "$BUNDLE_ROOT/Makefile"
     cp "$SCRIPT_DIR/deploy_kria.sh"     "$BUNDLE_ROOT/deploy_kria.sh"
     cp "$SCRIPT_DIR/power_bench.sh"     "$BUNDLE_ROOT/power_bench.sh"
-    chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh"
+    cp "$SCRIPT_DIR/bench_batch.sh"     "$BUNDLE_ROOT/bench_batch.sh"
+    cp "$SCRIPT_DIR/sweep_all.sh"       "$BUNDLE_ROOT/sweep_all.sh"
+    cp "$SCRIPT_DIR/split_sweep_csv.py" "$BUNDLE_ROOT/split_sweep_csv.py"
+    cp "$SCRIPT_DIR/sweep_split_ab.sh"   "$BUNDLE_ROOT/sweep_split_ab.sh"
+    cp "$SCRIPT_DIR/sweep_split_k.sh"    "$BUNDLE_ROOT/sweep_split_k.sh"
+    chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh" \
+             "$BUNDLE_ROOT/bench_batch.sh" "$BUNDLE_ROOT/sweep_all.sh" \
+             "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/sweep_split_ab.sh" \
+             "$BUNDLE_ROOT/sweep_split_k.sh"
     cp "$SCRIPT_DIR/board.conf.example" "$BUNDLE_ROOT/board.conf.example" 2>/dev/null || true
 
     # u-dma-buf driver source (vendored submodule), so the board needs no external module.

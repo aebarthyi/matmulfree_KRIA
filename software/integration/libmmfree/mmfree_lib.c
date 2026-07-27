@@ -290,14 +290,20 @@ int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t 
  * call blocked that. Bit-identical to mmfree_expand_acc for accWidth<=32 (the left shift
  * discards the same high garbage the mask did; the arithmetic >> sign-extends). The
  * volatile fallback covers non-cached / wider-than-32-bit lane mappings. */
-static void readback_rows(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint32_t b) {
+/* General form: expand `pr`'s b rows into `acc`, whose rows are `acc_stride` wide, placing
+ * this projection's columns at `col0`. The un-split case is (acc_stride=pr->M, col0=0); a
+ * column-tile chunk passes the FULL projection's M as the stride and its own first column,
+ * so chunks scatter straight into the caller's single [b][M] accumulator with no
+ * reassembly step. */
+static void readback_rows_at(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint32_t b,
+                             uint32_t acc_stride, uint32_t col0) {
     const mmfree_geom_t *g = &h->ctx.geom;
     if (h->out.cached && g->outLaneBytes == 4 && g->accWidth <= 32) {
         const uint32_t sh = 32u - g->accWidth;
         const uint32_t *ob = (const uint32_t *)h->out.vaddr;
         for (uint32_t i = 0; i < b; i++) {
             const uint32_t *row = ob + (size_t)i * pr->n_outputs;
-            int32_t *ar = acc + (size_t)i * pr->M;
+            int32_t *ar = acc + (size_t)i * acc_stride + col0;
             for (uint32_t m = 0; m < pr->M; m++)
                 ar[m] = (int32_t)(row[m] << sh) >> sh;
         }
@@ -306,9 +312,14 @@ static void readback_rows(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint3
     const volatile uint32_t *ob = (const volatile uint32_t *)h->out.vaddr;
     for (uint32_t i = 0; i < b; i++) {
         const volatile uint32_t *row = ob + (size_t)i * pr->n_outputs;
+        int32_t *ar = acc + (size_t)i * acc_stride + col0;
         for (uint32_t m = 0; m < pr->M; m++)
-            acc[(size_t)i * pr->M + m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
+            ar[m] = (int32_t)mmfree_expand_acc(row[m], g->accWidth);
     }
+}
+
+static void readback_rows(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint32_t b) {
+    readback_rows_at(h, pr, acc, b, pr->M, 0u);
 }
 
 static void pack_act_port0(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
@@ -400,6 +411,218 @@ int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
     return mmfree_bitlinear_batch(h, proj_id, x, acc, 1u);
 }
 
+/* ---- column-tile splitting -------------------------------------------------
+ * A projection's weight blob is COL-TILE-MAJOR: per port, the byte at
+ * (t*N + n)*portBytes carries the lanes of output columns [t*olt, (t+1)*olt) for
+ * inner position n (see mmfree_pack's pack_projection). So a contiguous range of
+ * output column tiles is a contiguous byte range, and a "chunk" is just this
+ * projection with a shifted byte_offset and a smaller M — no re-packing, no new
+ * blob, no manifest change.
+ *
+ * Why bother: every chunk reads the SAME activations, so one pack + one LOAD_ACT
+ * serves them all (the RTL keeps actBram across COMPUTEs — CoreSpec "split:
+ * per-column-tile-chunk COMPUTEs on one LOAD == the whole projection"). That turns a
+ * single serialized projection into a self-pipeline: chunk j-1's readback runs on the
+ * CPU while the engine computes chunk j. readback is ~28% of engine time on the big
+ * projections and was pure dead time before.
+ *
+ * Chunk boundaries are constrained by the blob encoding, NOT chosen freely:
+ *  - 2-bit: offset = t*N*portBytes. Always exact and beat-aligned. Any boundary works.
+ *  - 1.6-bit: trits pack 5/byte over the flat [t][n][lane] stream, so tile t starts at
+ *    trit t*N*olt -> byte t*N*olt/5. That is only a valid DMA start when it divides
+ *    exactly AND lands on a wire beat (then per-port offset = flat/numPorts, since
+ *    port 0 holds the beat LSBs). e.g. N=2560 gives 131072 B/tile — any boundary is
+ *    fine; N=6912 only allows boundaries at multiples of 5 tiles. chunk_offset()
+ *    returns <0 for an illegal boundary and the caller drops to fewer chunks.
+ */
+/* Defined with the seq primitives below (the split driver reuses them verbatim). */
+static int compute_issue_pr(mmfree_lib_t *h, const proj_t *pr, uint32_t b);
+static int store_issue_pr(mmfree_lib_t *h, const proj_t *pr, uint32_t b);
+static int store_wait_pr(mmfree_lib_t *h, const proj_t *pr, uint32_t b, uint64_t *sync_ns);
+
+static int chunk_offset(const mmfree_geom_t *g, uint32_t N, uint32_t t, uint64_t *out) {
+    if (!g->packed) {
+        *out = (uint64_t)t * N * g->portBytes;
+        return 0;
+    }
+    uint64_t trits = (uint64_t)t * N * g->outLanesPerTile;
+    if (trits % 5u) return -1;                       /* not a whole byte boundary */
+    uint64_t flat = trits / 5u;
+    if (flat % g->sAxisBytes) return -1;             /* not a wire-beat boundary */
+    *out = flat / g->numPorts;
+    return 0;
+}
+
+/* Build the proj_t view of tiles [t0, t0+tiles) of `pr`. M is clamped to the real
+ * column count so the LAST chunk of a non-tile-aligned projection asks the engine for
+ * exactly the columns that exist; n_outputs stays tile-rounded (what the engine drains). */
+static int chunk_view(const mmfree_geom_t *g, const proj_t *pr,
+                      uint32_t t0, uint32_t tiles, proj_t *out) {
+    const uint32_t olt = g->outLanesPerTile;
+    uint64_t off;
+    if (chunk_offset(g, pr->N, t0, &off) < 0) return -1;
+    uint32_t first = t0 * olt;
+    uint32_t span = tiles * olt;
+    out->byte_offset = pr->byte_offset + off;
+    out->N = pr->N;
+    out->M = (first + span <= pr->M) ? span : (pr->M - first);
+    out->n_outputs = span;
+    return 0;
+}
+
+/* Largest k <= want for which EVERY even boundary of an k-way split is legal. Halving
+ * (rather than decrementing) keeps the boundaries a subset of the previous attempt's, so
+ * a projection that only permits coarse boundaries still gets the coarse split instead of
+ * failing outright. Returns 1 when no split is possible. */
+static uint32_t pick_chunks(const mmfree_geom_t *g, const proj_t *pr, uint32_t want) {
+    uint32_t tiles = (pr->M + g->outLanesPerTile - 1) / g->outLanesPerTile;
+    for (uint32_t k = want; k > 1; k /= 2u) {
+        if (tiles / k == 0) continue;               /* fewer tiles than chunks */
+        uint32_t per = tiles / k, ok = 1;
+        for (uint32_t j = 1; j < k && ok; j++) {
+            uint64_t dummy;
+            if (chunk_offset(g, pr->N, j * per, &dummy) < 0) ok = 0;
+        }
+        if (ok) return k;
+    }
+    return 1u;
+}
+
+/* Chunk boundary walk shared by the split driver and mmfree_split_plan, so the plan you can
+ * inspect is by construction the plan that runs. */
+static uint32_t chunk_bounds(uint32_t tiles, uint32_t k, uint32_t j, uint32_t *ct0) {
+    uint32_t per = tiles / k;
+    *ct0 = j * per;
+    return (j + 1 == k) ? (tiles - *ct0) : per;   /* last chunk absorbs the remainder */
+}
+
+int mmfree_split_plan(const mmfree_lib_t *h, int proj_id, uint32_t want_chunks,
+                      mmfree_split_chunk_t *out, uint32_t max) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj || !out || max == 0) return -EINVAL;
+    const proj_t *pr = &h->projs[proj_id];
+    const mmfree_geom_t *g = &h->ctx.geom;
+    const uint32_t olt = g->outLanesPerTile;
+    const uint32_t tiles = (pr->M + olt - 1) / olt;
+    const uint32_t k = (want_chunks < 2u) ? 1u : pick_chunks(g, pr, want_chunks);
+
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < k && n < max; j++) {
+        uint32_t ct0, ctiles = chunk_bounds(tiles, k, j, &ct0);
+        proj_t cv;
+        if (chunk_view(g, pr, ct0, ctiles, &cv) < 0) return -EINVAL;
+        out[n].first_tile  = ct0;
+        out[n].tiles       = ctiles;
+        out[n].first_col   = ct0 * olt;
+        out[n].M           = cv.M;
+        out[n].byte_offset = cv.byte_offset;
+        out[n].blob_bytes  = mmfree_wt_port_bytes(g, cv.N, cv.M);
+        n++;
+    }
+    return (int)n;
+}
+
+int mmfree_bitlinear_batch_split(mmfree_lib_t *h, int proj_id, const int16_t *x,
+                                 int32_t *acc, uint32_t b, uint32_t want_chunks) {
+    return mmfree_bitlinear_batch_split_cb(h, proj_id, x, acc, b, want_chunks, NULL, NULL);
+}
+
+int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int16_t *x,
+                                int32_t *acc, uint32_t b, uint32_t want_chunks,
+                                mmfree_chunk_cb_t cb, void *cb_ctx) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj || !x || !acc) return -EINVAL;
+    const proj_t *pr = &h->projs[proj_id];
+    const mmfree_geom_t *g = &h->ctx.geom;
+    if (b == 0 || b > g->batch) return -EINVAL;
+
+    const uint32_t olt = g->outLanesPerTile;
+    const uint32_t tiles = (pr->M + olt - 1) / olt;
+    const uint32_t k = (want_chunks < 2u) ? 1u : pick_chunks(g, pr, want_chunks);
+    /* Nothing to overlap with a single chunk — take the plain blocking path, which also
+     * keeps the phase stats meaningful for the un-split case. The callback still fires (over
+     * the whole column range) so the caller's work happens exactly once either way; it just
+     * cannot be hidden here. */
+    if (k < 2u) {
+        int rc = mmfree_bitlinear_batch(h, proj_id, x, acc, b);
+        if (rc == 0 && cb) cb(cb_ctx, 0u, pr->M);
+        return rc;
+    }
+
+    uint64_t t0 = now_ns();
+    /* ONE pack + ONE LOAD for every chunk: they all read the same activations. */
+    pack_act_port0(h, x, pr->N, b);
+    uint64_t tps = now_ns();
+    mmfree_buf_sync_for_device(&h->act[0], (size_t)pr->N * g->portBytes);
+    uint64_t t1 = now_ns();
+    if (mmfree_load(&h->ctx, h->act, pr->N) < 0) return -EIO;
+    uint64_t t2 = now_ns();
+
+    uint64_t compute_ns = 0, store_ns = 0, readback_ns = 0, out_sync_ns = 0, hidden_ns = 0;
+    proj_t cur, prev;
+    uint32_t prev_first = 0, prev_cols = 0;
+    int have_prev = 0;
+
+    for (uint32_t j = 0; j < k; j++) {
+        uint32_t ct0, ctiles = chunk_bounds(tiles, k, j, &ct0);
+        if (chunk_view(g, pr, ct0, ctiles, &cur) < 0) return -EINVAL;
+
+        /* The COMPUTE window is issue -> wait-done. It is charged to compute_ns WHOLE, even
+         * though the readback below runs inside it: that is the wall time spent waiting on
+         * the engine, and it correctly absorbs the overrun when a readback outlasts the
+         * COMPUTE it was meant to hide under. The hidden readback is therefore NOT added to
+         * readback_ns (it costs nothing) — it goes to hidden_ns for tuning. This keeps
+         * pack+load+compute+store+readback == wall time on both paths, so the split and
+         * un-split phase tables stay directly comparable. */
+        uint64_t c0 = now_ns();
+        if (compute_issue_pr(h, &cur, b) < 0) return -EIO;
+
+        /* --- CPU work hidden under this chunk's COMPUTE ---
+         * Sign-expand the PREVIOUS chunk. OUT still holds its STORE (we have not issued
+         * this chunk's STORE yet), and COMPUTE never touches OUT — the same invariant
+         * matmul_seq relies on. This is the whole point of the split. */
+        if (have_prev) {
+            uint64_t r0 = now_ns();
+            readback_rows_at(h, &prev, acc, b, pr->M, prev_first);
+            /* ...and whatever else the caller can do with just those columns. Both are
+             * charged to hidden_ns: they cost no wall time unless they outlast the COMPUTE,
+             * in which case the window itself stretches and compute_ns picks up the excess. */
+            if (cb) cb(cb_ctx, prev_first, prev_cols);
+            hidden_ns += now_ns() - r0;
+        }
+        /* -------------------------------------------------- */
+
+        if (mmfree_seq_compute_wait(h) < 0) return -EIO;
+        compute_ns += now_ns() - c0;
+
+        uint64_t s0 = now_ns();
+        if (store_issue_pr(h, &cur, b) < 0) return -EIO;
+        if (store_wait_pr(h, &cur, b, &out_sync_ns) < 0) return -EIO;
+        store_ns += now_ns() - s0;
+
+        prev = cur;
+        prev_first = ct0 * olt;
+        prev_cols = cur.M;
+        have_prev = 1;
+    }
+    /* Last chunk: no COMPUTE left to hide its readback under, so this one IS paid for. */
+    uint64_t r0 = now_ns();
+    readback_rows_at(h, &prev, acc, b, pr->M, prev_first);
+    if (cb) cb(cb_ctx, prev_first, prev_cols);
+    readback_ns += now_ns() - r0;
+
+    /* Count the projection as ONE call so us/call stays comparable to the un-split path;
+     * the chunking shows up as compute/readback moving, not as inflated call counts. */
+    h->stats.calls++;
+    h->stats.pack_ns     += t1 - t0;
+    h->stats.act_sync_ns += t1 - tps;
+    h->stats.load_ns     += t2 - t1;
+    h->stats.compute_ns  += compute_ns;
+    h->stats.store_ns    += store_ns;
+    h->stats.out_sync_ns += out_sync_ns;
+    h->stats.readback_ns += readback_ns;
+    h->stats.readback_hidden_ns += hidden_ns;
+    return 0;
+}
+
 /* ---- pipelined cluster primitives ------------------------------------------
  * mmfree_bitlinear_batch split into non-blocking issue + blocking wait so the
  * caller (FpgaBackend::matmul_seq) can run CPU work — quant+pack the NEXT
@@ -425,11 +648,11 @@ int mmfree_seq_load(mmfree_lib_t *h, uint32_t N) {
     return 0;
 }
 
-int mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
-    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
-    const proj_t *pr = &h->projs[proj_id];
+/* COMPUTE issue for an explicit projection view — the chunk-aware core of
+ * mmfree_seq_compute_issue. A chunk is just a proj_t with a shifted byte_offset and a
+ * smaller M (see chunk_view), so it needs no separate code path. */
+static int compute_issue_pr(mmfree_lib_t *h, const proj_t *pr, uint32_t b) {
     const mmfree_geom_t *g = &h->ctx.geom;
-    if (b == 0 || b > g->batch) return -EINVAL;
     /* Per-port weight DMA length (batch-count-independent; honors packed). */
     uint32_t bytes = mmfree_wt_port_bytes(g, pr->N, pr->M);
     for (uint32_t i = 0; i < h->ctx.num_dma; i++)
@@ -442,6 +665,13 @@ int mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
     return 0;
 }
 
+int mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
+    const mmfree_geom_t *g = &h->ctx.geom;
+    if (b == 0 || b > g->batch) return -EINVAL;
+    return compute_issue_pr(h, &h->projs[proj_id], b);
+}
+
 int mmfree_seq_compute_wait(mmfree_lib_t *h) {
     if (!h) return -EINVAL;
     uint32_t st = mmfree_wait_done(&h->ctx);
@@ -451,11 +681,8 @@ int mmfree_seq_compute_wait(mmfree_lib_t *h) {
     return 0;
 }
 
-int mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
-    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
-    const proj_t *pr = &h->projs[proj_id];
+static int store_issue_pr(mmfree_lib_t *h, const proj_t *pr, uint32_t b) {
     const mmfree_geom_t *g = &h->ctx.geom;
-    if (b == 0 || b > g->batch) return -EINVAL;
     /* Store only the b rows the drain wrote (rows 0..b-1, row-major). */
     uint32_t total = b * pr->n_outputs;
     uint32_t bytes = total * g->outLaneBytes;
@@ -464,16 +691,30 @@ int mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
     return 0;
 }
 
-int mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id, uint32_t b) {
+int mmfree_seq_store_issue(mmfree_lib_t *h, int proj_id, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
-    const proj_t *pr = &h->projs[proj_id];
+    if (b == 0 || b > h->ctx.geom.batch) return -EINVAL;
+    return store_issue_pr(h, &h->projs[proj_id], b);
+}
+
+/* `sync_ns` (nullable) receives just the cache-invalidate portion, so the split driver can
+ * keep out_sync_ns meaning the same thing it does on the blocking path (the sync alone, a
+ * subset of store) rather than conflating it with the S2MM wait. */
+static int store_wait_pr(mmfree_lib_t *h, const proj_t *pr, uint32_t b, uint64_t *sync_ns) {
     const mmfree_geom_t *g = &h->ctx.geom;
-    if (b == 0 || b > g->batch) return -EINVAL;
     uint32_t st = mmfree_wait_done(&h->ctx);
     if (MMFREE_STATUS_ERR(st) != MMFREE_ERR_NONE) return -EIO;
     if (mmfree_dma_s2mm_wait(h->ctx.dma_regs[0]) < 0) return -EIO;
+    uint64_t s0 = sync_ns ? now_ns() : 0;
     mmfree_buf_sync_for_cpu(&h->out, (size_t)b * pr->n_outputs * g->outLaneBytes);
+    if (sync_ns) *sync_ns += now_ns() - s0;
     return 0;
+}
+
+int mmfree_seq_store_wait(mmfree_lib_t *h, int proj_id, uint32_t b) {
+    if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj) return -EINVAL;
+    if (b == 0 || b > h->ctx.geom.batch) return -EINVAL;
+    return store_wait_pr(h, &h->projs[proj_id], b, NULL);
 }
 
 void mmfree_seq_readback(mmfree_lib_t *h, int proj_id, int32_t *acc, uint32_t b) {
