@@ -73,7 +73,11 @@ RUNNER="$REPO_ROOT/software/integration/fpga_runner/build/mmfree-cli-fpga"
 # silently, with nothing in the CSV to show for it. So: if the host advertises avx512f and
 # the binary contains no zmm register use, refuse.
 if grep -qw avx512f /proc/cpuinfo; then
-    if ! objdump -d "$RUNNER" 2>/dev/null | grep -q zmm; then
+    # grep -c, NOT grep -q: -q exits on the first match, which SIGPIPEs objdump, and under
+    # `set -o pipefail` the pipeline then reports objdump's 141 rather than grep's success —
+    # so the check fired on a binary that DID contain zmm. -c consumes the whole stream.
+    zmm=$(objdump -d "$RUNNER" 2>/dev/null | grep -c zmm || true)
+    if [ "${zmm:-0}" -eq 0 ]; then
         cat >&2 <<EOF
 ERROR: this host supports AVX-512 but $RUNNER
        was built without it (no zmm instructions found). That understates the Xeon
@@ -86,7 +90,7 @@ Set ALLOW_NARROW_SIMD=1 to override, but then this is NOT the final data set.
 EOF
         [ "${ALLOW_NARROW_SIMD:-0}" = "1" ] || exit 1
     fi
-    echo "# SIMD: AVX-512 build confirmed (zmm present)"
+    echo "# SIMD: AVX-512 build confirmed ($zmm zmm instructions)"
 fi
 
 echo "############################################################"
