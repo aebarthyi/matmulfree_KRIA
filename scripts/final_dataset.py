@@ -85,22 +85,57 @@ def read_board(board_root):
     return recs
 
 
+def xeon_fmt(bits):
+    """bench_host_cpu.sh records the encoding as bits/weight, not a name."""
+    try:
+        b = float(bits)
+    except (TypeError, ValueError):
+        return '?'
+    if abs(b - 8.0) < 0.01:
+        return 'int8'
+    if abs(b - 2.0) < 0.01:
+        return '2bit'
+    if abs(b - 1.625) < 0.01:
+        return '1p6'
+    return f'{b:g}b'
+
+
 def read_xeon(xeon_root):
+    """Raw per-pass CSVs from bench_host_cpu.sh.
+
+    NOTE the schema here is the runner's own, NOT the derived one in xeon_best.csv (which
+    was post-processed and carries friendly model/weight_fmt/total_w columns). Reading the
+    raw file directly is deliberate: it is what the sweep actually writes, so the final
+    data set does not depend on an undocumented hand transformation.
+
+    watts = timed_pkg_w + timed_dram_w — package plus DRAM over the TIMED window, which is
+    what the runner's own tok_per_joule uses and the closest analogue to the KRIA's SOM rail
+    figure (both include the platform's idle draw). idle_*_w is in the raw file if a
+    net-of-idle variant is ever wanted, but subtracting idle on one side only is not a
+    like-for-like comparison.
+    """
     recs = []
     for f in sorted(glob.glob(os.path.join(xeon_root, 't*_p*', 'host_cpu_sweep.csv'))):
         tag = os.path.basename(os.path.dirname(f))
         mt = re.match(r'^t(\d+)_p(\d+)$', tag)
         if not mt:
             continue
-        th, pas = mt.group(1), mt.group(2)
+        pas = mt.group(2)
         for r in csv.DictReader(open(f)):
-            w = r.get('total_w') or ''
+            # model arrives as the blob path: .../ridger/MMfreeLM-1.3B/model.mmfree
+            mdl = model_from_preset(os.path.basename(os.path.dirname(r['model'])))
+            pkg, dram = r.get('timed_pkg_w', ''), r.get('timed_dram_w', '')
+            watts = (float(pkg) + float(dram)) if pkg not in ('', 'None') else None
             recs.append(dict(
-                platform='xeon', arm='cpu', model=r['model'], weight_fmt=r['weight_fmt'],
-                batch=int(r['batch']), threads=th, pass_id=pas,
+                platform='xeon', arm='cpu', model=mdl,
+                weight_fmt=xeon_fmt(r.get('cpu_wt_bits')),
+                batch=int(r['batch']),
+                # the row's own thread count, not the directory's — they agree, but the row
+                # is the authority and this survives a re-run with a different THREAD_SET
+                threads=r.get('omp_threads') or mt.group(1),
+                pass_id=pas,
                 decode=float(r['decode_tok_s']),
-                watts=float(w) if w not in ('', 'None') else None,
-                streams_ok='', preset=''))
+                watts=watts, streams_ok='', preset=r.get('host_cpu', '')))
     return recs
 
 

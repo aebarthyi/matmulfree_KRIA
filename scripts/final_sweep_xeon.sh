@@ -65,6 +65,30 @@ fi
 RUNNER="$REPO_ROOT/software/integration/fpga_runner/build/mmfree-cli-fpga"
 [ -x "$RUNNER" ] || { echo "ERROR: build the runner first: make -C software/integration/fpga_runner" >&2; exit 1; }
 
+# ── The binary must use the widest SIMD this host has ───────────────────────────────
+# The runner's Makefile defaults x86 to MMFREE_SIMD=X86 (-mavx2), and that default is right
+# for a portable build but WRONG for a baseline measurement on an AVX-512 part: measured on
+# this W-2155, 370M 2-bit b=6 reads 159 tok/s built AVX2 against 206 built AVX-512, a 29%
+# handicap. Quoting an FPGA speedup against a hobbled Xeon would overstate it by that much,
+# silently, with nothing in the CSV to show for it. So: if the host advertises avx512f and
+# the binary contains no zmm register use, refuse.
+if grep -qw avx512f /proc/cpuinfo; then
+    if ! objdump -d "$RUNNER" 2>/dev/null | grep -q zmm; then
+        cat >&2 <<EOF
+ERROR: this host supports AVX-512 but $RUNNER
+       was built without it (no zmm instructions found). That understates the Xeon
+       baseline by ~29% and would inflate every FPGA-vs-Xeon comparison drawn from it.
+
+  make -C software/integration/fpga_runner clean
+  MMFREE_SIMD=X86_512 make -C software/integration/fpga_runner
+
+Set ALLOW_NARROW_SIMD=1 to override, but then this is NOT the final data set.
+EOF
+        [ "${ALLOW_NARROW_SIMD:-0}" = "1" ] || exit 1
+    fi
+    echo "# SIMD: AVX-512 build confirmed (zmm present)"
+fi
+
 echo "############################################################"
 echo "# Xeon final sweep: $PASSES passes x {$THREAD_SET} threads"
 echo "#   models   : $MODELS"
