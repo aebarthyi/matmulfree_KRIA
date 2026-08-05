@@ -21,6 +21,10 @@ all gates PASS (engine bit-identical to the CPU reference), all `streams_ok=1`.
 
 \* 1.3B runs the 2.7B bitstream, so the 2.7B WNS is its timing record.
 
+Reproducibility: `mmfree_1_3b` was re-measured in a separate session on 2026-08-05 and
+came back 49.45 / 52.22 / 54.75 at b=4/5/6 — within ~1.2% of the row above. Treat ±1–2% as
+the session-to-session band and do not read a delta smaller than that as a result.
+
 Use **b=4 or b=6, never b=5** — the host's vector ops are `omp schedule(static)` over the
 batch on 4 A53 cores, so they cost `ceil(b/4)` waves and b=5 pays b=6's price for 5 streams.
 
@@ -51,7 +55,7 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
 | lever | gain | notes |
 |---|---|---|
 | B4 → B6 | +11.8% | the big one. B8 is a ~95% LUT capacity wall even with DSP accum |
-| 2-bit → 1.6-bit packing | +4.3% at 2.7B | grows with model size, shrinks with batch |
+| 2-bit → 1.6-bit packing | +4.3% at 2.7B | grows with model size, decays with batch — only ~+1.4% at 1.3B b=6 |
 | column-tile split (k=4) | +4.4% at b=4 | hides readback under COMPUTE; the ladder is already optimal |
 | 200 → 250 MHz | ~+5% | **the least valuable axis** — decode is weight-bandwidth-bound |
 
@@ -59,17 +63,7 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
 
 ## 2. Open
 
-1. **`mmfree_1_3b` at b=6 in the 2-bit ablation arm read 47.57 tok/s**, below its own b=5
-   (50.62) and far below the packed arm (55.43). Not noise — the three reps were
-   47.61/47.49/47.61. Every engine phase scales normally; the whole deficit is host-side
-   `pack` (`bl_pack_us_call` 204.8 vs a trend of ~137 and the packed sibling's 127.2), which
-   is a pure activation scatter with no dependence on weight format. Candidates are a
-   per-invocation mmap lottery or CMA placement changing the cache/bank aliasing of the b
-   read streams. `transfer/rerun_1p3b_b6.sh` is the four-pass experiment that separates them.
-   **This affects an exploration-branch arm, not a shipped preset** — the packed 1.3B number
-   in the table above is clean.
-
-2. **STORE ‖ COMPUTE (RTL), ~+5%.** `m_axis` is a separate physical port from `s_axis`, so
+1. **STORE ‖ COMPUTE (RTL), ~+5%.** `m_axis` is a separate physical port from `s_axis`, so
    STORE and COMPUTE can overlap; the only conflict is `outBram` (STORE reads while the
    drain writes), which needs double buffering. Resource-feasible — URAM would go ~25% → 50%
    and it adds no DSP, which is the tight resource. This is the largest remaining item and
@@ -80,13 +74,13 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
    queue on its own (the Core FSM runs one op to completion regardless, and the CPU programs
    the DMA anyway — that needs scatter-gather, not a queue).
 
-3. **~217 ms/run of unexplained per-chunk cost** at k=4. The balance sheet closes overall,
+2. **~217 ms/run of unexplained per-chunk cost** at k=4. The balance sheet closes overall,
    but after accounting store (+171 ms) and pack (+5 ms) there is a residual charged to
    compute. Hypothesis is weight-DMA ramp-up — k separate MM2S transfers instead of one long
    one. Unmeasured; instrumenting DMA start → first-beat latency would confirm or kill it,
    and it decides whether item 2 is worth more than the +5% estimate.
 
-4. **Host `pack` is now the top software cost** at 1.1–1.2 s/run at b=6 on the large models,
+3. **Host `pack` is now the top software cost** at 1.1–1.2 s/run at b=6 on the large models,
    larger than STORE and readback combined. It is a strided int16 scatter into udmabuf-act;
    nothing has tried to vectorize or block it.
 
@@ -103,6 +97,16 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
   250 MHz rows was lost on 2026-08-04.
 - **Only compare POWER=1 against POWER=1** — rail sampling costs ~2% decode and has already
   manufactured one phantom regression.
+- **A single (arm, batch) cell can go bad without anything else in the row moving, and it
+  is repeatable across reps within that run.** On 2026-08-04 the 1.3B 2-bit b=6 cell read
+  47.57 tok/s across 3/3 reps (spread 0.12), non-monotonic against its own b=5. A four-pass
+  re-run — two invocations under one overlay load, one after a fresh load, plus the packed
+  sibling as an in-session control — put it at 53.48–54.56 over 9 reps and the host `pack`
+  cost back in family (123–132 µs/call vs the bad run's 204.8, trend ~127). So rep-to-rep
+  agreement is NOT evidence a number is real; a fresh process and a fresh overlay load are.
+  When one cell is out of family, diff the `bl_*_us_call` columns against a sibling arm
+  before believing the headline — the phase that moves tells you whether it is even the
+  engine. Here it never was.
 - **`plClkMhz` must be a PL0_REF rung** (100/143/167/200/250/300). Off-rung values used to
   snap down silently, so a "230 MHz" build was really 200 and its recorded Fmax was slack
   against the wrong period. `CoreConfig` now rejects them at build time.
