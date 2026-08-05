@@ -31,31 +31,19 @@ static std::uint32_t split_chunks(std::size_t M) {
 }
 
 void FpgaBackend::matmul(int proj_id, const std::int32_t* x, std::int32_t* acc,
-                         const std::int8_t* /*wq*/, std::size_t N, std::size_t M) {
-  for (std::size_t n = 0; n < N; ++n) {
-    std::int32_t v = x[n];
-    if (v > 32767) v = 32767;
-    else if (v < -32768) v = -32768;
-    x16_[n] = static_cast<std::int16_t>(v);
-  }
-  if (mmfree_bitlinear(h_, proj_id, x16_.data(), acc) < 0)
+                         const std::int8_t* /*wq*/, std::size_t /*N*/, std::size_t /*M*/) {
+  // N/M come from the projection registered with libmmfree, not from the caller.
+  if (mmfree_bitlinear(h_, proj_id, x, acc) < 0)
     throw std::runtime_error("mmfree_bitlinear failed for proj_id " + std::to_string(proj_id));
-  (void)M;
 }
 
 void FpgaBackend::matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
-                               const std::int8_t* /*wq*/, std::size_t N, std::size_t M,
+                               const std::int8_t* /*wq*/, std::size_t /*N*/, std::size_t M,
                                std::size_t b) {
-  // Narrow b*N int32 -> int16 (already saturated by the FixedQ510 quant; clamp
-  // defensively), row-major, then ONE weight-broadcast engine call for all b rows.
-  for (std::size_t i = 0; i < b; ++i)
-    for (std::size_t n = 0; n < N; ++n) {
-      std::int32_t v = x[i * N + n];
-      if (v > 32767) v = 32767;
-      else if (v < -32768) v = -32768;
-      x16_[i * N + n] = static_cast<std::int16_t>(v);
-    }
-  if (mmfree_bitlinear_batch_split(h_, proj_id, x16_.data(), acc,
+  // ONE weight-broadcast engine call for all b rows. The int32 -> int16 narrow used to
+  // happen here, in its own pass over b*N; libmmfree now saturates during the pack, so
+  // the activations are touched once instead of twice.
+  if (mmfree_bitlinear_batch_split(h_, proj_id, x, acc,
                                    static_cast<std::uint32_t>(b), split_chunks(M)) < 0)
     throw std::runtime_error("mmfree_bitlinear_batch failed for proj_id " +
                              std::to_string(proj_id));
@@ -68,16 +56,9 @@ static void chunk_trampoline(void* ctx, std::uint32_t col0, std::uint32_t ncols)
 
 void FpgaBackend::matmul_batch_chunked(
     int proj_id, const std::int32_t* x, std::int32_t* acc, const std::int8_t* /*wq*/,
-    std::size_t N, std::size_t M, std::size_t b,
+    std::size_t /*N*/, std::size_t M, std::size_t b,
     const std::function<void(std::size_t, std::size_t)>& on_cols) {
-  for (std::size_t i = 0; i < b; ++i)
-    for (std::size_t n = 0; n < N; ++n) {
-      std::int32_t v = x[i * N + n];
-      if (v > 32767) v = 32767;
-      else if (v < -32768) v = -32768;
-      x16_[i * N + n] = static_cast<std::int16_t>(v);
-    }
-  if (mmfree_bitlinear_batch_split_cb(h_, proj_id, x16_.data(), acc,
+  if (mmfree_bitlinear_batch_split_cb(h_, proj_id, x, acc,
                                       static_cast<std::uint32_t>(b), split_chunks(M),
                                       on_cols ? chunk_trampoline : nullptr,
                                       const_cast<std::function<void(std::size_t, std::size_t)>*>(
@@ -101,24 +82,18 @@ void FpgaBackend::matmul_seq(const int* proj_ids, const std::int8_t* const* wqs,
 
   if (xq_.size() < b * N)  xq_.resize(b * N);
   if (acc_.size() < b * M) acc_.resize(b * M);
-  const std::size_t bN = b * N;
 
-  // produce projection j -> int32 xq_, narrow to int16 x16_, scatter into the
-  // (single) ACT region. Caller guarantees ACT is free (prior LOAD drained it).
-  auto quant_narrow_pack = [&](int j) {
+  // produce projection j -> int32 xq_, then scatter it straight into the (single) ACT
+  // region; mmfree_seq_pack saturates to int16 as it transposes, so there is no separate
+  // narrowing pass. Caller guarantees ACT is free (prior LOAD drained it).
+  auto quant_pack = [&](int j) {
     produce(j, xq_.data());
-    for (std::size_t i = 0; i < bN; ++i) {
-      std::int32_t v = xq_[i];
-      if (v > 32767) v = 32767;
-      else if (v < -32768) v = -32768;
-      x16_[i] = static_cast<std::int16_t>(v);
-    }
-    if (mmfree_seq_pack(h_, x16_.data(), static_cast<std::uint32_t>(N),
+    if (mmfree_seq_pack(h_, xq_.data(), static_cast<std::uint32_t>(N),
                         static_cast<std::uint32_t>(b)) < 0)
       throw std::runtime_error("mmfree_seq_pack failed");
   };
 
-  quant_narrow_pack(0);
+  quant_pack(0);
   if (mmfree_seq_load(h_, static_cast<std::uint32_t>(N)) < 0)
     throw std::runtime_error("mmfree_seq_load failed");
 
@@ -134,7 +109,7 @@ void FpgaBackend::matmul_seq(const int* proj_ids, const std::int8_t* const* wqs,
       consume(n - 1, acc_.data());
     }
     // RMSNorm+quant+pack the NEXT projection into ACT (free since LOAD(n) drained it).
-    if (n + 1 < k) quant_narrow_pack(n + 1);
+    if (n + 1 < k) quant_pack(n + 1);
     // ----------------------------------------
 
     if (mmfree_seq_compute_wait(h_) < 0)
