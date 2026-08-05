@@ -35,9 +35,14 @@ RAPL package+DRAM), at b=6:
 
 | model | KRIA tok/s | KRIA W | KRIA tok/J | Xeon tok/s | Xeon W | Xeon tok/J | advantage |
 |---|---|---|---|---|---|---|---|
-| 370M | 102.63 | 5.37 | 19.1 | 209.11 | 95.7 | 2.19 | **8.8x** |
-| 1.3B | 55.43 | 5.96 | 9.30 | 97.69 | 112.0 | 0.872 | **10.7x** |
-| 2.7B | 34.41 | 6.14 | 5.61 | 49.05 | 115.5 | 0.425 | **13.2x** |
+| 370M | 102.63 | 5.37 | 19.1 | 209.11 | 98.76 | 2.12 | **9.0x** |
+| 1.3B | 55.43 | 5.96 | 9.30 | 97.69 | 111.97 | 0.872 | **10.7x** |
+| 2.7B | 34.41 | 6.14 | 5.60 | 49.05 | 115.52 | 0.425 | **13.2x** |
+
+Xeon rows are the b=6 best of `xeon_best.csv` (all three land on 2-bit, 10 threads) and use
+its `total_w`, which is the column comparable to the KRIA's SOM rail figure — both include
+idle. Using its `net_w` instead (idle subtracted on the Xeon side only) would read 7.8x /
+9.4x / 11.7x, which is not a like-for-like comparison; pick one and say which.
 
 The Xeon wins raw throughput by 1.4–2.0x; the KRIA wins energy by 8.8–13.2x, and **the
 energy advantage grows with model size while the throughput deficit shrinks.** The board
