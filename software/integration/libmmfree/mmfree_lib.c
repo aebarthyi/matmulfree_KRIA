@@ -322,49 +322,7 @@ static void readback_rows(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint3
     readback_rows_at(h, pr, acc, b, pr->M, 0u);
 }
 
-/* Saturate a producer's int32 activation to the int16 the engine's LOAD beat carries.
- * The FixedQ510 quantizer already produces in-range values; this is the defensive clamp
- * that used to live in the caller (fpga_backend), moved here so the narrow happens during
- * the scatter instead of in a separate pass over b*N. Clamps to int16 regardless of
- * aWidth, which is what the caller did — the generic path below then truncates to abytes,
- * exactly as before. */
-static inline int16_t sat16(int32_t v) {
-    if (v > 32767)  return (int16_t)32767;
-    if (v < -32768) return (int16_t)(-32768);
-    return (int16_t)v;
-}
-
-/* Transpose b*N row-major int32 activations into the engine's int16 LOAD beat layout:
- * beat n occupies `stride` int16 slots and carries the b values for inner index n, one
- * slot per PE row, with slots [b, stride) zeroed.
- *
- * Zeroing the unused PE-row slots is NOT for correctness — the engine reads only lanes
- * 0..b-1 (cmpBatch), which is why leaving them stale worked. It is so each beat is written
- * WHOLE: at b=6 of stride 8 we wrote 12 of every 16 bytes, i.e. 48 of each 64-byte line,
- * and a partially-written line has to be fetched before it can be merged. Writing all the
- * slots turns the buffer into a contiguous full-line store stream, and sync_for_device was
- * flushing the padding either way. mmfree_pack_act_beat_batch (the generic path) has always
- * zeroed its tail; this brings the fast path in line with it.
- *
- * Pure / board-free (dst is a plain buffer) — unit-tested in tests/test_pack_act.c. */
-void mmfree_pack_act_rows_i16(int16_t *dst, const int32_t *x,
-                              uint32_t N, uint32_t b, uint32_t stride) {
-    for (uint32_t n = 0; n < N; n++) {
-        int16_t *beat = dst + (size_t)n * stride;
-        for (uint32_t r = 0; r < b; r++)
-            beat[r] = sat16(x[(size_t)r * N + n]);
-        for (uint32_t r = b; r < stride; r++)
-            beat[r] = 0;
-    }
-}
-
-/* Scatter the producer's activations into port 0's LOAD region.
- *
- * Takes int32 straight from the producer. The caller used to narrow b*N int32 -> int16
- * into a scratch buffer and hand that over, which was a whole extra traversal of the array
- * (and one NOT counted in stats.pack_ns, since the timer starts inside the bitlinear call).
- * Folding it in here drops the per-element traffic from 4R+2W then 2R+2W down to 4R+2W. */
-static void pack_act_port0(mmfree_lib_t *h, const int32_t *x, uint32_t N, uint32_t b) {
+static void pack_act_port0(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
     const mmfree_geom_t *g = &h->ctx.geom;
     const uint32_t abytes = g->aWidth / 8u;
     volatile uint8_t *a0 = (volatile uint8_t *)h->act[0].vaddr;
@@ -372,12 +330,18 @@ static void pack_act_port0(mmfree_lib_t *h, const int32_t *x, uint32_t N, uint32
         /* act[0] is a cached normal-memory mapping flushed by an explicit
          * sync_for_device, so plain (non-volatile) stores let the compiler
          * pipeline/unroll the strided int16 scatter. */
-        mmfree_pack_act_rows_i16((int16_t *)h->act[0].vaddr, x, N, b, g->portBytes / 2u);
+        int16_t *a0w = (int16_t *)h->act[0].vaddr;
+        const uint32_t stride = g->portBytes / 2u;   /* int16 slots per beat */
+        for (uint32_t n = 0; n < N; n++) {
+            int16_t *beat = a0w + (size_t)n * stride;
+            for (uint32_t r = 0; r < b; r++)
+                beat[r] = x[(size_t)r * N + n];
+        }
     } else {
         int32_t vals[MMFREE_MAX_DMA * 64];   /* batch <= xDim; ample headroom */
         for (uint32_t n = 0; n < N; n++) {
             for (uint32_t r = 0; r < b; r++)
-                vals[r] = (int32_t)sat16(x[(size_t)r * N + n]);
+                vals[r] = (int32_t)x[(size_t)r * N + n];
             mmfree_pack_act_beat_batch(&a0[(size_t)n * g->portBytes], vals, b,
                                        abytes, g->portBytes);
         }
@@ -385,7 +349,7 @@ static void pack_act_port0(mmfree_lib_t *h, const int32_t *x, uint32_t N, uint32
 }
 
 int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
-                           const int32_t *x, int32_t *acc, uint32_t b) {
+                           const int16_t *x, int32_t *acc, uint32_t b) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj || !x || !acc) return -EINVAL;
     const proj_t *pr = &h->projs[proj_id];
     const mmfree_geom_t *g = &h->ctx.geom;
@@ -443,7 +407,7 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
 }
 
 int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
-                     const int32_t *x, int32_t *acc) {
+                     const int16_t *x, int32_t *acc) {
     return mmfree_bitlinear_batch(h, proj_id, x, acc, 1u);
 }
 
@@ -592,12 +556,12 @@ int mmfree_split_plan(const mmfree_lib_t *h, int proj_id, uint32_t want_chunks,
     return (int)n;
 }
 
-int mmfree_bitlinear_batch_split(mmfree_lib_t *h, int proj_id, const int32_t *x,
+int mmfree_bitlinear_batch_split(mmfree_lib_t *h, int proj_id, const int16_t *x,
                                  int32_t *acc, uint32_t b, uint32_t want_chunks) {
     return mmfree_bitlinear_batch_split_cb(h, proj_id, x, acc, b, want_chunks, NULL, NULL);
 }
 
-int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int32_t *x,
+int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int16_t *x,
                                 int32_t *acc, uint32_t b, uint32_t want_chunks,
                                 mmfree_chunk_cb_t cb, void *cb_ctx) {
     if (!h || proj_id < 0 || (uint32_t)proj_id >= h->nproj || !x || !acc) return -EINVAL;
@@ -706,7 +670,7 @@ int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int32_t 
  * actBram before COMPUTE) and single OUT region (the caller reads OUT back
  * before issuing the next STORE) — no double-buffering needed. */
 
-int mmfree_seq_pack(mmfree_lib_t *h, const int32_t *x, uint32_t N, uint32_t b) {
+int mmfree_seq_pack(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
     if (!h || !x) return -EINVAL;
     const mmfree_geom_t *g = &h->ctx.geom;
     if (b == 0 || b > g->batch) return -EINVAL;

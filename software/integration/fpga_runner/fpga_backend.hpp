@@ -17,15 +17,15 @@ struct mmfree_lib;  // opaque handle (mmfree_lib.h)
 namespace mmfree_fpga {
 
 // Engine backend. `proj_id` (from mmfree_register) addresses the resident weights, so
-// `wq` is ignored. Activations are handed to libmmfree as int32 and saturated to the
-// engine's int16 LOAD slot during the pack, so they are traversed once. NOT thread-safe:
-// one op per call, reusing shared scratch — matches libmmfree's one-in-flight-op contract.
+// `wq` is ignored. Activations are narrowed int32 -> int16 (already saturated to int16
+// range by the FixedQ510 quant; clamped defensively). NOT thread-safe: one op per call,
+// reusing a single narrow buffer — matches libmmfree's one-in-flight-op contract.
 class FpgaBackend final : public mmfree::TernaryBackend {
  public:
   // `batch` = the loaded bitstream's CoreConfig.batchSize (B PE rows). matmul_batch
   // streams the resident weights once and applies them to up to `batch` activation rows.
   FpgaBackend(mmfree_lib* h, std::size_t maxN, std::size_t batch = 1)
-      : h_(h), batch_(batch ? batch : 1) { (void)maxN; }
+      : h_(h), batch_(batch ? batch : 1), x16_(maxN * (batch ? batch : 1)) {}
   std::size_t batch_size() const override { return batch_; }
   void matmul(int proj_id, const std::int32_t* x, std::int32_t* acc, const std::int8_t* wq,
               std::size_t N, std::size_t M) override;
@@ -50,7 +50,8 @@ class FpgaBackend final : public mmfree::TernaryBackend {
  private:
   mmfree_lib* h_;
   std::size_t batch_;
-  std::vector<std::int32_t> xq_;     // b*N produce() scratch, packed straight from here
+  std::vector<std::int16_t> x16_;    // b*N narrowed activations, row-major
+  std::vector<std::int32_t> xq_;     // b*N produce() scratch (int32 before narrow)
   std::vector<std::int32_t> acc_;    // b*M readback scratch
 };
 

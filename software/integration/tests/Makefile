@@ -5,7 +5,6 @@
 #
 #   make            # everything
 #   make split      # column-tile split plan + readback scatter (C)
-#   make pack       # activation LOAD-beat scatter: fused narrow + pad zeroing (C)
 #   make packed     # 1.6-bit pack round-trip (Python)
 #   make tq1        # CPU-side TQ1_0 1.6-bit weights: exhaustive + bit-exact vs int8 (C++)
 CC       ?= gcc
@@ -36,8 +35,8 @@ else
   SIMD_FLAGS :=
 endif
 
-.PHONY: all split pack packed tq1 clean
-all: split pack packed tq1
+.PHONY: all split packed tq1 clean
+all: split packed tq1
 
 # test_split_chunks.c #includes mmfree_lib.c to drive the real static chunk math, so it
 # needs mmfree_runtime.c linked in for the symbols it references (none are called).
@@ -47,15 +46,6 @@ $(BUILD)/test_split_chunks: test_split_chunks.c ../libmmfree/mmfree_lib.c $(SW)/
 
 split: $(BUILD)/test_split_chunks
 	$(BUILD)/test_split_chunks
-
-# Links the real mmfree_lib.c (not a copy of the loop) so the test cannot drift from the
-# code that ships. mmfree_runtime.c supplies the symbols mmfree_lib.c references.
-$(BUILD)/test_pack_act: test_pack_act.c ../libmmfree/mmfree_lib.c $(SW)/bench/mmfree_runtime.c
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(INCS) test_pack_act.c ../libmmfree/mmfree_lib.c $(SW)/bench/mmfree_runtime.c -o $@
-
-pack: $(BUILD)/test_pack_act
-	$(BUILD)/test_pack_act
 
 packed:
 	cd .. && PYTHONPATH=. python3 tests/test_packed_roundtrip.py

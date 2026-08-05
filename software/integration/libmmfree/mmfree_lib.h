@@ -7,16 +7,14 @@
  *   1. mmfree_lib_open(cfg)                 open HW + allocate RESIDENT udmabufs
  *   2. mmfree_lib_load_weights_file(p,path) copy each per-port packed blob in ONCE
  *   3. id = mmfree_register(off, N, M)      one per projection (from the manifest)
- *   4. mmfree_bitlinear(id, x_int32, acc)   LOAD_ACT -> COMPUTE_MM@off -> STORE_OUT
+ *   4. mmfree_bitlinear(id, x_int16, acc)   LOAD_ACT -> COMPUTE_MM@off -> STORE_OUT
  *
  * Weights are loaded once and never re-copied; a COMPUTE just points the weight
  * DMA at the projection's resident byte offset (mmfree_compute_off). The library
  * does NOT parse the manifest or know about scales — the Python side reads the
  * JSON manifest, registers offsets, and applies the y = acc/(a_scale*s) dequant.
  *
- * Activations are passed in as int32 and saturated to the engine's signed int16 LOAD
- * slot during the pack (the producer's quantizer emits int32; narrowing in a separate
- * pass cost a full extra traversal of b*N). `acc` is the raw
+ * Activations are signed int16 (the k26_mmfree370m_a16 engine); `acc` is the raw
  * int32 dot-product Σ_n x_int[n]*w_t[n,m], sign-expanded from the engine's
  * accWidth-bit accumulator. NOT thread-safe: one in-flight op per handle.
  */
@@ -86,32 +84,22 @@ int mmfree_lib_load_weights(mmfree_lib_t *h, uint32_t port,
  * to mmfree_bitlinear, or negative on error (table full / out of range). */
 int mmfree_register(mmfree_lib_t *h, uint64_t byte_offset, uint32_t N, uint32_t M);
 
-/* Transpose b*N row-major int32 activations into the engine's int16 LOAD beat layout:
- * beat n occupies `stride` int16 slots, carrying the b values for inner index n (one slot
- * per PE row, saturated to int16) with slots [b, stride) zeroed. This is the hot inner
- * loop of every op — it runs once per projection per token. Exposed because it is pure
- * (dst is a plain buffer, no hardware) and therefore host-testable: see
- * tests/test_pack_act.c. Callers should use mmfree_bitlinear* / mmfree_seq_pack. */
-void mmfree_pack_act_rows_i16(int16_t *dst, const int32_t *x,
-                              uint32_t N, uint32_t b, uint32_t stride);
-
-/* Run one BitLinear projection. `x` holds N int32 activations, saturated to int16 as
- * they are packed into the LOAD beats; `acc`
+/* Run one BitLinear projection. `x` holds N signed int16 activations; `acc`
  * receives M signed int32 dot products (Σ_n x[n]*w_t[n,m]). Returns 0 on
  * success, negative on error/timeout (state dumped to stderr by the runtime). */
 int mmfree_bitlinear(mmfree_lib_t *h, int proj_id,
-                     const int32_t *x, int32_t *acc);
+                     const int16_t *x, int32_t *acc);
 
 /* Batched BitLinear: run `b` activation vectors through ONE weight stream (the
  * engine is weight-broadcast + activation-stationary, so the B PE rows share the
  * streamed weights — amortizing the DDR weight bandwidth that bounds decode).
- *   x:   b*N int32, row-major (vector i at x[i*N + n]); saturated to int16 on pack
+ *   x:   b*N int16, row-major (vector i at x[i*N + n])
  *   acc: b*M int32, row-major (vector i at acc[i*M + m])
  * `b` must be in 1..geom.batch (the bitstream's batchSize); if b < geom.batch the
  * unused PE rows are zero-padded and their outputs ignored. mmfree_bitlinear is
  * the b==1 case. Returns 0 on success, negative on error/timeout. */
 int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
-                           const int32_t *x, int32_t *acc, uint32_t b);
+                           const int16_t *x, int32_t *acc, uint32_t b);
 
 /* As mmfree_bitlinear_batch, but runs the projection as up to `want_chunks` COMPUTEs over
  * contiguous slices of its output column tiles, sharing ONE activation pack + LOAD. Because
@@ -127,7 +115,7 @@ int mmfree_bitlinear_batch(mmfree_lib_t *h, int proj_id,
  * Chunking is a TRADE: each chunk pays a COMPUTE issue + STORE round-trip, so the win peaks
  * where chunk COMPUTE time ~= chunk readback time and reverses if you over-split. Tune with
  * MMFREE_SPLIT_CHUNKS (see fpga_backend.cpp), which also selects per projection size. */
-int mmfree_bitlinear_batch_split(mmfree_lib_t *h, int proj_id, const int32_t *x,
+int mmfree_bitlinear_batch_split(mmfree_lib_t *h, int proj_id, const int16_t *x,
                                  int32_t *acc, uint32_t b, uint32_t want_chunks);
 
 /* Called once per chunk, with the output columns [col0, col0+ncols) of `acc` that have just
@@ -142,7 +130,7 @@ typedef void (*mmfree_chunk_cb_t)(void *ctx, uint32_t col0, uint32_t ncols);
  * split). The callback is the point of splitting beyond readback: readback alone only fills
  * part of the COMPUTE window, and whatever else the caller can express per-column-range
  * rides along for free in the remainder. */
-int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int32_t *x,
+int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int16_t *x,
                                     int32_t *acc, uint32_t b, uint32_t want_chunks,
                                     mmfree_chunk_cb_t cb, void *cb_ctx);
 
@@ -175,7 +163,7 @@ int mmfree_split_plan(const mmfree_lib_t *h, int proj_id, uint32_t want_chunks,
  *   pack -> load -> compute_issue -> [CPU overlap] -> compute_wait ->
  *   store_issue -> store_wait -> readback.
  * All return 0 / negative (errno-style); b is 1..geom.batch. */
-int  mmfree_seq_pack(mmfree_lib_t *h, const int32_t *x, uint32_t N, uint32_t b);
+int  mmfree_seq_pack(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b);
 int  mmfree_seq_load(mmfree_lib_t *h, uint32_t N);
 int  mmfree_seq_compute_issue(mmfree_lib_t *h, int proj_id, uint32_t b);
 int  mmfree_seq_compute_wait(mmfree_lib_t *h);
