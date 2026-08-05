@@ -15,9 +15,10 @@
 # mixed 10T and 20T rows.
 #
 # So this runs BOTH and records `omp_threads` on every row. The aggregator then selects the
-# better one per (model, encoding, batch) and carries the thread count into the output, which
-# turns "best of a sweep" from a hidden caveat into a stated method: the Xeon baseline is
-# given its best configuration, and the table says which.
+# better one per (model, encoding) — across the whole batch ladder, so one curve is one
+# configuration — and carries the thread count into the output. That turns "best of a sweep"
+# from a hidden caveat into a stated method: the Xeon baseline is given its best
+# configuration, and the table says which.
 #
 # ── RAPL ────────────────────────────────────────────────────────────────────────────
 # energy_uj is 0400 on stock Ubuntu (PLATYPUS mitigation). Without read access the power
@@ -111,7 +112,7 @@ echo "############################################################"
 echo "# Xeon final sweep: $PASSES passes x {$THREAD_SET} threads"
 echo "#   models   : $MODELS"
 echo "#   backends : $BACKENDS"
-echo "#   batches  : $BATCHES   gen=$GEN reps=$REPS"
+echo "#   batches  : $BATCHES   reps=$REPS   gen: 370M=$(gen_for x-370M) 1.3B=$(gen_for x-1.3B) 2.7B=$(gen_for x-2.7B)"
 echo "#   out      : $OUT_ROOT"
 echo "############################################################"
 
