@@ -115,7 +115,11 @@ def read_xeon(xeon_root):
     like-for-like comparison.
     """
     recs = []
-    for f in sorted(glob.glob(os.path.join(xeon_root, 't*_p*', 'host_cpu_sweep.csv'))):
+    # Recursive: the sweep nests one level per model (<root>/<slug>/t<th>_p<n>/) because GEN
+    # is chosen per model. The flat layout is still matched for older runs.
+    files = (glob.glob(os.path.join(xeon_root, 't*_p*', 'host_cpu_sweep.csv')) +
+             glob.glob(os.path.join(xeon_root, '*', 't*_p*', 'host_cpu_sweep.csv')))
+    for f in sorted(set(files)):
         tag = os.path.basename(os.path.dirname(f))
         mt = re.match(r'^t(\d+)_p(\d+)$', tag)
         if not mt:
@@ -156,14 +160,28 @@ def collapse(recs, spread_limit):
                         preset=rs[0]['preset'])
 
     # Xeon: the thread count is a tuning knob, not a variable of interest — collapse it by
-    # taking the best per cell and CARRYING the winner into the row, so "best of a sweep" is
-    # visible in the table rather than hidden in the file it came from.
+    # taking the best and CARRYING the winner into the row, so "best of a sweep" is visible
+    # in the table rather than hidden in the file it came from.
+    #
+    # Chosen per (model, encoding) across the whole batch ladder, NOT per batch. Per-batch
+    # selection maximises each point independently but lets one curve switch configuration
+    # mid-plot — 2.7B int8 genuinely wins at 10 threads for b=1 and 20 for b=6 — which puts a
+    # discontinuity in the batch-scaling curve that is an artifact of the selection rather
+    # than of the hardware. One configuration per curve, picked on mean throughput over the
+    # ladder, is what a reader assumes when they see a line.
+    tot = defaultdict(float)
+    for (plat, arm, model, fmt, batch, th), v in means.items():
+        tot[(plat, arm, model, fmt, th)] += v['mean']
+    win = {}
+    for (plat, arm, model, fmt, th), s_ in tot.items():
+        ck = (plat, arm, model, fmt)
+        if ck not in win or s_ > win[ck][1]:
+            win[ck] = (th, s_)
     best = {}
-    for k, v in means.items():
+    for k in means:
         plat, arm, model, fmt, batch, th = k
-        ck = (plat, arm, model, fmt, batch)
-        if ck not in best or v['mean'] > means[best[ck]]['mean']:
-            best[ck] = k
+        if th == win[(plat, arm, model, fmt)][0]:
+            best[(plat, arm, model, fmt, batch)] = k
 
     rows = []
     for ck, k in sorted(best.items(), key=lambda kv: (kv[0][0], kv[0][2], kv[0][3], kv[0][4])):

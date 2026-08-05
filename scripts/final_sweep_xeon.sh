@@ -41,7 +41,21 @@ THREAD_SET="${THREAD_SET:-10 20}"
 MODELS="${MODELS:-ridger/MMfreeLM-370M ridger/MMfreeLM-1.3B ridger/MMfreeLM-2.7B}"
 BACKENDS="${BACKENDS:-cpu cpu-2bit cpu-1p6}"
 BATCHES="${BATCHES:-1 2 3 4 5 6}"
-GEN="${GEN:-64}"
+
+# ── GEN IS PER MODEL, AND HAS TO BE ─────────────────────────────────────────────────
+# decode_tok_s is a rate, so GEN does not change the quantity being measured — only how
+# precisely it is estimated. A fixed GEN=64 therefore reads very differently across models
+# on this host: 2.7B b=1 is a 1.4 s timed window, but 370M b=1 is 0.34 s, short enough that
+# scheduler noise dominates. Measured consequence, GEN=64 over 3 passes: 1.3B and 2.7B agreed
+# to 0.09-1.2%, while 370M scattered 2.1-6.0% and tripped the aggregator's 3% outlier flag on
+# three cells. These values put every model's b=1 window at >= 2 s. gen_tokens is recorded on
+# every row, so the choice is visible in the data rather than assumed.
+declare -A GEN_FOR=( [370M]=384 [1.3B]=192 [2.7B]=128 )
+GEN_DEFAULT="${GEN:-128}"
+gen_for() {   # gen_for <hf-id> -> tokens
+    local slug="${1##*-}"                       # ridger/MMfreeLM-1.3B -> 1.3B
+    echo "${GEN_FOR[$slug]:-$GEN_DEFAULT}"
+}
 REPS="${REPS:-3}"
 OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/reports/host_cpu/final}"
 
@@ -101,9 +115,11 @@ echo "#   batches  : $BATCHES   gen=$GEN reps=$REPS"
 echo "#   out      : $OUT_ROOT"
 echo "############################################################"
 
-# Rows a complete pass must contain: models x backends x batches.
+# One sweep PER MODEL now, since GEN differs per model and bench_host_cpu.sh takes a single
+# GEN for whatever model list it is given. Output nests one level deeper —
+# <root>/<slug>/t<threads>_p<pass>/ — and final_dataset.py globs recursively for t*_p*.
 count() { set -- $1; echo $#; }
-EXPECT_ROWS=$(( $(count "$MODELS") * $(count "$BACKENDS") * $(count "$BATCHES") ))
+EXPECT_ROWS=$(( $(count "$BACKENDS") * $(count "$BATCHES") ))
 
 # bench_host_cpu.sh refuses to start above MAX_LOAD (default nproc/4) so it never measures
 # contention instead of the model. That guard is right, but it also fires on OUR OWN residual
@@ -124,23 +140,27 @@ settle() {
 }
 
 t0=$(date +%s); failed=""
-for pass in $(seq 1 "$PASSES"); do
-    for th in $THREAD_SET; do
-        out="$OUT_ROOT/t${th}_p${pass}"
-        # Idempotent: a complete pass is left alone, so re-running after a partial failure
-        # fills only the gaps instead of redoing hours of work.
-        if [ -f "$out/host_cpu_sweep.csv" ] && \
-           [ "$(( $(wc -l < "$out/host_cpu_sweep.csv") - 1 ))" -ge "$EXPECT_ROWS" ]; then
-            echo "=== pass $pass, ${th} threads — already complete ($EXPECT_ROWS rows), skipping"
-            continue
-        fi
-        rm -rf "$out"          # partial output would append and duplicate rows
-        echo
-        echo "=== [$(date -Is)] pass $pass, ${th} threads -> $out ==="
-        settle
-        OMP_THREADS="$th" MODELS="$MODELS" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
-        GEN="$GEN" REPS="$REPS" OUT="$out" \
-            ./scripts/bench_host_cpu.sh || failed="$failed t${th}p${pass}"
+for model in $MODELS; do
+    slug="${model##*-}"
+    g=$(gen_for "$model")
+    for pass in $(seq 1 "$PASSES"); do
+        for th in $THREAD_SET; do
+            out="$OUT_ROOT/$slug/t${th}_p${pass}"
+            # Idempotent: a complete pass is left alone, so re-running after a partial
+            # failure fills only the gaps instead of redoing hours of work.
+            if [ -f "$out/host_cpu_sweep.csv" ] && \
+               [ "$(( $(wc -l < "$out/host_cpu_sweep.csv") - 1 ))" -ge "$EXPECT_ROWS" ]; then
+                echo "=== $slug pass $pass, ${th}T — already complete ($EXPECT_ROWS rows), skipping"
+                continue
+            fi
+            rm -rf "$out"          # partial output would append and duplicate rows
+            echo
+            echo "=== [$(date -Is)] $slug pass $pass, ${th} threads, gen=$g -> $out ==="
+            settle
+            OMP_THREADS="$th" MODELS="$model" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
+            GEN="$g" REPS="$REPS" OUT="$out" \
+                ./scripts/bench_host_cpu.sh || failed="$failed ${slug}/t${th}p${pass}"
+        done
     done
 done
 
