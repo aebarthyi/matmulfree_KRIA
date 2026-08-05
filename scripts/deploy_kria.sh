@@ -14,7 +14,7 @@
 # source is shared at udmabuf/. Both are resolved relative to this script's dir, so
 # the bundle is fully self-contained.
 #
-# Usage:  sudo ./deploy_kria.sh <preset>     (e.g. sudo ./deploy_kria.sh k26_mmfree1_3b_a16_b4)
+# Usage:  sudo ./deploy_kria.sh <preset>     (e.g. sudo ./deploy_kria.sh mmfree_2_7b)
 #         or via the bundle Makefile:  sudo make deploy-hw PRESET=<preset>
 
 set -euo pipefail
@@ -156,10 +156,10 @@ fi
 # clocking0 node as `assigned-clock-rates`, in Hz, and the kernel programs it on load. That
 # makes the dtbo the AUTHORITATIVE record of what a built bundle runs at — it is derived
 # from the XSA, so it carries the snapped rate rather than the request. Checked here because
-# it can disagree with the manifest in BOTH directions: every 230-labelled preset shipped a
-# dtbo asking for 199998001 Hz (the manifest was wrong), and k26_mmfree1_3b_a16_b4 ships a
-# 250 manifest over a 199998001 dtbo (a bundle built at one rate and relabelled without a
-# rebuild). Needs dtc; skipped silently if the board has no dtc.
+# it can disagree with the manifest in BOTH directions, and both were seen in practice: a
+# manifest naming an off-rung rate the PS IP silently snapped down, and a bundle relabelled
+# to a new rate without being rebuilt. Trust the dtbo when they differ.
+# Needs dtc; skipped silently if the board has no dtc.
 DTBO_HZ=""
 if command -v dtc >/dev/null 2>&1 && [ -f "$PRESET_DIR/$APP.dtbo" ]; then
     DTBO_HZ=$(dtc -I dtb -O dts "$PRESET_DIR/$APP.dtbo" 2>/dev/null \

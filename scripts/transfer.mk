@@ -27,7 +27,7 @@
 # board.conf.example to board.conf and edit only if your addresses/nodes differ.
 -include board.conf
 
-PRESET     ?= k26_mmfree1_3b_a16_b4
+PRESET     ?= mmfree_2_7b
 CORE_PHYS  ?= 0xA0010000
 DMA_PHYS   ?= 0xA0000000
 UIO_DEV    ?= /dev/uio4
@@ -187,10 +187,10 @@ run: runner-bin
 # the op and engine-phase breakdowns as columns. The overlay for PRESET must ALREADY be
 # loaded (sudo make deploy-hw PRESET=… first) — the sweep does not touch the hardware.
 # BATCHES="1 2 4" sweeps an explicit list; GEN/REPS/WARMUP/OUT tune the runs.
-#   make sweep PRESET=k26_mmfree370m_a16_b6 GEN=64 REPS=3
+#   make sweep PRESET=mmfree_370m GEN=64 REPS=3
 # BACKEND=cpu runs the same ladder with the engine out of the loop — the CPU baseline for
 # the speedup number. No overlay or packed blob needed, and it writes a separate _cpu CSV:
-#   make sweep PRESET=k26_mmfree1_3b_a16_b6_dsp_s8_200 BACKEND=cpu
+#   make sweep PRESET=mmfree_1_3b BACKEND=cpu
 SWEEP_VARS = $(if $(MODEL),MODEL=$(MODEL),) $(if $(GEN),GEN=$(GEN),) \
              $(if $(REPS),REPS=$(REPS),) $(if $(WARMUP),WARMUP=$(WARMUP),) \
              $(if $(BATCHES),BATCHES='$(BATCHES)',) $(if $(OUT),OUT=$(OUT),) \
@@ -206,7 +206,7 @@ sweep: runner-bin
 # Single-stream decode of PROMPT=, printing each token as the engine emits it (decoded
 # via tokenizer.mmtok beside the blob). Stops at the model's EOS. GEN=<n> caps tokens.
 # TEMP>0 turns on sampling (TOPK/SEED tune it); TEMP=0 (default) is greedy. e.g.
-#   make gen PRESET=k26_mmfree1_3b_a16_b4 PROMPT="The capital of France is" GEN=40
+#   make gen PRESET=mmfree_1_3b PROMPT="The capital of France is" GEN=40
 #   make gen PRESET=... MODEL=ridger/MMfreeLM-2.7B PROMPT="Once upon a time" TEMP=0.8 TOPK=40 SEED=1
 GEN    ?= 64
 PROMPT ?= Once upon a time

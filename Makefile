@@ -12,7 +12,7 @@
 #
 #   make help                                   # this list
 #   make sim   [SPEC=CoreConfig]                # mill tests (SPEC = name substring)
-#   make build PRESET=k26_mmfree1_3b_a16_b4     # Chisel → bitstream → transfer/presets/<p>/ + stage src/
+#   make build PRESET=mmfree_2_7b     # Chisel → bitstream → transfer/presets/<p>/ + stage src/
 #   make provision MODEL=ridger/MMfreeLM-1.3B   # HF download → transfer/models/<slug>/{model.mmfree,tokenizer.mmtok}
 #   make pack  PRESET=... [BLOB=f|CKPT=id]      # pack weights → transfer/models/<slug>/packed/
 #   make deploy BOARD=ubuntu@kria               # rsync transfer/ → board:~/transfer/  (then run board verbs there)
@@ -24,7 +24,7 @@
 # the defaults when it is absent. (Device paths now live in the bundle's own board.conf.)
 -include board.conf
 
-PRESET     ?= k26_mmfree1_3b_a16_b4
+PRESET     ?= mmfree_2_7b
 BOARD      ?= ubuntu@kria
 # Remote dir that will CONTAIN transfer/ on the board (the bundle lands at
 # $(BOARD_DEST)/transfer/, and the board works from there: `cd ~/transfer && make ...`).

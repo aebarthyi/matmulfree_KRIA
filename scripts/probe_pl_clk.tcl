@@ -30,7 +30,7 @@ set part       "xck26-sfvc784-2LV-c"
 set board_part "xilinx.com:kr260_som:part0:1.1"
 
 set ip_repo [expr {[llength $argv] > 0 ? [lindex $argv 0] \
-                                       : [file join $repo_root generated k26_bench]}]
+                                       : [file join $repo_root generated mmfree_2_7b]}]
 set cands [lrange $argv 1 end]
 if {[llength $cands] == 0} {
     set cands [list 100 150 166 167 175 187 188 200 210 214 215 220 225 230 240 250 275 295 300]

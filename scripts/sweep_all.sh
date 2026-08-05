@@ -36,71 +36,50 @@ GEN=${GEN:-64}
 REPS=${REPS:-3}
 WARMUP=${WARMUP:-1}
 
-# Default sweep set (2026-08-03): GROUPED BY MODEL SIZE, ascending, and within each size the
-# four arms in this order — CPU 2-bit, CPU 1.6-bit, FPGA 2-bit, FPGA 1.6-bit. So each size's
-# whole story lands together instead of being split across the run, and the two CPU arms are
-# measured before the size's overlay is loaded (they need no CMA at all).
+# Default sweep set: the three deployable presets, grouped by model size, each preceded by
+# the CPU arm it is quoted against. That is the full production comparison — one FPGA row and
+# one CPU row per checkpoint — and nothing else.
 #
-# The CPU arms use the SAME weight encodings as the FPGA arms (mmfree/tq1.hpp): cpu-2bit is
-# 4 trits/byte = 2.0 bits/weight, cpu-1p6 is llama.cpp's TQ1_0 = 1.625. Both are bit-identical
-# to the CPU's native int8 path, so the arms differ only in speed.
+# The CPU arm here is int8 (BACKEND=cpu), which is the A53's FASTEST configuration and
+# therefore the FAIR denominator for a speedup claim. Running the CPU at the FPGA's own
+# weight encodings is a narrower question ("same format on both sides") and it makes the CPU
+# look worse: measured on the A53, cpu-2bit is 0.96-1.25x of int8 and cpu-1p6 only 0.52-0.82x,
+# because the ternary dot is ALU/issue-bound rather than weight-bandwidth-bound, so unpacking
+# costs more than the saved traffic buys. Add those arms explicitly if you want them:
 #
-#   NOTE: int8 is NOT in this list, and it is the CPU's FASTEST configuration (A53-measured:
-#   2-bit 0.96-1.25x of int8, 1.6-bit 0.52-0.82x — the ternary dot is ALU-bound, so packing
-#   costs more than the saved traffic buys). The four arms below answer "same format on both
-#   sides"; if you also want the CPU's best-case denominator, add e.g.
-#       "k26_mmfree370m_a16_b6_s8::int8::cpu"
-#   which is the plain int8 arm tagged so it does not collide.
+#     sudo ./sweep_all.sh "mmfree_2_7b::2bit::cpu-2bit" "mmfree_2_7b::1p6::cpu-1p6"
 #
-#   370M PAIR: now matched. Both 370M arms are dsp=0/s8=8 @250 (k26_mmfree370m_a16_b6_s8 was
-#   built for exactly this), so all three sizes isolate the weight encoding and nothing else.
+# The exhaustive 12-arm matrix that established all of the above (2-bit vs packed bitstreams,
+# 200 vs 250 MHz at fixed RTL, matched CPU arms at every encoding) lives on the `exploration`
+# branch together with the ablation presets it swept.
 #
-# Runtime is many hours — the 2.7B arms dominate and every FPGA arm gates before it times.
+# CPU arms need no overlay, no CMA and no gate, so they run before the size's overlay loads.
+# Runtime is a few hours — the 2.7B arms dominate and every FPGA arm gates before it times.
 # Subset by passing your own specs; the ordering is just the array order.
 DEFAULT_SPECS=(
-    # ── 370M ────────────────────────────────────────────────────────────────
-    "k26_mmfree370m_a16_b6_s8::::cpu-2bit"          # CPU  2.0   bits/weight
-    "k26_mmfree370m_a16_b6_s8::::cpu-1p6"           # CPU  1.625 bits/weight
-    "k26_mmfree370m_a16_b6_s8"                      # FPGA 2-bit    (250 MHz, s8)
-    "k26_mmfree370m_a16_b6_packed"                  # FPGA 1.6-bit  (250 MHz, s8)
-    # ── 1.3B ────────────────────────────────────────────────────────────────
-    "k26_mmfree1_3b_a16_b6_dsp_s8_200::::cpu-2bit"
-    "k26_mmfree1_3b_a16_b6_dsp_s8_200::::cpu-1p6"
-    "k26_mmfree1_3b_a16_b6_dsp_s8_200"              # FPGA 2-bit    (200 MHz, dsp+s8)
-    "k26_mmfree1_3b_a16_b6_dsp_s8_packed"           # FPGA 1.6-bit  (200 MHz, dsp+s8)
-    # ── 2.7B ────────────────────────────────────────────────────────────────
-    "k26_mmfree2_7b_a16_b6_dsp_s8_200::::cpu-2bit"
-    "k26_mmfree2_7b_a16_b6_dsp_s8_200::::cpu-1p6"
-    "k26_mmfree2_7b_a16_b6_dsp_s8_200"              # FPGA 2-bit    (200 MHz, dsp+s8)
-    "k26_mmfree2_7b_a16_b6_dsp_s8_packed"           # FPGA 1.6-bit  (200 MHz, dsp+s8)
-    # ── 250 MHz arms (2026-08-04): the first maxN=8192 B6 builds to CLOSE 250 ──
-    # colBankSize=4 + actRamStyle=block/cascade 2 fixed the TWO paths that failed 0.005 ns
-    # apart (see NEXT_STEPS §BB). WNS +0.042 (2-bit) / +0.025 (packed), both @250.000 MHz.
-    # The 1.3B pair is the SAME two bitstreams via clone_preset_hw.sh — identical RTL, 1.3B
-    # manifest. Paired with the 200 MHz arms above these give the clock axis at fixed RTL,
-    # which is the comparison the earlier "230 MHz" mislabel made impossible.
-    # GATE THESE FIRST: colBankSize=4 and the ActMem swap are simulation-verified only and
-    # have never run on hardware.
-    "k26_mmfree1_3b_a16_b6_dsp_s4_acb2"             # FPGA 2-bit    (250 MHz)
-    "k26_mmfree1_3b_a16_b6_dsp_s4_acb2_packed"      # FPGA 1.6-bit  (250 MHz)
-    "k26_mmfree2_7b_a16_b6_dsp_s4_acb2"             # FPGA 2-bit    (250 MHz)
-    "k26_mmfree2_7b_a16_b6_dsp_s4_acb2_packed"      # FPGA 1.6-bit  (250 MHz)
+    # ── 370M ──── maxN=4096, banking only, no DSP accum ──────────────────────
+    "mmfree_370m::::cpu"                    # CPU int8 baseline
+    "mmfree_370m"                           # FPGA 1.6-bit @250 — 102.63 tok/s at b=6
+    # ── 1.3B ──── the 2.7B bitstream with a 1.3B manifest ────────────────────
+    "mmfree_1_3b::::cpu"
+    "mmfree_1_3b"                           # FPGA 1.6-bit @250 —  55.43 tok/s at b=6
+    # ── 2.7B ──── the build-from preset ──────────────────────────────────────
+    "mmfree_2_7b::::cpu"
+    "mmfree_2_7b"                           # FPGA 1.6-bit @250 —  34.41 tok/s at b=6
 )
 # POWER PROFILING. POWER=1 wraps every arm in power_bench.sh (xlnx_platformstats rail
-# sampling) and costs ~2% decode, so its rows are NOT comparable to the POWER=0 rows already
-# in reports/sweeps/ — only compare POWER=1 against POWER=1.
+# sampling) and costs ~2% decode, so its rows are NOT comparable to POWER=0 rows —
+# only compare POWER=1 against POWER=1.
 #
 #   sudo POWER=1 TAG=pwr ./sweep_all.sh
 #
-# ⚠️ PASS TAG=. Without it a POWER=1 re-run writes to the same
-# <preset>_batch_sweep.csv as the POWER=0 run and OVERWRITES it — exactly how the 250 MHz
-# rows were lost on 2026-08-04 (NEXT_STEPS §A). The tag lands in the CSV filename.
-# The 1.3B/2.7B arms were named "_230" until 2026-08-04 and the same directories are still
-# on the board under the old name. They are the SAME bitstreams — 230 is not a PL0_REF rung,
-# so those builds were always constrained at 199.998 MHz (their own dtbos ask the kernel for
-# 199998001 Hz) and, after the deploy snap-down fix, always ran there. Only the label moved.
-# Re-run `make deploy` from the build server before this sweep or the "_200" presets will not
-# exist on the board.
+# ⚠️ PASS TAG= on any re-run under changed conditions. Without it the re-run writes to the
+# same <preset>_batch_sweep.csv and OVERWRITES the previous one — that is how a whole set of
+# 250 MHz rows was lost on 2026-08-04. The tag lands in the CSV filename.
+#
+# NOTE power_bench.sh names its samples file after the GEOMETRY, not the batch size, so a
+# POWER=1 ladder leaves only the LAST batch's rail samples behind. Fine for a b=6 power
+# figure; if you want per-batch perf/W, fix the naming there first.
 
 if [ $# -gt 0 ]; then SPECS=("$@"); else SPECS=("${DEFAULT_SPECS[@]}"); fi
 
@@ -180,12 +159,11 @@ for spec in "${SPECS[@]}"; do
     # timings. It degrades to a plain run if xlnx_platformstats is missing.
     #
     # DEFAULT IS 0, AND THAT MATTERS: sampling costs ~2% decode. Measured 2026-07-30, same
-    # preset/blob/overlay/session, ladder split both times — POWER=1 gave 26.88 tok/s and
-    # POWER=0 gave 27.44 (-2.04%). This default used to be 1 while bench_batch.sh and
-    # sweep_split_k.sh default to 0, so numbers from this script were silently ~2% below
-    # numbers from those, and comparing across them manufactured a regression that did not
-    # exist. Pass POWER=1 explicitly when you actually want rail data, and only compare
-    # POWER=1 against POWER=1.
+    # preset/blob/overlay/session — POWER=1 gave 26.88 tok/s and POWER=0 gave 27.44 (-2.04%).
+    # This default used to be 1 while every other bench script defaulted to 0, so numbers
+    # from this script were silently ~2% below numbers from those, and comparing across them
+    # manufactured a regression that did not exist. Pass POWER=1 explicitly when you actually
+    # want rail data, and only compare POWER=1 against POWER=1.
     sweep_args=("PRESET=$preset" "GEN=$GEN" "REPS=$REPS" "WARMUP=$WARMUP" "POWER=${POWER:-0}")
     [ -n "$model" ] && { gate_args+=("MODEL=$model"); sweep_args+=("MODEL=$model"); }
     [ -n "$tag" ]   && sweep_args+=("TAG=$tag")

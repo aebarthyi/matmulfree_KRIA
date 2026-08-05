@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/build_all.sh — full hardware flow for the t_matmul bench, Chisel → board.
 #
-#   Chisel  ──mill──▶  generated/k26_bench/*.sv   (SystemVerilog)
+#   Chisel  ──mill──▶  generated/mmfree_2_7b/*.sv   (SystemVerilog)
 #                       (packaged IP: user.org:user:CoreTop:1.0)
 #   bd.tcl  ─vivado─▶  build/t_matmul/  +  build/t_matmul.xsa   (bitstream + platform)
 #   xsa     ──xsct──▶  build/overlay/{core_bench.bit,.dtbo,shell.json}
@@ -19,7 +19,7 @@
 #   mill (repo-local ./mill), vivado, xsct, dtc, bootgen, unzip
 #
 # Environment overrides:
-#   PRESET=k26_bench    CoreConfig preset emitted + packaged
+#   PRESET=mmfree_2_7b CoreConfig preset emitted + packaged
 #   JOBS=8              parallel synth/impl jobs
 #   DT_BRANCH=...       device-tree-xlnx branch for xsct createdts
 #   DT_REPO=...         local device-tree-xlnx clone (offline builds)
@@ -41,7 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-PRESET="${PRESET:-k26_bench}"
+PRESET="${PRESET:-mmfree_2_7b}"
 DESIGN="t_matmul"
 
 # ─── Preset manifest = single source of truth ───────────────────────────────
@@ -207,14 +207,11 @@ stage_shared() {
     cp "$SCRIPT_DIR/bench_batch.sh"     "$BUNDLE_ROOT/bench_batch.sh"
     cp "$SCRIPT_DIR/sweep_all.sh"       "$BUNDLE_ROOT/sweep_all.sh"
     cp "$SCRIPT_DIR/split_sweep_csv.py" "$BUNDLE_ROOT/split_sweep_csv.py"
-    cp "$SCRIPT_DIR/sweep_split_ab.sh"   "$BUNDLE_ROOT/sweep_split_ab.sh"
-    cp "$SCRIPT_DIR/sweep_split_k.sh"    "$BUNDLE_ROOT/sweep_split_k.sh"
     cp "$SCRIPT_DIR/cma_reclaim.sh"      "$BUNDLE_ROOT/cma_reclaim.sh"
     cp "$SCRIPT_DIR/cma_boot_raise.sh"   "$BUNDLE_ROOT/cma_boot_raise.sh"
     chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh" \
              "$BUNDLE_ROOT/bench_batch.sh" "$BUNDLE_ROOT/sweep_all.sh" \
-             "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/sweep_split_ab.sh" \
-             "$BUNDLE_ROOT/sweep_split_k.sh" "$BUNDLE_ROOT/cma_reclaim.sh" \
+             "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/cma_reclaim.sh" \
              "$BUNDLE_ROOT/cma_boot_raise.sh"
     cp "$SCRIPT_DIR/board.conf.example" "$BUNDLE_ROOT/board.conf.example" 2>/dev/null || true
 

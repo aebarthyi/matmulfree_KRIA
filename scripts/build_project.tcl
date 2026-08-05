@@ -7,7 +7,7 @@
 # Optional -tclargs (positional):
 #   vivado -mode batch -source scripts/build_project.tcl -tclargs <proj_dir> <ip_repo> <jobs>
 #     proj_dir   Vivado project directory   (default: build/t_matmul)
-#     ip_repo    CoreTop IP repository       (default: generated/k26_bench)
+#     ip_repo    CoreTop IP repository       (default: generated/mmfree_2_7b)
 #     jobs       parallel jobs for synth/impl (default: 8)
 #
 # Produces:
@@ -27,7 +27,7 @@ set board_part  "xilinx.com:kr260_som:part0:1.1"
 set design_name "t_matmul"
 
 set proj_dir [expr {[llength $argv] > 0 ? [lindex $argv 0] : [file join $repo_root build $design_name]}]
-set ip_repo  [expr {[llength $argv] > 1 ? [lindex $argv 1] : [file join $repo_root generated k26_bench]}]
+set ip_repo  [expr {[llength $argv] > 1 ? [lindex $argv 1] : [file join $repo_root generated mmfree_2_7b]}]
 set jobs     [expr {[llength $argv] > 2 ? [lindex $argv 2] : 8}]
 
 set bd_tcl  [file join $repo_root vivado bd.tcl]

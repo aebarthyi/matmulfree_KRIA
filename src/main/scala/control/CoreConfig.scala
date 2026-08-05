@@ -384,9 +384,20 @@ object CoreConfig {
       */
     val plClkRungs: Set[Int] = Set(100, 143, 167, 200, 250, 300)
 
-    // ─── Named presets ─────────────────────────────────────────────────────
+    private val b4TimingLevers250 = Map(
+        "SYNTH_FLATTEN"                 -> "full",
+        "PLACE_DIRECTIVE"               -> "ExtraNetDelay_high",
+        "PHYS_OPT_DIRECTIVE"            -> "AggressiveExplore",
+        "ROUTE_DIRECTIVE"               -> "AggressiveExplore",
+        "POST_ROUTE_PHYS_OPT_DIRECTIVE" -> "AggressiveExplore"
+    )
 
-    /** Compact default. Single batch, 8x8 array. */
+    // ─── Dev / simulation fixtures ─────────────────────────────────────────
+    // NOT deployable and deliberately NOT in `presets` below: they exist so the test
+    // suite has small, fast-to-elaborate geometries. `make build PRESET=` only offers
+    // what is in the registry.
+
+    /** Compact default — single batch, 8x8 array. Also pins the case-class defaults. */
     val Default: CoreConfig = CoreConfig()
 
     /** Minimal config used by the test suite — fast to simulate. */
@@ -395,654 +406,131 @@ object CoreConfig {
         maxN = 8, maxM = 16
     )
 
-    // KRIA K26 placeholders. Refine after running OOC at each scale.
-    val K26_Small:  CoreConfig = forShape(n = 256,  m = 256,  xDim = 4,  batchSize = 1)
-    val K26_Medium: CoreConfig = forShape(n = 512,  m = 512,  xDim = 8,  batchSize = 1)
-    val K26_Large:  CoreConfig = forShape(n = 1024, m = 1024, xDim = 16, batchSize = 1)
-
-    /**
-      * First-board bring-up bench. xDim=4 / batchSize=1 keeps resources well within
-      * a KV260, while maxN=maxM=1024 spans the 64..1024 power-of-two sweep.
-      *
-      * outBeatLanes=1 makes m_axis 32 bits wide (one lane × 32-bit padded accumulator),
-      * matching a 32-bit AXI-Stream DMA S2MM. s_axis is also 32 bits (xDim*aWidth =
-      * 4*8) so a single AXI DMA IP configured at 32-bit width covers both directions.
-      */
-    val K26_Bench: CoreConfig = CoreConfig(
-        aWidth       = 16,
-        maxAcc       = 4096,
-        xDim         = 4,
-        batchSize    = 1,
-        maxN         = 1024,
-        maxM         = 1024,
-        outBeatLanes = 1
-    )
-
-    /**
-      * Scaled-up bench: 16 array columns. aWidth=8 (4 lanes/PE, 64 MACs/cycle)
-      * keeps s_axis at 16*8 = 128 bits — exactly the HP0 port width, so the
-      * weight stream runs stall-free (aWidth=16 would need a 256-bit stream
-      * through the 128-bit port and halve effective throughput).
-      *
-      * outBeatLanes=1 keeps m_axis at 32 bits (one padded accumulator lane),
-      * so the DMA S2MM side is unchanged from K26_Bench. Theoretical peak:
-      * 2*16*4 = 128 ops/cycle = 12.8 GOPS at 100 MHz.
-      */
-    val K26_Bench16: CoreConfig = CoreConfig(
-        aWidth       = 8,
-        maxAcc       = 4096,
-        xDim         = 16,
-        batchSize    = 1,
-        maxN         = 1024,
-        maxM         = 1024,
-        outBeatLanes = 1
-    )
-
-    /**
-      * Multi-HP-port bench: 32 array columns → s_axis = 32*8 = 256 bits, split
-      * across N=2 parallel 128-bit ports (HP0+HP1), each fed by its own AXI DMA.
-      * Theoretical peak: 2*32*4 = 256 ops/cycle = 25.6 GOPS at 100 MHz.
-      *
-      * outBeatLanes=1 keeps m_axis at 32 bits — output stays on DMA0's S2MM.
-      */
-    val K26_Bench32: CoreConfig = CoreConfig(
-        aWidth       = 8,
-        maxAcc       = 4096,
-        xDim         = 32,
-        batchSize    = 1,
-        maxN         = 1024,
-        maxM         = 1024,
-        outBeatLanes = 1
-    )
-
-    /**
-      * Multi-HP-port bench: 64 array columns → s_axis = 64*8 = 512 bits, split
-      * across N=4 parallel 128-bit ports (HP0–HP3), one AXI DMA each.
-      * Theoretical peak: 2*64*4 = 512 ops/cycle = 51.2 GOPS at 100 MHz.
-      */
-    val K26_Bench64: CoreConfig = CoreConfig(
-        aWidth       = 8,
-        maxAcc       = 4096,
-        xDim         = 64,
-        batchSize    = 1,
-        maxN         = 1024,
-        maxM         = 1024,
-        outBeatLanes = 1
-    )
-
-    /**
-      * Every projection of the 370M matmulfree LM (MMfreeLM-370M: hidden=1024,
-      * GLU intermediate=2816, vocab=32000, 24 layers) on the full 4-HP-port
-      * geometry. Distinct single-token matmul shapes (N inner × M out):
-      *
-      *   i/f/g/o_proj : 1024 × 1024    (4 per layer)
-      *   gate_up      : 1024 × 5632    (fused gate+up = 2×2816)
-      *   down_proj    : 2816 × 1024
-      *   lm_head      : 1024 × 32000
-      *
-      *   - xDim=64, aWidth=8 → 512-bit s_axis split across 4 × 128-bit HP
-      *     ports (the PS ceiling) — same datapath as K26_Bench64.
-      *   - maxN=4096 covers down_proj's inner dim 2816 (next pow2); maxAcc
-      *     matches, so accWidth stays 20 and m_axis lanes stay 32-bit.
-      *   - maxM=32000 covers the LM head. 32000 = 125 col tiles of 256 lanes;
-      *     5632 = 22 tiles, 1024 = 4 tiles — every projection is tile-aligned,
-      *     so no padding lanes anywhere in the sweep.
-      *   - outBeatLanes=1 keeps m_axis at 32 bits: output stays on DMA0's
-      *     S2MM, unchanged from the bench presets.
-      */
-    val K26_MMFree370M: CoreConfig =
-        forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
-                 aWidth = 8, xDim = 64, outBeatLanes = 1, signedAct = false,
-                 plClkMhz = 250, shapes = "370m", model = "ridger/MMfreeLM-370M")
-
-    /**
-      * Signed int16-activation sibling of K26_MMFree370M, for real BitLinear
-      * inference where activations are signed (and the HGRN carries 16-bit
-      * fixed-point). int16 is nearly free on this engine: weights stay 2-bit
-      * ternary (same 85 MB/token, same MACs/cycle), activations live in BRAM.
-      *
-      * Geometry reshapes to keep the 4-HP-port stream: aWidth=16 forces xDim=32
-      * (xDim*aWidth = 512 b = 4 x 128), giving outLanesPerTile = 32*8 = 256 —
-      * identical to the 64*4 of the int8 preset. accWidth = log2(4096)+16 = 28,
-      * but outLaneWidth = nextPow2(28) = 32, so the m_axis output format is
-      * UNCHANGED (still one 32-bit lane per beat). signedAct=true sign-extends.
-      */
-    val K26_MMFree370M_A16: CoreConfig =
-        forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
-                 aWidth = 16, xDim = 32, outBeatLanes = 1, signedAct = true,
-                 plClkMhz = 250, shapes = "370m", model = "ridger/MMfreeLM-370M")
-
-    /**
-      * Batched siblings of K26_MMFree370M_A16 for the batching sweep (Phase 0+).
-      * batchSize=B processes B activation vectors per single weight stream
-      * (one-load, B-results), amortizing the DDR weight bandwidth that bounds
-      * decode. Spatial batching: weights broadcast to all B PE rows, each row has
-      * its own activations + accumulators.
-      *
-      *   - B ≤ 8 keeps the LOAD beat (max(xDim,B)*aWidth = 512 b) at 4 × 128-bit
-      *     ports, so the bitstream topology is identical to the B=1 a16 preset;
-      *     only the yDim PE rows, actBram width, accumulator banks and outBram
-      *     depth scale ×B.
-      *   - outBeatLanes=4 (128-bit m_axis) — board B=4 showed the STORE is the
-      *     batch bottleneck: it doesn't amortize (B*M outputs read out) and was
-      *     m_axis-width-bound at ~1 GB/s (32-bit S2MM). 128-bit matches the HP
-      *     port → 4 GB/s store. It also shrinks outSubBeats (256→64) so the drain
-      *     hides through B=8 AND shallows outBram (shorter URAM cascade).
-      */
-    val K26_MMFree370M_A16_B2: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 2, outBeatLanes = 4)
-    val K26_MMFree370M_A16_B4: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 4, outBeatLanes = 4)
-    // B6 is the device sweet spot on K26: B8 overflowed the fabric (95.4% LUT →
-    // routing congestion, post-route WNS −0.693 @250 MHz, a capacity wall not a
-    // single path). B6 is ~3/4 of that array (~74–77% LUT est.) so it closes at
-    // full 250 MHz — no clock drop, no HP-port bandwidth loss — for ~1.5× the
-    // B4 stream-bound throughput. No power-of-2 batch requirement: all batch
-    // addressing is arithmetic (drainBatchCtr*numColTiles+…). outBram = 6*125*64
-    // = 48000-deep URAM (shallower than B8's 64000 → easier write-addr cascade).
-    val K26_MMFree370M_A16_B6: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 6, outBeatLanes = 4)
-    val K26_MMFree370M_A16_B8: CoreConfig = K26_MMFree370M_A16.copy(batchSize = 8, outBeatLanes = 4)
-
-    // ── accumulator-headroom OOC sweep (drain-cost investigation) ─────────────
-    // Siblings of the K26 sweet-spot B6 with a trimmed accumulator. 370M's
-    // maxN=nextPow2(2816)=4096, so the default headroom is log2Ceil(4096)=12
-    // (accWidth = 16+12 = 28). These lower it to 10 / 6 (accWidth 26 / 22); nextPow2
-    // keeps the m_axis lane at 32 bits for any headroom in 1..16, so they differ from
-    // B6 ONLY in internal accumulator / tileAccums / outBram width. Build all three
-    // OOC (ooc_synth.tcl) and compare LUT/FF/WNS to see if the wide accumulator is the
-    // synthesis cost before committing to the shadow-bank drain rewrite. NOT for
-    // deployment until the model's real dynamic range is validated (overflow).
-    val K26_MMFree370M_A16_B6_H10: CoreConfig = K26_MMFree370M_A16_B6.copy(accHeadroomBits = 10)
-    val K26_MMFree370M_A16_B6_H6:  CoreConfig = K26_MMFree370M_A16_B6.copy(accHeadroomBits = 6)
-
-    // ── input-broadcast fanout experiment (target the documented B6@250 path) ──
-    // The batched array-feed register broadcasts the activation to all xDim PEs per
-    // row; at B6 that is the route-bound ~-0.37 ns path (CoreConfig comment above).
-    // actMaxFanout forces synth to replicate that register per column. Two limits to
-    // bracket; a full impl build is the only real timing test (OOC can't see the
-    // congestion). SV differs from B6 only in the array-feed skid + the attribute.
-    val K26_MMFree370M_A16_B6_F32: CoreConfig = K26_MMFree370M_A16_B6.copy(actMaxFanout = 32)
-    val K26_MMFree370M_A16_B6_F16: CoreConfig = K26_MMFree370M_A16_B6.copy(actMaxFanout = 16)
-
-    // ── runtime-batch A/B sibling of the 370M B6 sweet spot ─────────────────
-    // CONFIG-IDENTICAL to K26_MMFree370M_A16_B6 — it exists only so a rebuild from
-    // a tree that HAS the runtime-batch drain (COMPUTE flags → cmpBatch) lands in its
-    // own preset dir instead of clobbering the deployed 2026-06-25 bitstream, which
-    // predates that RTL. Bench the two side by side: the batch sweep on _B6 shows a
-    // b<B call still draining all 6 rows (flat per-step cost), while _B6_RB should
-    // show b=1 paying ~B1 cost. Once that A/B is settled, this preset can be deleted
-    // and K26_MMFree370M_A16_B6 simply rebuilt in place.
-    val K26_MMFree370M_A16_B6_RB: CoreConfig = K26_MMFree370M_A16_B6
-
-    // ── DSP48E2 accumulator experiment ──────────────────────────────────────
-    // Map the per-lane PE accumulators onto DSP slices instead of LUT/CARRY8.
-    // One DSP/lane if Vivado infers cleanly → xDim*batch*nLanes = 32*batch*8 DSPs.
-    // The K26 has 1248 DSP48E2, so the array fits ONLY up to B4 (32*4*8 = 1024);
-    // B6 would need 1536 (>1248) and spill back to fabric — so this variant is
-    // based on B4, the largest fully-DSP-coverable batch. Payoff: free the
-    // LUT/CARRY8 the accumulators used (the batched presets are LUT-bound — see
-    // the B8 ~95% capacity wall), possibly buying headroom for clock or a bigger
-    // array. SV differs from B4 only in the use_dsp attr on accumReg; behavior is
-    // identical. Build both and diff reports/<tag>.rpt for DSP/LUT/CARRY8 + WNS.
-    val K26_MMFree370M_A16_B4_DSP: CoreConfig = K26_MMFree370M_A16_B4.copy(dspAccum = true)
-
-    /**
-      * Larger MMfreeLM checkpoints on the SAME a16 / 4-HP-port engine as 370M.
-      * Architecture (from the released ridger/MMfreeLM checkpoints, vocab=32000):
-      *
-      *   model  hidden  intermediate  gate_up(2I)  layers   weight traffic/token
-      *   370M    1024        2816         5632        24        85.3 MB
-      *   1.3B    2048        5632        11264        24       324.7 MB
-      *   2.7B    2560        6912        13824        32       654.9 MB
-      *
-      * Only the inner dim grows past 370M's: max(hidden,intermediate) is 5632
-      * (1.3B) / 6912 (2.7B), so maxN = nextPow2 = 8192 and maxAcc = 8192 for both
-      * (accWidth = log2(8192)+16 = 29 → 32-bit lane, m_axis format unchanged).
-      * maxM stays 32000 (the LM head dominates every gate_up). 1.3B and 2.7B
-      * therefore share an IDENTICAL bitstream geometry — they differ only in the
-      * default bench sweep — and that maxN=8192 engine also runs 370M.
-      */
-    val K26_MMFree1_3B_A16: CoreConfig =
-        forModel(hidden = 2048, intermediate = 5632, vocab = 32000, layers = 24,
-                 shapes = "1.3b", model = "ridger/MMfreeLM-1.3B")
-    val K26_MMFree2_7B_A16: CoreConfig =
-        forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
-                 shapes = "2.7b", model = "ridger/MMfreeLM-2.7B")
-
-    // Batched siblings (outBeatLanes=4 → 128-bit m_axis, as in the 370M batch
-    // presets). B6 is the 370M K26 sweet spot; at maxN=8192 the actBram/accum
-    // banks are ~2x deeper, so the batch ceiling may land lower — confirm OOC
-    // resource/timing on the board before trusting B6 at this scale.
-    // B6 missed 250 MHz timing at maxN=8192 (WNS −0.369 ns; the deeper actBram/URAM
-    // cascade + 77% LUT congestion lengthens the store path past the 370M B6 that
-    // closed). B4 is the fallback — less array logic, shorter cascades.
-    // The maxN=8192 B4 @ 250 MHz closure is razor-thin (post-route WNS ~0 ns): the default
-    // impl flow misses by ~0.07 ns, but this lever set closes it (1.3B B4 landed +0.004 ns).
-    // Baked into the preset so `make build` applies them automatically — no remembered env.
-    // (The store/broadcast path is identical for 1.3B and 2.7B B4, so the same set closes both.
-    // B6 @ 250 can't be closed by these levers — it drops to 230 MHz instead; see _B6_230.)
-    private val b4TimingLevers250 = Map(
-        "SYNTH_FLATTEN"                 -> "full",
-        "PLACE_DIRECTIVE"               -> "ExtraNetDelay_high",
-        "PHYS_OPT_DIRECTIVE"            -> "AggressiveExplore",
-        "ROUTE_DIRECTIVE"               -> "AggressiveExplore",
-        "POST_ROUTE_PHYS_OPT_DIRECTIVE" -> "AggressiveExplore"
-    )
-    val K26_MMFree1_3B_A16_B4: CoreConfig = K26_MMFree1_3B_A16.copy(batchSize = 4, outBeatLanes = 4, implDirectives = b4TimingLevers250)
-    val K26_MMFree2_7B_A16_B4: CoreConfig = K26_MMFree2_7B_A16.copy(batchSize = 4, outBeatLanes = 4, implDirectives = b4TimingLevers250)
-    val K26_MMFree1_3B_A16_B6: CoreConfig = K26_MMFree1_3B_A16.copy(batchSize = 6, outBeatLanes = 4)
-    val K26_MMFree2_7B_A16_B6: CoreConfig = K26_MMFree2_7B_A16.copy(batchSize = 6, outBeatLanes = 4)
-    // B6 can't close 250 MHz (route-bound arm-RAM→accumulator broadcast, ~−0.37 ns,
-    // unmoved by the impl levers). fmax ≈ 228 MHz, so this steps down to the next rung.
-    // RENAMED 2026-08-04 from _230: 230 is not a PL0_REF rung, so the "230 MHz" build was
-    // always constrained (and, after the deploy snap-down fix, always run) at 199.998 MHz.
-    // See the plClkMhz require above. The name now matches the constraint.
-    val K26_MMFree1_3B_A16_B6_200: CoreConfig = K26_MMFree1_3B_A16_B6.copy(plClkMhz = 200)
-
-    // ── B6 timing/area levers ported from the 370M B6 sweep to the maxN=8192 engine ──
-    // Same two experiments that bracket the 370M B6 (accumulator-headroom trim +
-    // input-broadcast fanout), aimed squarely at the route-bound arm-RAM→accumulator
-    // broadcast path that keeps 1.3B/2.7B B6 off 250 MHz (see _B6_230). maxN=8192 →
-    // auto headroom = log2Ceil(8192) = 13 (accWidth 16+13 = 29), so these trim to 11/7
-    // (accWidth 27/23) — 2 and 6 bits below auto, matching the 370M drop of 2/6 from its
-    // auto 12. nextPow2 keeps the m_axis lane at 32 bits for any headroom in 1..16, so
-    // the H siblings differ from B6 ONLY in accumulator / tileAccums / outBram width, and
-    // the F siblings ONLY in the array-feed skid + max_fanout attribute. NOT for
-    // deployment until the model's real dynamic range is validated (overflow); a full
-    // impl build is the only real timing test (OOC can't see the congestion).
-    // 1.3B and 2.7B share one bitstream geometry, so each lever is mirrored across both.
-    val K26_MMFree1_3B_A16_B6_H11: CoreConfig = K26_MMFree1_3B_A16_B6.copy(accHeadroomBits = 11)
-    val K26_MMFree1_3B_A16_B6_H7:  CoreConfig = K26_MMFree1_3B_A16_B6.copy(accHeadroomBits = 7)
-    val K26_MMFree1_3B_A16_B6_F32: CoreConfig = K26_MMFree1_3B_A16_B6.copy(actMaxFanout = 32)
-    val K26_MMFree1_3B_A16_B6_F16: CoreConfig = K26_MMFree1_3B_A16_B6.copy(actMaxFanout = 16)
-    val K26_MMFree2_7B_A16_B6_H11: CoreConfig = K26_MMFree2_7B_A16_B6.copy(accHeadroomBits = 11)
-    val K26_MMFree2_7B_A16_B6_H7:  CoreConfig = K26_MMFree2_7B_A16_B6.copy(accHeadroomBits = 7)
-    val K26_MMFree2_7B_A16_B6_F32: CoreConfig = K26_MMFree2_7B_A16_B6.copy(actMaxFanout = 32)
-    val K26_MMFree2_7B_A16_B6_F16: CoreConfig = K26_MMFree2_7B_A16_B6.copy(actMaxFanout = 16)
-
-    // DSP48E2-accumulator variant (see K26_MMFree370M_A16_B4_DSP). Same maxN=8192
-    // B4 geometry (32*4*8 = 1024 lanes → 1024 DSPs ≤ 1248) + the 250 MHz levers;
-    // differs from B4 only in the use_dsp attr on accumReg. accWidth here is 29b
-    // (16 + log2Ceil(8192)), still one DSP48E2 P-register per lane. A/B against
-    // K26_MMFree2_7B_A16_B4 for DSP/LUT/CARRY8 + WNS.
-    val K26_MMFree2_7B_A16_B4_DSP: CoreConfig = K26_MMFree2_7B_A16_B4.copy(dspAccum = true)
-    // DSP accumulators + systolic column banking (8 cols/bank → 4 banks at xDim=32):
-    // cuts the activation-broadcast fanout 32→8 to buy back margin on the DSP build,
-    // which closed 250 MHz with WNS ~0.000 (no room for silicon/temp fluctuation).
-    // Numerically identical, +3 cyc latency/op. A/B against K26_MMFree2_7B_A16_B4_DSP.
-    val K26_MMFree2_7B_A16_B4_DSP_S8: CoreConfig = K26_MMFree2_7B_A16_B4_DSP.copy(colBankSize = 8)
-
-    // 1.6-bit weight packing (packedWeights): a 256-entry unpack ROM + elastic gearbox
-    // on the s_axis→inQ path streams ternary weights at 5 trits/byte, ~20% fewer weight
-    // bytes on the DDR/HP-port wire — the binding resource for the bandwidth-bound decode
-    // (see [[fclk_runtime_vs_sta_clock]]). forModel(packedWeights=true) also sizes udmabuf-wt
-    // to the exact packed resident set (~0.8x). The 1.6-bit weight BLOB format MUST match
-    // this bitstream (weight_format=ternary-1p6; the runtime cross-checks MMFREE_PACKED_WEIGHTS).
-    //   _PACKED       — B1 base, for correctness bring-up + `make gate` bit-exactness.
-    //   _B4_DSP_S8_PACKED — the workhorse on the known-closing B4+DSP+S8 stack, for tok/s.
-    // CLOCK: the workhorse runs at 200 MHz, NOT 250. The 2.7B B4_DSP_S8 base closes 250
-    // at only +0.001 ns; its critical path is the maxN=8192 activation-BRAM 8-deep
-    // RAMB36E2 cascade → inQ (NOT the gearbox — LUT util ~43%, no congestion). Adding the
-    // unpack gearbox perturbs placement ~0.1 ns and tips that razor-thin path (packed 250
-    // build: WNS −0.097, Est Fmax 244). 250 was never sustainable here with added logic.
-    // Dropping a rung is nearly free on tok/s: decode is bandwidth-bound (see
-    // [[fclk_runtime_vs_sta_clock]]; the 12-arm sweep measured 250→200 = −20% clock costing
-    // only 2–5% at b=6), and packing already cut the binding weight bandwidth 20%.
-    // WAS plClkMhz=230 until 2026-08-04 — 230 is not a rung, so the constraint was 199.998
-    // all along (WNS +0.096 against 5.000 ns = Fmax 203.9, not the 235 the .rpt claimed).
-    // Only the LABEL changes here; the constraint is what it always was.
-    val K26_MMFree2_7B_A16_PACKED: CoreConfig =
-        forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
-                 shapes = "2.7b", model = "ridger/MMfreeLM-2.7B", packedWeights = true)
-    val K26_MMFree2_7B_A16_B4_DSP_S8_PACKED: CoreConfig =
-        K26_MMFree2_7B_A16_PACKED.copy(batchSize = 4, outBeatLanes = 4, plClkMhz = 200,
-            dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
-
-    // B6 on the same DSP-accum + column-banking (S8) lever stack, targeting 250 MHz.
-    // The runtime-batch drain (COMPUTE flags field → cmpBatch) makes this ONE bitstream
-    // serve both regimes: b=6 amortizes the 654 MB/token weight stream (the real lever
-    // for the bandwidth-bound 2.7B decode), while a b=1 decode drains only row 0 so it
-    // pays ~B1's cost (the weight stream is already batch-count-independent).
-    // CAVEAT — DSP capacity: full DSP-accum coverage needs xDim*batch*nLanes =
-    // 32*6*8 = 1536 DSP48E2 > the K26's 1248, so ~1/4 of the lane accumulators spill
-    // back to LUT/CARRY8. Banking (S8) + the aggressive impl flow are what close 250;
-    // if the spill-driven congestion misses, fall back to B6_S8 (banking only, no DSP)
-    // or the B4_DSP_S8 clean base. A full impl build is the only real timing test.
-    val K26_MMFree2_7B_A16_B6_DSP_S8: CoreConfig =
-        K26_MMFree2_7B_A16_B6.copy(dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
-
-    // B6 + DSP + banking at 200 MHz — the throughput-max maxN=8192 build, and the
-    // deployable conclusion of the B6@250 hunt. Both 250 attempts missed by a wide,
-    // lever-immune margin (DSP_S8 −0.376, S8-only −0.483), which is the same route-bound
-    // arm-RAM→accumulator broadcast that sent 1.3B B6 down a rung (see _B6_200). The rung
-    // below buys 1.000 ns over the DSP_S8 miss, so it closes comfortably (+0.118).
-    // Dropping the clock costs almost nothing here: decode is weight-bandwidth-bound — the
-    // 12-arm sweep measured 250→200 (−20% clock) costing only 2–5% at b=6. B6 vs B4 is the
-    // lever that matters — 6 tokens per weight stream instead of 4 on a 654 MB/token
-    // stream. With the runtime-batch drain this ONE bitstream also serves b=1..5, and the
-    // maxN=8192 geometry runs 370M/1.3B/2.7B, so it is the single build a batch sweep needs.
-    // RENAMED 2026-08-04 from _230, which was never a real clock: 230 is not a PL0_REF rung
-    // and snapped to 199.998, so this bitstream's +0.118 ns is slack against 5.000 ns
-    // (Fmax 204.8) — NOT against 4.348 ns as the report used to claim. The build itself is
-    // unchanged; only the label was wrong. fclk0 still has to be set explicitly on the
-    // board (deploy_kria.sh does it from the manifest) or it keeps the stale rate.
-    val K26_MMFree2_7B_A16_B6_DSP_S8_200: CoreConfig =
-        K26_MMFree2_7B_A16_B6_DSP_S8.copy(plClkMhz = 200)
-
-    // Banking-only B6 @ 250 — the DSP_S8 fallback. B6_DSP_S8 missed 250 at WNS −0.376 ns
-    // with the critical path on actBram/inQ reads: the 1248-DSP + LUT/CARRY8 spill (1536
-    // needed, only 1248 available) congested the BRAM read paths. This drops dspAccum so
-    // the accumulators go back to LUT/CARRY8 (no spill-driven congestion) while KEEPING
-    // colBankSize=8, which cuts the activation-broadcast fanout 32→8 — the exact route-
-    // bound arm-RAM→accumulator broadcast that holds plain B6 at ~−0.37 ns / fmax ≈ 228
-    // (see _B6_230, which gave up and dropped to 230). Banking targets that path directly
-    // and it's untried on B6 without the DSP congestion on top; if it still misses 250,
-    // fall back to the clean B4_DSP_S8 base. Full impl build is the only real timing test.
-    val K26_MMFree2_7B_A16_B6_S8: CoreConfig =
-        K26_MMFree2_7B_A16_B6.copy(colBankSize = 8, implDirectives = b4TimingLevers250)
-
-    // ── combined-lever B6 @ 250: the default candidate ────────────────────────
-    // Both levers on the 2.7B B6 at once — the first attempt to actually CLOSE the
-    // route-bound arm-RAM→accumulator broadcast that keeps B6 off 250 MHz (see
-    // _B6_230), rather than bracketing each lever alone. H11 = conservative 2-bit
-    // headroom trim (accWidth 27, safest overflow margin); F16 = aggressive per-column
-    // replication of the broadcast register (shortest routes on the critical path).
-    // F16 only crosses into the array under SYNTH_FLATTEN=full, and the miss is wide
-    // (~−0.37 ns), so this carries the proven b4TimingLevers250 aggressive impl flow
-    // (SYNTH_FLATTEN=full + Aggressive place/phys/route) — the full toolbox. If it
-    // closes 250 AND validates on-board (errs=0), this + its 1.3B sibling become the
-    // default B6 presets. NOT deployment-ready until the model's real dynamic range is
-    // validated (H11 overflow); this build is the timing/correctness gate for that.
-    val K26_MMFree2_7B_A16_B6_H11_F16: CoreConfig =
-        K26_MMFree2_7B_A16_B6.copy(accHeadroomBits = 11, actMaxFanout = 16, implDirectives = b4TimingLevers250)
-    val K26_MMFree1_3B_A16_B6_H11_F16: CoreConfig =
-        K26_MMFree1_3B_A16_B6.copy(accHeadroomBits = 11, actMaxFanout = 16, implDirectives = b4TimingLevers250)
-
-    // ══ FROZEN SET (2026-07-30): the best packed bitstream per model size ══════
-    // Deliberately TWO builds, not three. maxN = nextPow2(max(hidden, intermediate)) and
-    // maxM = ceilTo(max(2*intermediate, 32000), 256), so:
-    //   370M -> maxN 4096, maxM 32000
-    //   1.3B -> maxN 8192, maxM 32000
-    //   2.7B -> maxN 8192, maxM 32000
-    // 1.3B and 2.7B therefore produce byte-IDENTICAL RTL — they differ only in shapesHint /
-    // model / residentWtBytes, which feed the manifest (udmabuf-wt sizing, MODEL, SHAPES) and
-    // never reach the Core. So build A below is the 1.3B+2.7B bitstream and 1.3B runs on it
-    // via `MODEL=1.3b` with WT sized for the larger 2.7B set (see [[universal_overlay_wt_patch]]).
+    // ─── Deployable presets ────────────────────────────────────────────────
     //
-    // WHY THIS IS "BEST": B6 is the batch ceiling for EVERY size — B8 is a 95.4% LUT capacity
-    // wall, a device limit rather than a fixable path. Board-measured 2026-07-30: B6 is worth
-    // +11.8% over B4 and 1.6-bit packing +4.2%, and the two are independent, so B6+packed is
-    // the combination and it projects ~30.5 tok/s at 2.7B b=6. Clock is the LEAST valuable
-    // axis (the 12-arm sweep measured 250→200 = −20% clock costing only 2–5% at b=6, decode
-    // being weight-bandwidth-bound; see [[fclk_runtime_vs_sta_clock]]), so each build targets
-    // the highest RUNG that CLOSES — and only rungs, since off-rung values snap down.
+    // Exactly three, one per released MMfreeLM checkpoint. Each is the arm that WON the
+    // 2026-08-04/05 board sweep for its size, flattened into a single definition so the
+    // configuration is readable without chasing a .copy() chain through a dozen ancestors.
     //
-    // TIMING BUDGET — the unpack gearbox costs ~0.098 ns, measured on 2.7B B4_DSP_S8 (WNS
-    // +0.001 unpacked -> -0.097 packed, both at 250). Applied to the known closures:
-    //   A: B6_DSP_S8 @200 closed +0.118  ->  packed @200 ~= +0.02 (thin; measured +0.003)
-    //   B: 370M B6   @250 closed +0.048  ->  packed @250 ~= -0.05 (misses) unless banking
-    //      buys it back (it did: measured +0.030)
-    // The "@225" and "@240" fallbacks these notes used to name were never distinct timing
-    // points — both snap to the rung their parent already used. Deleted 2026-08-04.
+    // The ~50 ablation presets these were selected from — batch ladders, accumulator
+    // headroom, broadcast fanout, DSP-accum on/off, banking width, clock rungs, and the
+    // matched 2-bit controls for every packed arm — live on the `exploration` branch
+    // together with the sweep harness that produced the numbers below:
+    //
+    //     git checkout exploration
+    //     make build PRESET=k26_mmfree2_7b_a16_b6_dsp_s8_200
+    //
+    // ── WHAT ALL THREE SHARE ──────────────────────────────────────────────────
+    //
+    // batchSize = 6, outBeatLanes = 4
+    //   Decode is weight-bandwidth-bound, so the lever that matters is tokens amortized
+    //   per weight stream. B6 measured +11.8% over B4. B8 is a device capacity wall
+    //   (~95% LUT) even with DSP accumulators, so 6 is the ceiling the K26 can hold.
+    //   outBeatLanes=4 puts m_axis at 128 bits to match the HP port width; at 32 bits the
+    //   STORE was the batch bottleneck at ~1 GB/s and did not amortize.
+    //   The runtime batch count (COMPUTE flags field -> cmpBatch) makes ONE B6 bitstream
+    //   also serve b=1..5 at ~B1 cost, so there is no reason to ship a low-B build.
+    //
+    // packedWeights = true — 1.6-bit weights, 5 trits/byte
+    //   Cuts the binding weight traffic ~20%; measured +4.3% tok/s at 2.7B b=6, growing
+    //   with model size and shrinking with batch. Independent of the B6 gain, so the two
+    //   compound. This is an RTL parameter (the unpack gearbox only exists when it is
+    //   set), so a packed bitstream needs a packed blob — the runner hard-errors on a
+    //   mismatch rather than streaming garbage.
+    //
+    // plClkMhz = 250 — the top reachable PL0_REF rung (see plClkRungs).
+    //   Worth only ~5% at b=6, because a bandwidth-bound decode barely notices the fabric
+    //   clock. Kept because it is free once the build closes, and all three close.
+    //
+    // implDirectives = b4TimingLevers250 — SYNTH_FLATTEN=full plus Aggressive
+    //   place/phys/route. Every one of these three needs it to make 250.
+    //
+    // ── WHAT DIFFERS, AND WHY ─────────────────────────────────────────────────
+    //
+    // 370M is maxN=4096. 1.3B and 2.7B are both maxN=8192 (nextPow2 of the largest inner
+    // dim), so they emit BYTE-IDENTICAL RTL and differ only in manifest fields — model,
+    // bench shapes, udmabuf-wt sizing. Three presets, TWO bitstreams: build the 2.7B one
+    // and assemble 1.3B from it with scripts/clone_preset_hw.sh (seconds, not 50 minutes).
+    //
+    // The maxN=8192 pair carries three levers that 370M does not need:
+    //
+    //   dspAccum = true      Maps the lane accumulators onto DSP48E2 instead of LUT/CARRY8,
+    //                        worth ~22 pp LUT and ~34 pp CARRY8. Full coverage would want
+    //                        xDim*batch*nLanes = 32*6*8 = 1536 DSPs against the K26's 1248,
+    //                        so ~1/4 spill back to fabric; it is still a large net win.
+    //
+    //   colBankSize = 4      Halves the activation-broadcast fanout. Targets the route-bound
+    //                        path (74% route over 3 levels) that the DSP spill creates by
+    //                        smearing the array across the die.
+    //
+    //   actRamStyle="block"  Caps the 8192x96 activation BRAM's 8-deep RAMB36E2 hard cascade
+    //   actCascadeHeight=2   at one hop, resolving the rest in a fabric mux. That cascade was
+    //                        3.206 ns of pure logic before a single net routed. The attributes
+    //                        ride on the ActMem BlackBox because CIRCT cannot attach them to a
+    //                        SyncReadMem — same reason OutMemUltra exists.
+    //
+    // The last two are a PAIR. The two paths they fix failed 0.005 ns apart, so fixing
+    // either one alone moves WNS by 0.005 ns and wastes a 50-minute build; CoreConfigSpec
+    // pins that they always travel together.
+    //
+    // 370M needs none of the three: maxN=4096 is a 4-deep cascade, and it closes 250 with
+    // banking alone. dspAccum there would add spill congestion for no benefit.
+    //
+    // ── MEASURED — KRIA KV260, decode tok/s, POWER=1, all gates PASS, streams_ok=1 ─
+    //
+    //   preset        b=1    b=2    b=3    b=4    b=5    b=6   WNS@250   SOM W   tok/J
+    //   mmfree_370m  41.67  65.32  79.00  93.10  95.84  102.63  +0.030    5.37    19.1
+    //   mmfree_1_3b  20.40  33.30  42.75  49.18  51.73   55.43  +0.025*   5.96     9.30
+    //   mmfree_2_7b  11.72  19.27  25.16  29.88  30.97   34.41  +0.025    6.14     5.61
+    //
+    //   * 1.3B runs the 2.7B bitstream, so the 2.7B WNS is its timing record.
+    //   Against a Xeon W-2155 at the same weight format, the KRIA is 1.4-2.0x SLOWER in
+    //   raw throughput and 8.8-13.2x better in tok/J, with the energy advantage growing
+    //   with model size.
+    //
+    // Use b=4 or b=6, never b=5: the host's vector ops are omp static over the batch on
+    // 4 A53 cores, so they cost ceil(b/4) waves and b=5 pays b=6's price for 5 streams.
 
-    // Build A — 1.3B + 2.7B. Same DSP+banking lever stack as the measured B6_DSP_S8_200,
-    // plus packing. Keeps dspAccum even though 32*6*8 = 1536 DSP > the K26's 1248 (~1/4 of
-    // the lane accumulators spill to LUT/CARRY8), because that exact stack is what closed
-    // 200 at +0.118 — this changes ONE thing (packing) against a known-good baseline.
-    // plClkMhz was 230 until 2026-08-04; the constraint was 199.998 either way, so the
-    // measured +0.003 ns is slack against 5.000 ns => Fmax 200.1. Razor-thin AT ITS REAL
-    // RATE, which the 230 label had been hiding.
-    val K26_MMFree2_7B_A16_B6_DSP_S8_PACKED: CoreConfig =
-        K26_MMFree2_7B_A16_PACKED.copy(batchSize = 6, outBeatLanes = 4, plClkMhz = 200,
-            dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
-
-    // ── Build A, 1.3B-named siblings (SAME bitstream, correct manifest) ───────
-    // Build A's RTL is byte-identical for 1.3B and 2.7B (see the maxN/maxM arithmetic
-    // above), so these exist ONLY to carry a 1.3B-correct manifest: MMFREE_MODEL =
-    // ridger/MMfreeLM-1.3B (so `make model` provisions/packs the right checkpoint and the
-    // board's gate/run/gen auto-find its blobs), MMFREE_SHAPES = 1.3b (bench sweep), and
-    // UDMABUF_WT_SZ sized to 1.3B's resident set instead of 2.7B's — 1.3B then needs
-    // ~310 MiB of CMA for 2-bit / ~248 MiB packed rather than 2.7B's 624 MiB.
-    // They are NOT separate Vivado runs: assemble their transfer/presets/<p>/ from the
-    // corresponding 2.7B bitstream (identical CoreTop.sv / Core.sv) with the dtbo's
-    // udmabuf-wt re-sized, and keep the 2.7B WNS as the timing record
-    // (+0.118 2-bit / +0.003 packed, both against the 5.000 ns / 199.998 MHz constraint —
-    // reports/*.rpt).
-    // Running MODEL=1.3b on the 2.7B-named preset stays valid and equivalent; it just
-    // over-reserves WT and mislabels the sweep. See [[universal_overlay_wt_patch]].
-    val K26_MMFree1_3B_A16_PACKED: CoreConfig =
-        forModel(hidden = 2048, intermediate = 5632, vocab = 32000, layers = 24,
-                 shapes = "1.3b", model = "ridger/MMfreeLM-1.3B", packedWeights = true)
-    val K26_MMFree1_3B_A16_B6_DSP_S8_200: CoreConfig =
-        K26_MMFree1_3B_A16_B6.copy(plClkMhz = 200,
-            dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
-    val K26_MMFree1_3B_A16_B6_DSP_S8_PACKED: CoreConfig =
-        K26_MMFree1_3B_A16_PACKED.copy(batchSize = 6, outBeatLanes = 4, plClkMhz = 200,
-            dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
-    // The _225 "fallback" presets are GONE (2026-08-04). NOTE (2026-08-03) had already found
-    // that the 2.7B parent built at "225" produced a bitstream BYTE-IDENTICAL to the "230"
-    // one (same sha256, same WNS 0.003) from a separate full impl run, and guessed snapping
-    // as the cause. That guess is now MEASURED: scripts/probe_pl_clk.tcl reads ACT_FREQMHZ
-    // out of the PS IP and 215/220/225/230/240 all land on 199.998 MHz. So _225 was not a
-    // safer timing point, it was the same build under a second name — 40 minutes of Vivado
-    // per size for nothing. The plClkMhz require above makes that unrepeatable.
-
-    // Build B — 370M. NOT dspAccum: the same 1536 > 1248 DSP spill that build A tolerates at
-    // 200 is what sank 2.7B B6_DSP_S8 at 250 (WNS -0.376), and this build is trying to hold
-    // 250. Banking only (colBankSize=8) cuts the activation-broadcast fanout 32->8, attacking
-    // the route-bound path directly without adding DSP congestion; it is untried at 370M,
-    // which closes 250 with no levers at all, so it is the credible way to absorb the gearbox.
-    val K26_MMFree370M_A16_PACKED: CoreConfig =
+    /** MMfreeLM-370M — hidden 1024, intermediate 2816, vocab 32000, 24 layers.
+      * maxN=4096, ~85 MB of weight traffic per token. 102.63 tok/s at b=6.
+      */
+    val MMFree_370M: CoreConfig =
         forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
                  aWidth = 16, xDim = 32, outBeatLanes = 1, signedAct = true,
                  plClkMhz = 250, shapes = "370m", model = "ridger/MMfreeLM-370M",
                  packedWeights = true)
-    val K26_MMFree370M_A16_B6_PACKED: CoreConfig =
-        K26_MMFree370M_A16_PACKED.copy(batchSize = 6, outBeatLanes = 4,
-            colBankSize = 8, implDirectives = b4TimingLevers250)
-    // (There was a _240 fallback here for the case where 250 missed. It never meant anything:
-    // 240 snaps to 199.998, so it would have been a 20% clock cut dressed up as a 4% one. 250
-    // closed anyway at +0.030. Deleted 2026-08-04; the real fallback rung is 200.)
+            .copy(batchSize = 6, outBeatLanes = 4, colBankSize = 8,
+                  implDirectives = b4TimingLevers250)
 
-    // Build B's MATCHED 2-BIT CONTROL — the other half of the 370M packing A/B.
-    // Until this existed the 370M pair was the only confounded one in the sweep set: its
-    // 2-bit arm was K26_MMFree370M_A16_B6_RB (colBankSize = 0), so the pair difference mixed
-    // column banking into the packing delta. 1.3B and 2.7B had matched pairs and 370M did not,
-    // which is exactly the size where the packing gain should be smallest (85 MB/token of
-    // weights vs 655 MB at 2.7B) and therefore the one that can least afford a confound.
-    // This is K26_MMFree370M_A16_B6_PACKED with ONE field changed — packedWeights — so the
-    // pair isolates the weight encoding and nothing else.
-    //
-    // Built from the UNPACKED base rather than `.copy(packedWeights = false)` on the packed
-    // preset, and that distinction is load-bearing: residentWtBytes is computed INSIDE
-    // forModel from packedWeights (2 bits/weight vs the exact 1.6-bit per-projection sum), so
-    // copying the packed preset would keep its ~0.8x resident figure while the RTL streamed
-    // full 2-bit weights — i.e. a udmabuf-wt sized 20% too small, which surfaces as a
-    // truncated weight stream rather than an allocation error.
-    //
-    // Timing, BUILT 2026-08-03: closed 250 MHz at WNS +0.034, LUT 75.11% (vs the packed
-    // build's +0.030 / 81.91%). The area came out as expected (-6.8 pp LUT, the gearbox) but
-    // the ~0.098 ns the gearbox costs on 2.7B B4 did NOT come back here — the prediction of
-    // ~+0.13 was wrong, so at 370M the gearbox is not on the critical path and the same
-    // route-bound path bounds both arms. Convenient for the A/B: the two arms close 250 with
-    // near-identical margin, so neither is advantaged by timing slack.
-    val K26_MMFree370M_A16_B6_S8: CoreConfig =
-        K26_MMFree370M_A16.copy(batchSize = 6, outBeatLanes = 4,
-            colBankSize = 8, implDirectives = b4TimingLevers250)
-
-    // ── B8 retry: the capacity wall was measured BEFORE dspAccum existed ──────
-    // B8 was written off as "a ~95% LUT capacity wall, not a single path" — but that was on
-    // fabric accumulators. Moving them into DSP48s is worth −21.9 pp LUT and −34 pp CARRY8 at
-    // B6 (measured: 77.15/45.10 no-DSP vs 55.26/11.06 with), which changes the arithmetic
-    // enough to be worth one build. Decomposing measured LUT% into fixed + per-batch array
-    // logic + fabric cost of the DSP-spilled lanes (0.0143 pp/lane) predicts:
-    //     B8 + DSP + packed  ~80% LUT, ~31% CARRY8, 50% URAM, ~54% BRAM, 100% DSP
-    //     B8 WITHOUT dspAccum ~110% LUT  <- i.e. the original rejection was correct
-    // so dspAccum is not an optimization here, it is the enabling condition. The model
-    // reproduces B4 to 0.26 pp when the B6-measured packing delta is transferred down, but B8
-    // is one extrapolation step past the data — treat ~80% as +/- a few points.
-    //
-    // WHY B8 AND NOT JUST MORE CLOCK: b=8 is optimal on BOTH sides at once, which nothing else
-    // on the roadmap is. Engine side, the weight stream amortizes over 8 tokens instead of 6
-    // (B4->B6 measured +11.8%). Host side, CPU vector ops cost ceil(b/4) waves on the 4 A53s
-    // (parallel_rows is omp schedule(static) over batch rows), so efficiency b/(4*ceil(b/4)) is
-    // 0.75 at b=6 but 1.00 at b=8 — b=5..8 all pay the same two waves and only b=8 fully
-    // amortizes them (see [[batch_wave_quantization]]).
-    //
-    // CLOCK 200: B6+packed closed 200 at only +0.003, and B8 triples the DSP spill (288 -> 800
-    // lanes) while pushing LUT 60 -> ~80% where congestion starts costing real delay, so there
-    // is no headroom to give away. This asked for 215 until 2026-08-04, which is not a rung and
-    // snapped to 199.998 — i.e. it was already this build, just mislabelled and believed to
-    // carry ~0.30 ns of extra margin it never had. The next rung DOWN is 166.67, a 17% cut that
-    // is not worth paying pre-emptively; build at 200 and drop only if it misses.
-    // READING A FAILURE: LUT/placement overflow => the wall is real even with DSP, abandon B8.
-    // A timing miss with utilization in range => just drop the clock further.
-    val K26_MMFree2_7B_A16_B8_DSP_S8_PACKED: CoreConfig =
-        K26_MMFree2_7B_A16_PACKED.copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 200,
-            dspAccum = true, colBankSize = 8, implDirectives = b4TimingLevers250)
-
-    // ══ THE 250 MHz ATTEMPT ON maxN=8192 B6 (2026-08-04) ══════════════════════
-    // Everything before this gave up on 250 for the 1.3B/2.7B B6 engine and stepped down a
-    // rung. That retreat was decided from a single WNS number per build; since 2026-08-03
-    // build_project.tcl also dumps reports/<tag>.paths.txt, and the picture it shows is the
-    // reason to try again: `k26_mmfree2_7b_a16_b6_dsp_s8` @250 (WNS -0.376) fails on TWO
-    // structurally different paths only 0.005 ns apart, so every previous single-lever
-    // attempt was capped by whichever path it did not touch.
-    //
-    //   -0.376  logic 3.206 (76%)  7 levels  actBram/Memory_reg_bram_8 -> inQ/ram_ext
-    //   -0.371  route 3.189 (74%)  3 levels  arr/REG_11_0_reg[0] -> arr_4_11 DSP ALU_OUT
-    //
-    // Path 1 is LOGIC-bound and specific to maxN=8192. The full timing report names the
-    // mechanism outright: Vivado maps SyncReadMem(8192, Vec(6, UInt(16))) as 1024x36 blocks
-    // and chains eight of them through the DSP-style hard cascade —
-    //   Prop_RAMB36E2_CLKBWRCLK_CASDOUTB   1.588 ns   (bram_8)
-    //   7x Prop_RAMB36E2_CASDINB_CASDOUTB  0.247 ns   (bram_9..15)
-    //   Prop_RAMB36E2_CASDINB_DOUTBDOUT    0.136 ns
-    // = 3.206 ns of pure logic before a single net is routed. 370M (maxN=4096, 4 deep)
-    // closes 250 with no levers at all, which is the control: DEPTH is the variable, not the
-    // batch width. actRamStyle="block" + actCascadeHeight=2 caps the chain at one hop and
-    // resolves the remaining 4 groups in a fabric mux — ~1.7 ns of the 3.2 should come back,
-    // for ~96 LUTs and no latency change (ActMem is read-for-read identical to SyncReadMem).
-    //
-    // Path 2 is ROUTE-bound at 74% — 2.785 ns on ONE net, a fanout-103 banked broadcast
-    // register at SLICE_X33Y144 reaching a LUT3 at SLICE_X5Y55, i.e. most of the way across
-    // the die. Pipelining cannot help a single net. The cause is physical: DSPs are 100% used
-    // (1248/1248) while B6 wants 32*6*8 = 1536 accumulators, so ~288 lanes spill to fabric
-    // and the array smears over the whole device. colBankSize=4 halves the fanout (8 banks
-    // instead of 4) and gives the placer twice as many, smaller broadcast domains to keep
-    // local. Cost is +7 cycles of latency per op instead of +3 (nAcc is 2048-8192: noise)
-    // and ~2500 more flops for the deeper per-bank pipeline, on 35% register utilization.
-    //
-    // BOTH levers together or neither: fixing one path alone moves WNS by 0.005 ns.
-    val K26_MMFree2_7B_A16_B6_DSP_S4_ACB2: CoreConfig =
-        K26_MMFree2_7B_A16_B6_DSP_S8.copy(colBankSize = 4,
-            actRamStyle = "block", actCascadeHeight = 2)
-    // The deployable version of the above: same two levers on the packed B6, which is the
-    // arm the 12-arm sweep actually shipped. Only meaningful if the 2-bit attempt closes —
-    // the unpack gearbox costs ~0.098 ns on this engine, so this needs the attempt to land
-    // with real margin, not at +0.00x.
-    val K26_MMFree2_7B_A16_B6_DSP_S4_ACB2_PACKED: CoreConfig =
-        K26_MMFree2_7B_A16_B6_DSP_S8_PACKED.copy(plClkMhz = 250, colBankSize = 4,
-            actRamStyle = "block", actCascadeHeight = 2)
-    // 1.3B-named siblings of the 250 builds — identical RTL (maxN/maxM are the same at 1.3B and
-    // 2.7B, see the frozen-set arithmetic above), 1.3B manifest so MMFREE_MODEL/SHAPES and the
-    // udmabuf-wt sizing are right. Assemble BOTH from the corresponding 2.7B bitstream with
-    // scripts/clone_preset_hw.sh — seconds each, not two more 50-minute Vivado runs. The 2.7B
-    // WNS is the timing record for them (+0.042 2-bit / +0.025 packed, both @250.000 MHz).
-    val K26_MMFree1_3B_A16_B6_DSP_S4_ACB2: CoreConfig =
-        K26_MMFree1_3B_A16_B6_DSP_S8_200.copy(plClkMhz = 250, colBankSize = 4,
-            actRamStyle = "block", actCascadeHeight = 2)
-    val K26_MMFree1_3B_A16_B6_DSP_S4_ACB2_PACKED: CoreConfig =
-        K26_MMFree1_3B_A16_B6_DSP_S8_PACKED.copy(plClkMhz = 250, colBankSize = 4,
-            actRamStyle = "block", actCascadeHeight = 2)
-    // Attribution build, only worth running if the combined attempt CLOSES: the actBram fix
-    // alone. If this also closes then colBankSize=4 was unnecessary and the cheaper preset
-    // wins; if it misses by ~0.37 it confirms both paths had to be fixed. Not on the critical
-    // path to a deployable bitstream — queue it after.
-    val K26_MMFree2_7B_A16_B6_DSP_S8_ACB2: CoreConfig =
-        K26_MMFree2_7B_A16_B6_DSP_S8.copy(actRamStyle = "block", actCascadeHeight = 2)
-
-    /**
-      * LM head config for matmulfree HGRN: M=32000 output (vocab size), inner dim
-      * up to 4096 (covers the 370M-class model with hidden_dim=2731 and headroom).
-      *
-      *   - xDim = 64 → 512-bit s_axis at the typical 250 MHz PL clock targets
-      *     full-DDR4 effective bandwidth (~16 GB/s) on K26.
-      *   - batchSize = 1 (LM head is single-token during inference).
-      *   - outBeatLanes = 32 → 1024-bit m_axis (standard AXI-DMA width), 8 sub-beats
-      *     per col tile (8192/32 = 256 lanes per col tile → 8 m_axis beats).
+    /** MMfreeLM-1.3B — hidden 2048, intermediate 5632, vocab 32000, 24 layers.
+      * maxN=8192, ~325 MB of weight traffic per token. 55.43 tok/s at b=6.
+      * Same RTL as MMFree_2_7B; assemble its bundle with scripts/clone_preset_hw.sh.
       */
-    val K26_LMHead: CoreConfig = CoreConfig(
-        aWidth       = 8,
-        maxAcc       = 4096,
-        xDim         = 64,
-        batchSize    = 1,
-        maxN         = 4096,
-        maxM         = 32000,
-        outBeatLanes = 32
-    )
+    val MMFree_1_3B: CoreConfig =
+        forModel(hidden = 2048, intermediate = 5632, vocab = 32000, layers = 24,
+                 shapes = "1.3b", model = "ridger/MMfreeLM-1.3B", packedWeights = true)
+            .copy(batchSize = 6, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
+                  colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
+                  implDirectives = b4TimingLevers250)
 
+    /** MMfreeLM-2.7B — hidden 2560, intermediate 6912, vocab 32000, 32 layers.
+      * maxN=8192, ~655 MB of weight traffic per token. 34.41 tok/s at b=6.
+      * The largest checkpoint the K26 runs, and the one to build from.
+      */
+    val MMFree_2_7B: CoreConfig =
+        forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
+                 shapes = "2.7b", model = "ridger/MMfreeLM-2.7B", packedWeights = true)
+            .copy(batchSize = 6, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
+                  colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
+                  implDirectives = b4TimingLevers250)
+
+    /** The deployable set — what `make build PRESET=` and the board bundle consume.
+      * Dev fixtures above are deliberately absent; ablations live on `exploration`.
+      */
     val presets: Map[String, CoreConfig] = Map(
-        "default"     -> Default,
-        "tiny"        -> Tiny,
-        "k26_small"   -> K26_Small,
-        "k26_medium"  -> K26_Medium,
-        "k26_large"  -> K26_Large,
-        "k26_bench"   -> K26_Bench,
-        "k26_bench16" -> K26_Bench16,
-        "k26_bench32" -> K26_Bench32,
-        "k26_bench64" -> K26_Bench64,
-        "k26_mmfree370m" -> K26_MMFree370M,
-        "k26_mmfree370m_a16" -> K26_MMFree370M_A16,
-        "k26_mmfree370m_a16_b2" -> K26_MMFree370M_A16_B2,
-        "k26_mmfree370m_a16_b4" -> K26_MMFree370M_A16_B4,
-        "k26_mmfree370m_a16_b6" -> K26_MMFree370M_A16_B6,
-        "k26_mmfree370m_a16_b6_h10" -> K26_MMFree370M_A16_B6_H10,
-        "k26_mmfree370m_a16_b6_h6"  -> K26_MMFree370M_A16_B6_H6,
-        "k26_mmfree370m_a16_b6_f32" -> K26_MMFree370M_A16_B6_F32,
-        "k26_mmfree370m_a16_b6_rb"  -> K26_MMFree370M_A16_B6_RB,
-        "k26_mmfree370m_a16_b6_f16" -> K26_MMFree370M_A16_B6_F16,
-        "k26_mmfree370m_a16_b4_dsp" -> K26_MMFree370M_A16_B4_DSP,
-        "k26_mmfree370m_a16_b8" -> K26_MMFree370M_A16_B8,
-        "k26_mmfree1_3b_a16" -> K26_MMFree1_3B_A16,
-        "k26_mmfree1_3b_a16_b4" -> K26_MMFree1_3B_A16_B4,
-        "k26_mmfree1_3b_a16_b6" -> K26_MMFree1_3B_A16_B6,
-        "k26_mmfree1_3b_a16_b6_200" -> K26_MMFree1_3B_A16_B6_200,
-        "k26_mmfree1_3b_a16_b6_h11" -> K26_MMFree1_3B_A16_B6_H11,
-        "k26_mmfree1_3b_a16_b6_h7"  -> K26_MMFree1_3B_A16_B6_H7,
-        "k26_mmfree1_3b_a16_b6_f32" -> K26_MMFree1_3B_A16_B6_F32,
-        "k26_mmfree1_3b_a16_b6_f16" -> K26_MMFree1_3B_A16_B6_F16,
-        "k26_mmfree2_7b_a16" -> K26_MMFree2_7B_A16,
-        "k26_mmfree2_7b_a16_b4" -> K26_MMFree2_7B_A16_B4,
-        "k26_mmfree2_7b_a16_b4_dsp" -> K26_MMFree2_7B_A16_B4_DSP,
-        "k26_mmfree2_7b_a16_b4_dsp_s8" -> K26_MMFree2_7B_A16_B4_DSP_S8,
-        "k26_mmfree2_7b_a16_packed" -> K26_MMFree2_7B_A16_PACKED,
-        "k26_mmfree2_7b_a16_b4_dsp_s8_packed" -> K26_MMFree2_7B_A16_B4_DSP_S8_PACKED,
-        "k26_mmfree2_7b_a16_b6_dsp_s8" -> K26_MMFree2_7B_A16_B6_DSP_S8,
-        "k26_mmfree2_7b_a16_b6_dsp_s8_200" -> K26_MMFree2_7B_A16_B6_DSP_S8_200,
-        // ── frozen set (2026-07-30): best packed bitstream per model size ──
-        "k26_mmfree2_7b_a16_b6_dsp_s8_packed"     -> K26_MMFree2_7B_A16_B6_DSP_S8_PACKED,
-        // 1.3B-named siblings of build A — identical RTL, 1.3B manifest (model/shapes/WT)
-        "k26_mmfree1_3b_a16_packed"               -> K26_MMFree1_3B_A16_PACKED,
-        "k26_mmfree1_3b_a16_b6_dsp_s8_200"        -> K26_MMFree1_3B_A16_B6_DSP_S8_200,
-        "k26_mmfree1_3b_a16_b6_dsp_s8_packed"     -> K26_MMFree1_3B_A16_B6_DSP_S8_PACKED,
-        "k26_mmfree370m_a16_packed"               -> K26_MMFree370M_A16_PACKED,
-        "k26_mmfree370m_a16_b6_packed"            -> K26_MMFree370M_A16_B6_PACKED,
-        "k26_mmfree370m_a16_b6_s8"                -> K26_MMFree370M_A16_B6_S8,
-        // ── the 250 MHz attempt on maxN=8192 B6 (2026-08-04) ──
-        "k26_mmfree2_7b_a16_b6_dsp_s4_acb2"           -> K26_MMFree2_7B_A16_B6_DSP_S4_ACB2,
-        "k26_mmfree2_7b_a16_b6_dsp_s4_acb2_packed"    -> K26_MMFree2_7B_A16_B6_DSP_S4_ACB2_PACKED,
-        "k26_mmfree1_3b_a16_b6_dsp_s4_acb2"           -> K26_MMFree1_3B_A16_B6_DSP_S4_ACB2,
-        "k26_mmfree1_3b_a16_b6_dsp_s4_acb2_packed"    -> K26_MMFree1_3B_A16_B6_DSP_S4_ACB2_PACKED,
-        "k26_mmfree2_7b_a16_b6_dsp_s8_acb2"           -> K26_MMFree2_7B_A16_B6_DSP_S8_ACB2,
-        "k26_mmfree2_7b_a16_b8_dsp_s8_packed"     -> K26_MMFree2_7B_A16_B8_DSP_S8_PACKED,
-        "k26_mmfree2_7b_a16_b6_s8" -> K26_MMFree2_7B_A16_B6_S8,
-        "k26_mmfree2_7b_a16_b6" -> K26_MMFree2_7B_A16_B6,
-        "k26_mmfree2_7b_a16_b6_h11" -> K26_MMFree2_7B_A16_B6_H11,
-        "k26_mmfree2_7b_a16_b6_h7"  -> K26_MMFree2_7B_A16_B6_H7,
-        "k26_mmfree2_7b_a16_b6_f32" -> K26_MMFree2_7B_A16_B6_F32,
-        "k26_mmfree2_7b_a16_b6_f16" -> K26_MMFree2_7B_A16_B6_F16,
-        "k26_mmfree2_7b_a16_b6_h11_f16" -> K26_MMFree2_7B_A16_B6_H11_F16,
-        "k26_mmfree1_3b_a16_b6_h11_f16" -> K26_MMFree1_3B_A16_B6_H11_F16,
-        "k26_lm_head" -> K26_LMHead
+        "mmfree_370m" -> MMFree_370M,
+        "mmfree_1_3b" -> MMFree_1_3B,
+        "mmfree_2_7b" -> MMFree_2_7B
     )
 
     def byName(name: String): CoreConfig = {

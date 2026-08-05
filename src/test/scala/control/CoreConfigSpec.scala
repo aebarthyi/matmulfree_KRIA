@@ -5,6 +5,11 @@ import org.scalatest.matchers.must.Matchers
 
 class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
+  // The three deployable presets, by the name the board flow uses.
+  private val m370 = CoreConfig.MMFree_370M
+  private val m1_3 = CoreConfig.MMFree_1_3B
+  private val m2_7 = CoreConfig.MMFree_2_7B
+
   "CoreConfig.forShape" - {
     "rounds maxN up to the next power of 2" in {
       val c = CoreConfig.forShape(n = 100, m = 64, xDim = 8)
@@ -54,83 +59,52 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       c.outLanesPerTile mustBe 4
     }
 
-    "K26_LMHead config matches the LM-head bandwidth target" in {
-      val c = CoreConfig.K26_LMHead
-      c.xDim         mustBe 64
-      c.batchSize    mustBe 1
-      c.maxN         mustBe 4096
-      c.maxM         mustBe 32000
-      c.outBeatLanes mustBe 32
-      // 512-bit s_axis, 1024-bit m_axis after chunking.
-      c.axisDataWidth mustBe 512
-      c.outBeatWidth  mustBe 1024
+    "the deployable set is exactly the three released checkpoints" in {
+      CoreConfig.presets.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
     }
 
-    "K26_MMFree370M covers every MMfreeLM-370M projection shape" in {
-      val c = CoreConfig.K26_MMFree370M
-      c.xDim          mustBe 64
-      c.batchSize     mustBe 1
-      c.numInPorts    mustBe 4      // all 4 HP ports
-      c.inPortWidth   mustBe 128
-      c.axisDataWidth mustBe 512
-      c.outBeatWidth  mustBe 32     // output stays on DMA0's 32-bit S2MM
-      // Distinct (N inner, M out) projections of the 370M model — each must
-      // fit the config and land tile-aligned (no padding lanes).
-      val shapes = Seq(
-        (1024, 1024),   // i/f/g/o_proj
-        (1024, 5632),   // fused gate_up
-        (2816, 1024),   // down_proj
-        (1024, 32000)   // lm_head
-      )
-      shapes.foreach { case (n, m) =>
-        withClue(s"projection ${n}x$m") {
-          n must be <= c.maxN
-          n must be <= c.maxAcc
-          m must be <= c.maxM
-          m % c.outLanesPerTile mustBe 0
+    // These four fields ARE the conclusion of the optimization program: B6 amortizes the
+    // weight stream (+11.8% over B4), 1.6-bit packing cuts the binding traffic ~20%
+    // (+4.3% at 2.7B b=6), 128-bit m_axis stops STORE being the batch bottleneck, and 250
+    // is the top reachable rung. Any preset that loses one of them is a regression, not a
+    // variant — an ablation belongs on the `exploration` branch.
+    "every deployable preset carries the full optimization stack" in {
+      CoreConfig.presets.foreach { case (name, c) =>
+        withClue(s"preset '$name'") {
+          c.batchSize      mustBe 6
+          c.outBeatLanes   mustBe 4
+          c.packedWeights  mustBe true
+          c.plClkMhz       mustBe 250
+          c.implDirectives must not be empty      // the aggressive impl flow, needed for 250
         }
       }
     }
 
-    "K26_MMFree370M_A16 is the signed int16 sibling, same output geometry" in {
-      val a16 = CoreConfig.K26_MMFree370M_A16
-      val a8  = CoreConfig.K26_MMFree370M
-      a16.aWidth        mustBe 16
-      a16.xDim          mustBe 32
-      a16.signedAct     mustBe true
-      a16.numInPorts    mustBe 4          // still all 4 HP ports
-      a16.axisDataWidth mustBe 512
-      // identical compute width + output format to the int8 preset
-      a16.outLanesPerTile mustBe a8.outLanesPerTile   // 256 either way
-      a16.outBeatWidth    mustBe a8.outBeatWidth       // 32-bit m_axis unchanged
-      a16.outLaneWidth    mustBe 32                     // nextPow2(28)
-      // every projection still fits + tile-aligned
-      Seq((1024,1024),(1024,5632),(2816,1024),(1024,32000)).foreach { case (n,m) =>
-        withClue(s"${n}x$m") { (m % a16.outLanesPerTile) mustBe 0; n must be <= a16.maxN }
-      }
-    }
-
-    "K26_MMFree1_3B_A16 / 2_7B_A16 span the larger checkpoints on the a16 engine" in {
-      // (hidden, intermediate, vocab, layers) per ridger/MMfreeLM checkpoint.
-      val arch = Map(
-        CoreConfig.K26_MMFree1_3B_A16 -> (2048, 5632, 32000, 24),
-        CoreConfig.K26_MMFree2_7B_A16 -> (2560, 6912, 32000, 32)
-      )
-      arch.foreach { case (c, (h, inter, vocab, _)) =>
-        withClue(s"preset shapes=${c.shapesHint}") {
-          // Same engine geometry as the 370M a16 preset — only maxN/maxAcc grow.
+    "the a16 / 4-HP-port engine geometry is identical across all three sizes" in {
+      CoreConfig.presets.foreach { case (name, c) =>
+        withClue(s"preset '$name'") {
           c.aWidth          mustBe 16
           c.xDim            mustBe 32
           c.signedAct       mustBe true
-          c.numInPorts      mustBe 4
+          c.numInPorts      mustBe 4          // all 4 HP ports
+          c.inPortWidth     mustBe 128
           c.axisDataWidth   mustBe 512
           c.outLanesPerTile mustBe 256
-          c.outBeatWidth    mustBe 32           // 32-bit m_axis lane unchanged
-          c.outLaneWidth    mustBe 32           // nextPow2(log2(8192)+16 = 29)
-          c.maxN            mustBe 8192          // nextPow2(intermediate)
-          c.maxAcc          mustBe 8192
-          c.maxM            mustBe 32000         // vocab dominates gate_up
-          // Every projection (N inner, M out) fits and lands tile-aligned.
+          c.outLaneWidth    mustBe 32         // nextPow2(aWidth + log2(maxAcc))
+          c.maxM            mustBe 32000      // vocab dominates gate_up at every size
+        }
+      }
+    }
+
+    "each preset spans every projection of its own checkpoint, tile-aligned" in {
+      // (hidden, intermediate, vocab) per ridger/MMfreeLM checkpoint.
+      val arch = Map(
+        m370 -> (1024, 2816, 32000),
+        m1_3 -> (2048, 5632, 32000),
+        m2_7 -> (2560, 6912, 32000)
+      )
+      arch.foreach { case (c, (h, inter, vocab)) =>
+        withClue(s"preset shapes=${c.shapesHint}") {
           val projs = Seq(
             (h, h),            // i/f/g/o_proj
             (h, 2 * inter),    // fused gate_up
@@ -142,42 +116,51 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
               n must be <= c.maxN
               n must be <= c.maxAcc
               m must be <= c.maxM
-              m % c.outLanesPerTile mustBe 0
+              m % c.outLanesPerTile mustBe 0   // no padding lanes anywhere
             }
           }
         }
       }
     }
 
-    "1.3B and 2.7B share one bitstream geometry (differ only in default sweep)" in {
-      val a = CoreConfig.K26_MMFree1_3B_A16
-      val b = CoreConfig.K26_MMFree2_7B_A16
-      // Identical HW: shapesHint, modelName and residentWtBytes are deployment metadata
-      // (default bench sweep + target checkpoint + resident udmabuf-wt sizing), not
-      // bitstream geometry — normalize all three out before comparing.
-      a.copy(shapesHint = "", modelName = "", residentWtBytes = 0) mustBe
-        b.copy(shapesHint = "", modelName = "", residentWtBytes = 0)
-      a.shapesHint mustBe "1.3b"
-      b.shapesHint mustBe "2.7b"
-      a.modelName mustBe "ridger/MMfreeLM-1.3B"
-      b.modelName mustBe "ridger/MMfreeLM-2.7B"
-      // …but the resident weight set (-> UDMABUF_WT_SZ) DOES scale with model size,
-      // so the same bitstream needs a bigger wt buffer for 2.7B than for 1.3B.
-      b.residentWtBytes must be > a.residentWtBytes
-      b.udmabufWtBytes  must be > a.udmabufWtBytes
+    "maxN is nextPow2 of the largest inner dim, and only it scales with model size" in {
+      m370.maxN mustBe 4096          // nextPow2(2816)
+      m1_3.maxN mustBe 8192          // nextPow2(5632)
+      m2_7.maxN mustBe 8192          // nextPow2(6912)
+      Seq(m370, m1_3, m2_7).foreach(c => c.maxAcc mustBe c.maxN)
+    }
+
+    // This is what lets scripts/clone_preset_hw.sh assemble the 1.3B bundle from the 2.7B
+    // bitstream in seconds instead of a second 50-minute Vivado run. If it ever stops
+    // holding, that script must stop being used for this pair.
+    "1.3B and 2.7B emit identical RTL and differ only in deployment metadata" in {
+      // shapesHint / modelName / residentWtBytes are manifest fields (bench sweep, target
+      // checkpoint, udmabuf-wt sizing) and never reach the Core — normalize them out.
+      m1_3.copy(shapesHint = "", modelName = "", residentWtBytes = 0) mustBe
+        m2_7.copy(shapesHint = "", modelName = "", residentWtBytes = 0)
+      m1_3.shapesHint mustBe "1.3b"
+      m2_7.shapesHint mustBe "2.7b"
+      m1_3.modelName  mustBe "ridger/MMfreeLM-1.3B"
+      m2_7.modelName  mustBe "ridger/MMfreeLM-2.7B"
+      // …but the resident weight set (-> UDMABUF_WT_SZ) DOES scale with model size, so the
+      // same bitstream needs a bigger wt buffer for 2.7B than for 1.3B.
+      m2_7.residentWtBytes must be > m1_3.residentWtBytes
+      m2_7.udmabufWtBytes  must be > m1_3.udmabufWtBytes
       // …and that maxN=8192 engine still covers the 370M projections.
       Seq((1024, 1024), (1024, 5632), (2816, 1024), (1024, 32000)).foreach { case (n, m) =>
         withClue(s"370M ${n}x$m on the large engine") {
-          n must be <= a.maxN; m must be <= a.maxM; (m % a.outLanesPerTile) mustBe 0
+          n must be <= m1_3.maxN; m must be <= m1_3.maxM
+          (m % m1_3.outLanesPerTile) mustBe 0
         }
       }
     }
 
-    "the larger model presets carry their default bench sweep in the manifest" in {
+    "each preset carries its default bench sweep in the manifest" in {
       def shapes(c: CoreConfig, n: String) =
         c.presetEnv(n).linesIterator.find(_.startsWith("MMFREE_SHAPES=")).get
-      shapes(CoreConfig.K26_MMFree1_3B_A16, "k26_mmfree1_3b_a16") mustBe "MMFREE_SHAPES=1.3b"
-      shapes(CoreConfig.K26_MMFree2_7B_A16, "k26_mmfree2_7b_a16") mustBe "MMFREE_SHAPES=2.7b"
+      shapes(m370, "mmfree_370m") mustBe "MMFREE_SHAPES=370m"
+      shapes(m1_3, "mmfree_1_3b") mustBe "MMFREE_SHAPES=1.3b"
+      shapes(m2_7, "mmfree_2_7b") mustBe "MMFREE_SHAPES=2.7b"
     }
 
     "rejects maxN > maxAcc" in {
@@ -201,9 +184,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     "rejects a plClkMhz that is not a reachable PL0_REF rung" in {
       Seq(215, 220, 225, 230, 240, 275, 295).foreach { mhz =>
         withClue(s"plClkMhz=$mhz snaps down to a rung and mislabels the build") {
-          val ex = intercept[IllegalArgumentException] {
-            CoreConfig.K26_MMFree2_7B_A16_B6.copy(plClkMhz = mhz)
-          }
+          val ex = intercept[IllegalArgumentException] { m2_7.copy(plClkMhz = mhz) }
           ex.getMessage must include("not a reachable PL0_REF rung")
         }
       }
@@ -220,27 +201,29 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     "actCascadeHeight requires an explicit actRamStyle to have any effect" in {
       // The attribute rides on the ActMem BlackBox; with the inferred SyncReadMem there is
       // nowhere to put it, so asking for one silently does nothing. Fail instead.
-      assertThrows[IllegalArgumentException] {
-        CoreConfig.K26_MMFree2_7B_A16_B6.copy(actCascadeHeight = 2)
-      }
-      assertThrows[IllegalArgumentException] {
-        CoreConfig.K26_MMFree2_7B_A16_B6.copy(actRamStyle = "lutram")
-      }
+      // m370 is the one default that does NOT set actRamStyle, so it is the valid base here.
+      m370.actRamStyle mustBe ""
+      assertThrows[IllegalArgumentException] { m370.copy(actCascadeHeight = 2) }
+      assertThrows[IllegalArgumentException] { m370.copy(actRamStyle = "lutram") }
     }
 
-    "the 250 MHz attempt presets carry both levers, not one" in {
-      // Fixing either failing path alone moves WNS by 0.005 ns, so a preset with only one
-      // of the two is a wasted 40-minute build. Pin the pairing.
-      Seq(
-        CoreConfig.K26_MMFree2_7B_A16_B6_DSP_S4_ACB2,
-        CoreConfig.K26_MMFree2_7B_A16_B6_DSP_S4_ACB2_PACKED,
-        CoreConfig.K26_MMFree1_3B_A16_B6_DSP_S4_ACB2_PACKED
-      ).foreach { c =>
-        c.plClkMhz mustBe 250
-        c.colBankSize mustBe 4          // path 2: fanout-103 broadcast net
-        c.actRamStyle mustBe "block"    // path 1: 8-deep RAMB36E2 cascade
-        c.actCascadeHeight mustBe 2
+    // The two paths these fix failed 0.005 ns apart at maxN=8192, so a build carrying only
+    // one of them moves WNS by 0.005 ns and wastes 50 minutes of Vivado. Pin the pairing.
+    "the maxN=8192 presets carry both 250 MHz timing levers, not one" in {
+      Seq(m1_3, m2_7).foreach { c =>
+        withClue(s"${c.shapesHint}") {
+          c.maxN             mustBe 8192
+          c.dspAccum         mustBe true     // frees ~22 pp LUT / ~34 pp CARRY8
+          c.colBankSize      mustBe 4        // path 2: the route-bound broadcast net
+          c.actRamStyle      mustBe "block"  // path 1: the 8-deep RAMB36E2 cascade
+          c.actCascadeHeight mustBe 2
+        }
       }
+      // 370M is maxN=4096 — a 4-deep cascade that closes 250 on banking alone, so it
+      // deliberately carries neither the cascade cap nor the DSP spill that comes with it.
+      m370.maxN        mustBe 4096
+      m370.dspAccum    mustBe false
+      m370.colBankSize mustBe 8
     }
   }
 
@@ -259,11 +242,6 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       c.outLaneWidth must be >= c.outAccWidth
       c.outLaneWidth must be < (2 * c.outAccWidth)
     }
-
-    "K26_LMHead chunking yields 8 sub-beats per col tile" in {
-      val c = CoreConfig.K26_LMHead
-      c.outSubBeats mustBe 8
-    }
   }
 
   "Preset manifest (preset.env / preset.json)" - {
@@ -274,34 +252,21 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
         .map { l => val i = l.indexOf('='); l.substring(0, i) -> l.substring(i + 1) }
         .toMap
 
-    "carries the a16 geometry the board flow expects" in {
-      val e = envMap(CoreConfig.K26_MMFree370M_A16, "k26_mmfree370m_a16")
-      e("MMFREE_AWIDTH")    mustBe "16"
-      e("MMFREE_XDIM")      mustBe "32"
-      e("MMFREE_SIGNED")    mustBe "1"
-      e("MMFREE_SHAPES")    mustBe "370m"
-      e("NUM_DMA")          mustBe "4"
-      e("MM2S_WIDTH")       mustBe "128"
-      e("S2MM_WIDTH")       mustBe "32"
-      e("PL_CLK_MHZ")       mustBe "250"
-      e("UDMABUF_ACT_SZ")   mustBe "0x00010000"   // maxN*portBytes = 4096*16 = 64 KiB
-      e("UDMABUF_OUT_SZ")   mustBe "0x00020000"   // 125*256*4, page-up = 128 KiB
-    }
-
-    "scales S2MM width and the output udmabuf with batch" in {
-      val e = envMap(CoreConfig.K26_MMFree370M_A16_B6, "k26_mmfree370m_a16_b6")
-      e("MMFREE_BATCH")     mustBe "6"
-      e("S2MM_WIDTH")       mustBe "128"           // outBeatLanes=4 * 32-bit lane
+    "carries the geometry and batch the board flow expects" in {
+      val e = envMap(m370, "mmfree_370m")
+      e("MMFREE_AWIDTH")          mustBe "16"
+      e("MMFREE_XDIM")            mustBe "32"
+      e("MMFREE_SIGNED")          mustBe "1"
+      e("MMFREE_SHAPES")          mustBe "370m"
+      e("MMFREE_BATCH")           mustBe "6"
+      e("MMFREE_PACKED_WEIGHTS")  mustBe "1"
+      e("NUM_DMA")                mustBe "4"
+      e("MM2S_WIDTH")             mustBe "128"
+      e("S2MM_WIDTH")             mustBe "128"       // outBeatLanes=4 * 32-bit lane
+      e("PL_CLK_MHZ")             mustBe "250"
+      e("UDMABUF_ACT_SZ")         mustBe "0x00010000" // maxN*portBytes = 4096*16 = 64 KiB
       // OUT = batch*numColTilesMax*outLanesPerTile*outLaneBytes = 6*125*256*4, page-up
-      e("UDMABUF_OUT_SZ")   mustBe "0x000bc000"
-    }
-
-    "legacy bench preset keeps single-port 100 MHz geometry" in {
-      val e = envMap(CoreConfig.K26_Bench, "k26_bench")
-      e("NUM_DMA")     mustBe "1"
-      e("MM2S_WIDTH")  mustBe "64"
-      e("PL_CLK_MHZ")  mustBe "100"
-      e("MMFREE_SHAPES") mustBe "pow2"
+      e("UDMABUF_OUT_SZ")         mustBe "0x000bc000"
     }
 
     "env udmabuf sizes equal the JSON byte counts for every preset" in {
@@ -329,8 +294,8 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
   "byName" - {
     "is case-insensitive" in {
-      CoreConfig.byName("DEFAULT")     mustBe CoreConfig.Default
-      CoreConfig.byName("k26_LM_Head") mustBe CoreConfig.K26_LMHead
+      CoreConfig.byName("MMFree_2_7B") mustBe m2_7
+      CoreConfig.byName("mmfree_370m") mustBe m370
     }
 
     "throws on unknown names with a helpful message" in {
@@ -338,7 +303,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
         CoreConfig.byName("does-not-exist")
       }
       ex.getMessage must include("does-not-exist")
-      ex.getMessage must include("default")
+      ex.getMessage must include("mmfree_2_7b")
     }
   }
 }
