@@ -70,11 +70,26 @@ echo "    RTL sha256 ${h_src:0:16} — identical ($(sv_list "$SRC_GEN" | wc -l) 
 # ─── 2. Manifest delta is non-RTL only ──────────────────────────────────────
 echo "==> [2/4] Verifying the manifest delta touches only: $ALLOWED_KEYS"
 keys_of() { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$1" | cut -d= -f1 | sort; }
-if [ "$(keys_of "$SRC_GEN/preset.env")" != "$(keys_of "$DST_GEN/preset.env")" ]; then
-    echo "ERROR: manifest key sets differ." >&2
-    diff <(keys_of "$SRC_GEN/preset.env") <(keys_of "$DST_GEN/preset.env") >&2 || true; exit 1
-fi
 bad=0
+# A key present in DST but not in SRC is normally a MANIFEST-FORMAT addition, not a config
+# change: generated/<SRC> was emitted by an older tree that did not write that field yet.
+# (This is how it first showed up — MMFREE_ACT_RAM_STYLE / _CASCADE_HEIGHT arrived with the
+# ActMem BlackBox, so every manifest emitted before it lacks them.) That is benign only if
+# the new field is at its DEFAULT in DST — empty or 0 — because then SRC's silence and DST's
+# explicit default describe the same hardware. A new key with a NON-default value means DST
+# genuinely asks for something SRC's bitstream does not have, and must be built.
+# Keys missing from DST are never acceptable: DST's manifest is the one that ships.
+while read -r k; do
+    grep -qE "^$k=" "$SRC_GEN/preset.env" && continue
+    vd=$(grep -E "^$k=" "$DST_GEN/preset.env" | head -1 | cut -d= -f2-)
+    case "$vd" in
+        ''|0) printf "    %-26s (new manifest field, default '%s' — SRC predates it)\n" "$k" "$vd" ;;
+        *) echo "    !! $k=$vd is new AND non-default — SRC's bitstream cannot honour it" >&2
+           bad=1 ;;
+    esac
+done < <(keys_of "$DST_GEN/preset.env")
+missing=$(comm -23 <(keys_of "$SRC_GEN/preset.env") <(keys_of "$DST_GEN/preset.env"))
+[ -z "$missing" ] || { echo "ERROR: keys present in SRC but absent from DST: $missing" >&2; exit 1; }
 while read -r k; do
     vs=$(grep -E "^$k=" "$SRC_GEN/preset.env" | head -1 | cut -d= -f2-)
     vd=$(grep -E "^$k=" "$DST_GEN/preset.env" | head -1 | cut -d= -f2-)
