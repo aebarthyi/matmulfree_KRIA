@@ -101,12 +101,43 @@ echo "#   batches  : $BATCHES   gen=$GEN reps=$REPS"
 echo "#   out      : $OUT_ROOT"
 echo "############################################################"
 
+# Rows a complete pass must contain: models x backends x batches.
+count() { set -- $1; echo $#; }
+EXPECT_ROWS=$(( $(count "$MODELS") * $(count "$BACKENDS") * $(count "$BATCHES") ))
+
+# bench_host_cpu.sh refuses to start above MAX_LOAD (default nproc/4) so it never measures
+# contention instead of the model. That guard is right, but it also fires on OUR OWN residual
+# load: a pass that just finished saturating 10-20 threads leaves the 1-min average around 10
+# against a threshold of 5, so every pass after the first was refused instantly and the run
+# came back with one pass of six. Wait for the machine to actually settle rather than
+# weakening the guard — a real Vivado build will still block, which is the point.
+MAX_LOAD_LOCAL="${MAX_LOAD:-$(( $(nproc) / 4 ))}"
+settle() {
+    local waited=0
+    while [ "$MAX_LOAD_LOCAL" != "0" ]; do
+        local l1; l1=$(awk '{printf "%d", $1 + 0.5}' /proc/loadavg)
+        [ "$l1" -le "$MAX_LOAD_LOCAL" ] && { [ "$waited" -gt 0 ] && echo "    settled after ${waited}s (load $(awk '{print $1}' /proc/loadavg))"; return 0; }
+        [ "$waited" -ge "${SETTLE_MAX:-900}" ] && { echo "    WARNING: load still $(awk '{print $1}' /proc/loadavg) after ${waited}s — starting anyway"; return 0; }
+        [ "$waited" = 0 ] && echo "    waiting for load to fall below $MAX_LOAD_LOCAL (now $(awk '{print $1}' /proc/loadavg))..."
+        sleep 20; waited=$((waited + 20))
+    done
+}
+
 t0=$(date +%s); failed=""
 for pass in $(seq 1 "$PASSES"); do
     for th in $THREAD_SET; do
         out="$OUT_ROOT/t${th}_p${pass}"
+        # Idempotent: a complete pass is left alone, so re-running after a partial failure
+        # fills only the gaps instead of redoing hours of work.
+        if [ -f "$out/host_cpu_sweep.csv" ] && \
+           [ "$(( $(wc -l < "$out/host_cpu_sweep.csv") - 1 ))" -ge "$EXPECT_ROWS" ]; then
+            echo "=== pass $pass, ${th} threads — already complete ($EXPECT_ROWS rows), skipping"
+            continue
+        fi
+        rm -rf "$out"          # partial output would append and duplicate rows
         echo
         echo "=== [$(date -Is)] pass $pass, ${th} threads -> $out ==="
+        settle
         OMP_THREADS="$th" MODELS="$MODELS" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
         GEN="$GEN" REPS="$REPS" OUT="$out" \
             ./scripts/bench_host_cpu.sh || failed="$failed t${th}p${pass}"

@@ -230,12 +230,32 @@ def main():
     # ── completeness / integrity ─────────────────────────────────────────────
     problems = [r for r in rows if r['flag']]
     want_batches = set(range(1, 7))
+    want_models = ['370M', '1.3B', '2.7B']
+    # The EXPECTED matrix, asserted rather than inferred. Checking only that whatever showed
+    # up has all six batches lets a half-finished sweep report CLEAN — which it did, when five
+    # of six Xeon passes were refused by the load guard and the one that landed looked
+    # complete on its own terms.
+    want_cells = ([('kria', 'fpga', m, '1p6') for m in want_models] +
+                  [('kria', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')] +
+                  [('xeon', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')])
+    have = {(r['platform'], r['arm'], r['model'], r['weight_fmt']) for r in rows}
     missing = []
-    for plat, arm, model, fmt in {(r['platform'], r['arm'], r['model'], r['weight_fmt']) for r in rows}:
+    for cell in want_cells:
+        if cell not in have:
+            missing.append(f"{'/'.join(cell)}: ENTIRELY ABSENT")
+            continue
         got = {r['batch'] for r in rows
-               if (r['platform'], r['arm'], r['model'], r['weight_fmt']) == (plat, arm, model, fmt)}
+               if (r['platform'], r['arm'], r['model'], r['weight_fmt']) == cell}
         if got != want_batches:
-            missing.append(f"{plat}/{arm}/{model}/{fmt}: missing b={sorted(want_batches - got)}")
+            missing.append(f"{'/'.join(cell)}: missing b={sorted(want_batches - got)}")
+    for cell in sorted(have - set(want_cells)):
+        missing.append(f"{'/'.join(str(c) for c in cell)}: UNEXPECTED (not in the report matrix)")
+    # Every FPGA cell should carry PASSES independent runs; a cell with fewer means a pass
+    # died and its spread is not the spread the method claims.
+    fpga_passes = {r['passes'] for r in rows if r['arm'] == 'fpga'}
+    if len(fpga_passes) > 1:
+        missing.append(f"FPGA cells have inconsistent pass counts {sorted(fpga_passes)} — "
+                       "some pass failed partway")
 
     print()
     if missing:
