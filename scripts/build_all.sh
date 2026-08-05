@@ -186,6 +186,18 @@ cp "$OVERLAY_DIR/shell.json"   "$TRANSFER_DIR/"
 cp "$SV_DIR/preset.env"  "$TRANSFER_DIR/" 2>/dev/null || true
 cp "$SV_DIR/preset.json" "$TRANSFER_DIR/" 2>/dev/null || true
 
+# PL_CLK_MHZ is a REQUEST; PL0_REF only exists on discrete rungs and the PS IP snaps
+# anything else DOWN (230 -> 199.998 on this part). build_project.tcl reads the rate the
+# design was actually CONSTRAINED at off the clock object and drops it here; append it to
+# the shipped manifest so the board sets fclk0 from the constrained rate, not the label.
+# CoreConfig now requires plClkMhz to BE a rung, so these normally agree — this catches a
+# hand-passed PL_CLK_MHZ=... override, which bypasses that check.
+if [ -f "$REPO_ROOT/build/pl_clk_actual.env" ] && [ -f "$TRANSFER_DIR/preset.env" ]; then
+    cat "$REPO_ROOT/build/pl_clk_actual.env" >> "$TRANSFER_DIR/preset.env"
+    _act=$(sed -n 's/^PL_CLK_ACT_MHZ=//p' "$REPO_ROOT/build/pl_clk_actual.env")
+    echo "#   constrained fabric clock: ${_act} MHz (requested ${PL_CLK_MHZ})"
+fi
+
 # Shared, preset-independent bundle parts (staged once; idempotent — safe every build).
 stage_shared() {
     # Board entrypoint + on-board scripts (tracked sources in scripts/, staged here).
@@ -197,10 +209,13 @@ stage_shared() {
     cp "$SCRIPT_DIR/split_sweep_csv.py" "$BUNDLE_ROOT/split_sweep_csv.py"
     cp "$SCRIPT_DIR/sweep_split_ab.sh"   "$BUNDLE_ROOT/sweep_split_ab.sh"
     cp "$SCRIPT_DIR/sweep_split_k.sh"    "$BUNDLE_ROOT/sweep_split_k.sh"
+    cp "$SCRIPT_DIR/cma_reclaim.sh"      "$BUNDLE_ROOT/cma_reclaim.sh"
+    cp "$SCRIPT_DIR/cma_boot_raise.sh"   "$BUNDLE_ROOT/cma_boot_raise.sh"
     chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh" \
              "$BUNDLE_ROOT/bench_batch.sh" "$BUNDLE_ROOT/sweep_all.sh" \
              "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/sweep_split_ab.sh" \
-             "$BUNDLE_ROOT/sweep_split_k.sh"
+             "$BUNDLE_ROOT/sweep_split_k.sh" "$BUNDLE_ROOT/cma_reclaim.sh" \
+             "$BUNDLE_ROOT/cma_boot_raise.sh"
     cp "$SCRIPT_DIR/board.conf.example" "$BUNDLE_ROOT/board.conf.example" 2>/dev/null || true
 
     # u-dma-buf driver source (vendored submodule), so the board needs no external module.

@@ -15,6 +15,14 @@
 # Read bl_readback_hidden_pct (how much readback the split moved off the wall clock) against
 # decode_tok_s (what survived after the per-chunk cost). They peak at different k; the second
 # one is the one that matters.
+#
+# CORRECTNESS: every k is gated (CPU==FPGA, --backend both) BEFORE it is timed, because a
+# wrong column range corrupts values silently instead of crashing. The bench's own streams_ok
+# does NOT catch this: its reference is a single-stream run on the SAME FPGA backend, and
+# splitting applies at b=1 too, so a uniform chunk-boundary bug corrupts the reference and
+# every stream identically and still reports streams_ok=1. The gate is short (GATE_GEN tokens)
+# because chunk-boundary math is per-projection-invocation — the first token exercises them
+# all. GATE=0 skips it; a k that fails the gate is not timed at all.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -22,9 +30,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 PRESET=${PRESET:-k26_mmfree2_7b_a16_b4_dsp_s8_packed}
 EXTRA=${EXTRA:---packed-dir $(pwd)/models/ridger/MMfreeLM-2.7B/packed-1p6}
-K=${K:-0 2 4 8 16}
+# The previous sweep turned over at k=8, but that was before dequant ran inside the COMPUTE
+# window. More hideable CPU work means more windows are worth having, so the knee is expected
+# to move UP — hence the extra points above 4.
+K=${K:-0 2 4 6 8 12 16}
 GEN=${GEN:-64}
 REPS=${REPS:-3}
+GATE=${GATE:-1}
+GATE_GEN=${GATE_GEN:-4}
 for arg in "$@"; do case "$arg" in *=*) eval "${arg%%=*}='${arg#*=}'" ;; esac; done
 
 MANIFEST="presets/$PRESET/preset.env"
@@ -37,6 +50,20 @@ echo "# chunk sweep: preset=$PRESET  b=$BATCH  k=[$K]"
 
 for k in $K; do
     echo "=== k=$k"
+    if [ "$GATE" != 0 ]; then
+        glog="results/logs/gate_${PRESET}_k${k}.log"
+        # ARGS lands after RUNNER_ARTIFACTS, and the runner takes the LAST occurrence, so the
+        # --packed-dir in EXTRA correctly overrides the manifest default (which is the 2-bit
+        # blob — gating that would validate a path this sweep never runs).
+        if make gate PRESET="$PRESET" ENV="MMFREE_SPLIT_CHUNKS=$k" \
+                ARGS="--gen $GATE_GEN $EXTRA" > "$glog" 2>&1; then
+            echo "   gate PASS (CPU==FPGA)"
+        else
+            echo "   !! GATE FAIL at k=$k — NOT timing it; a decode number here would be a lie"
+            grep -aE 'checked|GATE|mismatch' "$glog" | tail -3 | sed 's/^/      /'
+            continue
+        fi
+    fi
     args=("PRESET=$PRESET" "BATCHES=$BATCH" "GEN=$GEN" "REPS=$REPS" "TAG=k$k"
           "ENV=MMFREE_SPLIT_CHUNKS=$k")
     [ -n "$EXTRA" ] && args+=("EXTRA=$EXTRA")

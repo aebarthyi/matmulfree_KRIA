@@ -82,7 +82,7 @@ class Core(
     val colBankSize:     Int = 0,        // systolic column banking: broadcast within a bank
                                          // of this many columns, pipeline between banks to
                                          // cut activation fanout. 0 = no banking (broadcast).
-    val packedWeights:   Boolean = false // stream ternary weights at 1.6 bits/trit (5 trits/
+    val packedWeights:   Boolean = false, // stream ternary weights at 1.6 bits/trit (5 trits/
                                          // byte) and unpack them on-chip through a regroup
                                          // gearbox (WeightUnpackGearbox) into the native 2-bit
                                          // weight beat. ~20% fewer weight bytes on the HP-port
@@ -90,6 +90,12 @@ class Core(
                                          // geometry change. false = legacy 2-bit slice (SV
                                          // byte-identical). The DDR blob must be packed to
                                          // match (base-3, LSB-first lanes); see TernaryPack.
+    val actRamStyle:     String = "",    // "" = inferred SyncReadMem for actBram; "block"/
+                                         // "ultra" = the control.ActMem BlackBox carrying
+                                         // ram_style + cascade_height. Identical read
+                                         // semantics and latency — a mapping choice, not a
+                                         // design change. See ActMem for why maxN=8192 needs it.
+    val actCascadeHeight: Int = 0        // cascade_height for ActMem; 0 = omit the attribute.
 ) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0,        "aWidth must be even and >= 2")
     require(maxAcc >= 2,                           "maxAcc must be >= 2")
@@ -145,10 +151,31 @@ class Core(
     }
 
     // ─── On-chip storage ──────────────────────────────────────────────────────
-    val actBram = SyncReadMem(maxN, Vec(batchSize, UInt(aWidth.W)))
+    // actBram: maxN entries x (batchSize * aWidth) bits, 1-cycle synchronous read.
+    // Two interchangeable implementations, selected by actRamStyle:
+    //   ""              → SyncReadMem, letting Vivado infer the mapping (the legacy path;
+    //                     every preset before 2026-08-04 uses this).
+    //   "block"/"ultra" → control.ActMem, a BlackBox carrying ram_style + cascade_height.
+    // Same cycle behaviour either way; the BlackBox exists only to bound the RAMB36E2 depth
+    // cascade, which at maxN=8192 is 3.2 ns of logic and the worst 250 MHz path (see ActMem).
     val actRdAddr = Wire(UInt(log2Ceil(maxN).W))
     actRdAddr := 0.U
-    val actRdData = actBram.read(actRdAddr)
+    val actBram =
+        if (actRamStyle.isEmpty) Some(SyncReadMem(maxN, Vec(batchSize, UInt(aWidth.W))).suggestName("actBram"))
+        else None
+    val actMem = if (actRamStyle.isEmpty) None else Some {
+        val m = Module(new ActMem(maxN, batchSize * aWidth, actRamStyle, actCascadeHeight))
+        m.suggestName("actMem")
+        m.io.clk   := clock
+        m.io.raddr := actRdAddr
+        m.io.wen   := false.B          // overridden in sLoad
+        m.io.waddr := 0.U
+        m.io.wdata := 0.U
+        m
+    }
+    val actRdData: Vec[UInt] = actBram
+        .map(_.read(actRdAddr))
+        .getOrElse(actMem.get.io.rdata.asTypeOf(Vec(batchSize, UInt(aWidth.W))))
 
     // Output-memory port wires. The implementation (BRAM SyncReadMem vs URAM
     // BlackBox) is selected by `outRamStyle` in the STORE section below; both
@@ -412,7 +439,12 @@ class Core(
             val unpacked = VecInit(Seq.tabulate(batchSize) { i =>
                 s_axis.tdata((i + 1) * aWidth - 1, i * aWidth)
             })
-            actBram.write(loadBeatCtr(log2Ceil(maxN) - 1, 0), unpacked)
+            actBram.foreach(_.write(loadBeatCtr(log2Ceil(maxN) - 1, 0), unpacked))
+            actMem.foreach { m =>
+                m.io.wen   := true.B
+                m.io.waddr := loadBeatCtr(log2Ceil(maxN) - 1, 0)
+                m.io.wdata := unpacked.asUInt
+            }
             val next = loadBeatCtr + 1.U
             loadBeatCtr := next
             when(next === loadTotalBeats) {

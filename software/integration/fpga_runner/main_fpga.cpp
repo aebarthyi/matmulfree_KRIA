@@ -18,7 +18,17 @@
 //   --packed-dir DIR   dir with <prefix>.port{p}.bin + <prefix>.manifest.tsv (default .)
 //   --prefix NAME      packed-blob prefix (default "weights")
 //   --tokenizer PATH   tokenizer.mmtok (default <blob dir>/tokenizer.mmtok; only for --prompt)
-//   --backend cpu|fpga|both   (default fpga)
+//   --backend cpu|cpu-2bit|cpu-1p6|fpga|both   (default fpga)
+//                      cpu-2bit / cpu-1p6 are the CPU path with weights held at the two
+//                      encodings the FPGA is swept at (2.0 and 1.625 bits/weight), so a
+//                      CPU-vs-FPGA comparison can hold the weight format fixed. cpu-1p6 is
+//                      the TQ1_0 form
+//                      (llama.cpp's format; see mmfree/tq1.hpp) instead of one int8 per
+//                      ternary weight. Same arithmetic, 5x less weight traffic — this is
+//                      the CPU arm to quote against a 1.6-bit FPGA build, since plain
+//                      `cpu` is really an 8-bit-storage baseline. Results are BIT-IDENTICAL
+//                      to `cpu` (lossless packing + associative integer accumulation), so
+//                      the two differ only in speed.
 //   --mode float|fixed (default fixed; only fixed offloads to the engine)
 //   --frac N           fixed-point frac bits (default 10)
 //   --ids a,b,c        raw token ids (bypass the tokenizer)
@@ -42,6 +52,8 @@
 #include "mmfree/bench.hpp"
 #include "mmfree/model.hpp"
 #include "mmfree/profile.hpp"
+#include "mmfree/simd.hpp"          // simd::backend(), reported at startup
+#include "mmfree/tq1.hpp"           // Tq1Backend: --backend cpu-tq1
 #include "mmfree/tokenizer.hpp"
 #include "mmfree/weights.hpp"
 
@@ -82,6 +94,23 @@ static const char* port_path(char* out, size_t n, const char* base, uint32_t i, 
   if (e && *e) return e;
   snprintf(out, n, "%s%u", base, i);
   return out;
+}
+
+// The ACTUAL fabric clock, straight from the PS clock driver. The CSV's clk_mhz column is
+// the manifest's PL_CLK_MHZ, which is only a REQUEST: PL0_REF exists on 1000/N MHz rungs
+// (250, 200, 166.67), so a "230" preset runs at 250 or, after deploy_kria.sh walks it down,
+// at 200. Rows labelled 230 in the 2026-08-04 sweeps were measured at both. Recording the
+// achieved rate makes every row self-describing instead of requiring the deploy log.
+static std::string fclk_hz_str() {
+  std::FILE* f = std::fopen("/sys/devices/platform/fclk0/set_rate", "r");
+  if (!f) return std::string("unknown");
+  char buf[64] = {0};
+  const bool ok = std::fgets(buf, sizeof(buf), f) != nullptr;
+  std::fclose(f);
+  if (!ok) return std::string("unknown");
+  std::string v(buf);
+  while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' ')) v.pop_back();
+  return v.empty() ? std::string("unknown") : v;
 }
 
 static std::string getenv_or(const char* n, const char* d) {
@@ -266,8 +295,12 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); return 2; }
   }
   const bool use_fpga = (backend == "fpga" || backend == "both");
-  if (backend != "cpu" && backend != "fpga" && backend != "both") {
-    std::fprintf(stderr, "--backend must be cpu|fpga|both\n");
+  // cpu-1p6 / cpu-2bit are the CPU arms at the FPGA's two weight encodings; plain `cpu`
+  // is the CPU's native int8 (8 bits) and remains its fastest configuration.
+  const bool use_tq1 = (backend == "cpu-1p6" || backend == "cpu-tq1");  // cpu-tq1: old name
+  const bool use_tq2 = (backend == "cpu-2bit");
+  if (backend != "cpu" && !use_tq1 && !use_tq2 && backend != "fpga" && backend != "both") {
+    std::fprintf(stderr, "--backend must be cpu|cpu-2bit|cpu-1p6|fpga|both\n");
     return 2;
   }
   ActQuant aq = (mode == "fixed") ? ActQuant::FixedQ510 : ActQuant::Float;
@@ -301,9 +334,41 @@ int main(int argc, char** argv) {
   }
   if (ids.empty()) { std::fprintf(stderr, "no input ids\n"); return 2; }
 
+  // Report the SIMD backend the kernels were COMPILED with. Not decoration: the CPU side is
+  // ~57% of wall time on the FPGA path, and a scalar libmmfreecpu.a produces bit-identical
+  // results — so the gate cannot catch it and only a low tok/s would hint at it. (2026-07-30:
+  // a whole measurement session ran on a binary that turned out to be ~12% slower on the CPU
+  // side than a rebuild from the same sources and flags. A scalar build was ruled out by
+  // binary size, so that one was stale code rather than a wrong backend — but nothing printed
+  // enough to tell them apart at the time, which is the gap this closes.)
+  std::printf("simd backend: %s\n", mmfree::simd::backend());
+
   // ---- CPU-side weights + model (norms, scales, embeddings, wq for CPU/Float) ----
   Weights w(blob);
   Model model(w, aq, frac);
+
+  // ---- cpu-tq1: same CPU reduction, weights repacked to 1.6 bits on first touch ----
+  // Installed before the engine block so `--backend cpu-tq1` never opens a device. The
+  // backend packs each projection lazily (keyed on its mmap'd wq pointer) and caches it,
+  // so the cost lands on the first decode step — which a --warmup run absorbs.
+  std::unique_ptr<mmfree::Tq1Backend> tq1;
+  std::unique_ptr<mmfree::Tq2Backend> tq2;
+  double cpu_bits = 8.0;
+  if (use_tq1) {
+    tq1.reset(new mmfree::Tq1Backend());
+    model.set_backend(tq1.get(), {});  // no proj_ids: the CPU backends ignore proj_id
+    cpu_bits = mmfree::Tq1Backend::format_bits();
+    std::printf("weight format: TQ1_0 %.4f bits/weight (%zu-weight blocks, %zu B each)\n",
+                cpu_bits, mmfree::tq1::kBlockElems, mmfree::tq1::kBlockBytes);
+  } else if (use_tq2) {
+    tq2.reset(new mmfree::Tq2Backend());
+    model.set_backend(tq2.get(), {});
+    cpu_bits = mmfree::Tq2Backend::format_bits();
+    std::printf("weight format: 2-bit %.4f bits/weight (%zu-weight blocks, %zu B each)\n",
+                cpu_bits, mmfree::tq2::kBlockElems, mmfree::tq2::kBlockBytes);
+  } else if (!use_fpga) {
+    std::printf("weight format: int8 8.0000 bits/weight (unpacked ternary)\n");
+  }
 
   // ---- engine bring-up (fpga / both): geometry, resident weights, registry ----
   mmfree_lib_t* lib = nullptr;
@@ -509,9 +574,14 @@ int main(int argc, char** argv) {
       CsvRow row;
       row.add("preset", getenv_or("MMFREE_PRESET", "?"));
       row.add("clk_mhz", getenv_or("MMFREE_CLK_MHZ", "?"));
+      // The rate the fabric ACTUALLY ran at, which clk_mhz above does not give.
+      row.add("fclk_hz", fclk_hz_str());
       row.add("hw_batch", getenv_or("MMFREE_BATCH", "?"));
       row.add("packed_weights", getenv_or("MMFREE_PACKED_WEIGHTS", "0"));
       row.add("model", blob);
+      // CPU-side weight representation, so an int8 arm and a TQ1_0 arm are
+      // distinguishable in the CSV (0 = the engine owns the matmul).
+      row.add("cpu_wt_bits", use_fpga ? 0.0 : cpu_bits, 4);
       row.add("batch", (double)Bn, 0);
       row.add("prompt_tokens", (double)ids.size(), 0);
       row.add("gen_tokens", (double)gen_per, 0);
@@ -561,9 +631,14 @@ int main(int argc, char** argv) {
       CsvRow row;
       row.add("preset", getenv_or("MMFREE_PRESET", "?"));
       row.add("clk_mhz", getenv_or("MMFREE_CLK_MHZ", "?"));
+      // The rate the fabric ACTUALLY ran at, which clk_mhz above does not give.
+      row.add("fclk_hz", fclk_hz_str());
       row.add("hw_batch", getenv_or("MMFREE_BATCH", "?"));
       row.add("packed_weights", getenv_or("MMFREE_PACKED_WEIGHTS", "0"));
       row.add("model", blob);
+      // CPU-side weight representation, so an int8 arm and a TQ1_0 arm are
+      // distinguishable in the CSV (0 = the engine owns the matmul).
+      row.add("cpu_wt_bits", use_fpga ? 0.0 : cpu_bits, 4);
       row.add("batch", 1.0, 0);
       row.add("prompt_tokens", (double)br.prompt_tokens, 0);
       row.add("gen_tokens", (double)br.gen_tokens, 0);
@@ -617,6 +692,12 @@ int main(int argc, char** argv) {
     std::fputc('\n', stdout);
   }
 
+  if (tq1)
+    std::printf("cpu-1p6: packed %zu projections, %.1f MiB resident (%.4f bits/weight)\n",
+                tq1->packed_tensors(), (double)tq1->packed_bytes() / (1024.0 * 1024.0), cpu_bits);
+  if (tq2)
+    std::printf("cpu-2bit: packed %zu projections, %.1f MiB resident (%.4f bits/weight)\n",
+                tq2->packed_tensors(), (double)tq2->packed_bytes() / (1024.0 * 1024.0), cpu_bits);
   if (lib) mmfree_lib_close(lib);
   return rc;
 }

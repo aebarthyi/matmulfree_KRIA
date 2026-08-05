@@ -192,6 +192,56 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
         CoreConfig(aWidth = 8, xDim = 8, batchSize = 1, maxN = 32, maxM = 100, maxAcc = 32)
       }
     }
+
+    // PL0_REF only exists on discrete rungs and the PS IP snaps anything else DOWN, so an
+    // off-rung plClkMhz produces a bitstream constrained at the rung while every report,
+    // manifest and CSV carries the request. That went unnoticed for weeks: every "_230"
+    // preset was really a 199.998 MHz build, and two presets 5 MHz apart came out
+    // byte-identical. These two cases are the guard that makes it a build failure instead.
+    "rejects a plClkMhz that is not a reachable PL0_REF rung" in {
+      Seq(215, 220, 225, 230, 240, 275, 295).foreach { mhz =>
+        withClue(s"plClkMhz=$mhz snaps down to a rung and mislabels the build") {
+          val ex = intercept[IllegalArgumentException] {
+            CoreConfig.K26_MMFree2_7B_A16_B6.copy(plClkMhz = mhz)
+          }
+          ex.getMessage must include("not a reachable PL0_REF rung")
+        }
+      }
+    }
+
+    "every named preset targets a reachable PL0_REF rung" in {
+      CoreConfig.presets.foreach { case (name, c) =>
+        withClue(s"$name asks for ${c.plClkMhz} MHz") {
+          CoreConfig.plClkRungs must contain(c.plClkMhz)
+        }
+      }
+    }
+
+    "actCascadeHeight requires an explicit actRamStyle to have any effect" in {
+      // The attribute rides on the ActMem BlackBox; with the inferred SyncReadMem there is
+      // nowhere to put it, so asking for one silently does nothing. Fail instead.
+      assertThrows[IllegalArgumentException] {
+        CoreConfig.K26_MMFree2_7B_A16_B6.copy(actCascadeHeight = 2)
+      }
+      assertThrows[IllegalArgumentException] {
+        CoreConfig.K26_MMFree2_7B_A16_B6.copy(actRamStyle = "lutram")
+      }
+    }
+
+    "the 250 MHz attempt presets carry both levers, not one" in {
+      // Fixing either failing path alone moves WNS by 0.005 ns, so a preset with only one
+      // of the two is a wasted 40-minute build. Pin the pairing.
+      Seq(
+        CoreConfig.K26_MMFree2_7B_A16_B6_DSP_S4_ACB2,
+        CoreConfig.K26_MMFree2_7B_A16_B6_DSP_S4_ACB2_PACKED,
+        CoreConfig.K26_MMFree1_3B_A16_B6_DSP_S4_ACB2_PACKED
+      ).foreach { c =>
+        c.plClkMhz mustBe 250
+        c.colBankSize mustBe 4          // path 2: fanout-103 broadcast net
+        c.actRamStyle mustBe "block"    // path 1: 8-deep RAMB36E2 cascade
+        c.actCascadeHeight mustBe 2
+      }
+    }
   }
 
   "Derived widths" - {

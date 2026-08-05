@@ -19,19 +19,47 @@
 #   ./bench_batch.sh PRESET=<preset> [MODEL=<hf-id>] [GEN=64] [REPS=3] [WARMUP=1] [OUT=file.csv]
 #   ./bench_batch.sh PRESET=<preset> BATCHES="1 2 4 6"    # explicit list instead of 1..B
 #
-# Defaults land the CSV in results/<preset>[_<model-slug>]_batch_sweep.csv. Everything else
-# (device paths, geometry env, model resolution) is delegated to the bundle's Makefile, so
-# this stays consistent with `make run`/`make gate`.
+# BACKEND=cpu runs the SAME sweep with the engine out of the loop — the CPU baseline to
+# quote the FPGA speedup against. It is a true apples-to-apples control: only the model's
+# TernaryBackend differs (main_fpga.cpp header), everything else — prompt, greedy sampling,
+# --serve batching, warmup/reps, CSV columns — is the identical code path. Notes:
+#   * No overlay, no bitstream and no packed blob are needed (the runner never touches the
+#     engine), so a CPU sweep runs on any preset, even one whose blob isn't built. It still
+#     reads the preset manifest for the default batch ladder, so the b's line up with the
+#     FPGA run you're comparing to.
+#   * The CSV is a strict SUBSET of the FPGA one: the bl_* engine-phase columns are absent
+#     (there is no engine), headline + op_* columns are identical. split_sweep_csv.py just
+#     omits the _phases sheet.
+#   * Output is tagged _cpu so it never clobbers the FPGA CSV for the same preset.
+#   * Match POWER between the two runs before comparing — POWER=1 costs ~2% decode.
+#
+# BACKEND=cpu-2bit / cpu-1p6 are the same CPU sweep with the weights held at the FPGA's two
+# encodings (2.0 and 1.625 bits/weight, mmfree/tq1.hpp) instead of one int8 per ternary weight,
+# so a CPU-vs-FPGA comparison can hold the weight format fixed. Both are bit-identical to
+# BACKEND=cpu, so the rows differ only in speed. MEASURED ON THE A53, per projection:
+#   cpu-2bit  0.96-1.25x of int8   (shift+mask extraction; wins at the largest inner dims)
+#   cpu-1p6   0.52-0.82x of int8   (base-3 multiply+compare costs more than the traffic saves)
+# The CPU ternary dot is ALU/issue-bound rather than weight-bandwidth-bound, which is why
+# packing does not pay off the way it does on the engine. `cpu` (int8) remains the CPU's
+# fastest configuration and hence the fair headline denominator.
+#
+# Defaults land the CSV in results/<preset>[_<model-slug>][_cpu]_batch_sweep.csv. Everything
+# else (device paths, geometry env, model resolution) is delegated to the bundle's Makefile,
+# so this stays consistent with `make run`/`make gate`.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # ---- args: KEY=VAL only (mirrors the Makefile's convention) -------------------
 PRESET=""; MODEL=""; GEN=64; REPS=3; WARMUP=1; OUT=""; BATCHES=""; POWER=0; EXTRA=""; TAG=""; RUNENV=""
+BACKEND=fpga
 for arg in "$@"; do
     case "$arg" in
         PRESET=*)  PRESET="${arg#*=}"  ;;
         MODEL=*)   MODEL="${arg#*=}"   ;;
+        # cpu = the no-engine baseline; both = CPU and FPGA in one run, every projection
+        # cross-checked (slow, and its timings include the comparison — don't quote them).
+        BACKEND=*) BACKEND="${arg#*=}" ;;
         GEN=*)     GEN="${arg#*=}"     ;;
         REPS=*)    REPS="${arg#*=}"    ;;
         WARMUP=*)  WARMUP="${arg#*=}"  ;;
@@ -52,18 +80,25 @@ for arg in "$@"; do
         *) echo "unknown arg '$arg' (KEY=VAL only)" >&2; exit 2 ;;
     esac
 done
-[ -n "$PRESET" ] || { echo "usage: $0 PRESET=<preset> [MODEL=<hf-id>] [GEN=n] [REPS=n] [BATCHES=\"1 2 4\"] [OUT=f.csv]" >&2; exit 2; }
+[ -n "$PRESET" ] || { echo "usage: $0 PRESET=<preset> [BACKEND=fpga|cpu|cpu-2bit|cpu-1p6|both] [MODEL=<hf-id>] [GEN=n] [REPS=n] [BATCHES=\"1 2 4\"] [OUT=f.csv]" >&2; exit 2; }
+case "$BACKEND" in
+    fpga|cpu|cpu-2bit|cpu-1p6|cpu-tq1|both) ;;
+    *) echo "ERROR: BACKEND must be fpga, cpu, cpu-2bit, cpu-1p6 or both (got '$BACKEND')." >&2; exit 2 ;;
+esac
 
 MANIFEST="presets/$PRESET/preset.env"
 [ -f "$MANIFEST" ] || { echo "ERROR: no manifest at $MANIFEST — '$PRESET' is not in this bundle." >&2; exit 1; }
 
 # The bitstream's compile-time batchSize is the sweep ceiling: --serve b requires
 # b <= batchSize (above it the engine has no PE row to put the extra stream in).
+# It is the DEFAULT ladder for every backend, so a CPU baseline sweeps the same b's as the
+# FPGA run it is compared against — but it is only a hard CAP when the engine is in play.
+# BACKEND=cpu has no PE rows to run out of, so an explicit BATCHES may go past it.
 HW_BATCH=$(grep -hE '^MMFREE_BATCH=' "$MANIFEST" | cut -d= -f2)
 HW_BATCH=${HW_BATCH:-1}
 if [ -z "$BATCHES" ]; then
     BATCHES=$(seq 1 "$HW_BATCH" | tr '\n' ' ')
-else
+elif [ "${BACKEND#cpu}" = "$BACKEND" ]; then   # any cpu* backend: no PE rows to cap
     for b in $BATCHES; do
         [ "$b" -le "$HW_BATCH" ] || { echo "ERROR: batch $b exceeds the bitstream's batchSize $HW_BATCH." >&2; exit 1; }
     done
@@ -71,12 +106,15 @@ fi
 
 MODEL_ARG=$([ -n "$MODEL" ] && echo "MODEL=$MODEL" || echo "")
 SLUG=$([ -n "$MODEL" ] && echo "_$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')" || echo "")
+# Tag non-default backends so a CPU baseline never overwrites the FPGA CSV for the same preset.
+[ "$BACKEND" = "fpga" ] || SLUG="${SLUG}_${BACKEND}"
 [ -n "$TAG" ] && SLUG="${SLUG}_${TAG}"
 [ -n "$OUT" ] || OUT="results/${PRESET}${SLUG}_batch_sweep.csv"
 mkdir -p "$(dirname "$OUT")" results/logs
 
-echo "# batch sweep: preset=$PRESET  batchSize=$HW_BATCH  sweep=[$BATCHES]"
+echo "# batch sweep: preset=$PRESET  backend=$BACKEND  batchSize=$HW_BATCH  sweep=[$BATCHES]"
 echo "#   gen=$GEN tok/stream  warmup=$WARMUP  reps=$REPS  ${MODEL_ARG:-[manifest model]}"
+case "$BACKEND" in cpu*) echo "#   CPU baseline — engine not used (no overlay/blob needed); bl_* phase columns absent" ;; esac
 echo "#   -> $OUT"
 
 : > "$OUT"
@@ -89,8 +127,11 @@ for b in $BATCHES; do
     # `make run` supplies the device paths + geometry env from the manifest; ARGS adds the
     # sweep-specific flags. --serve b overrides the runner's default single-stream --bench
     # path, and --csv makes it emit the machine-readable row we collect below.
+    # --backend goes in ARGS (not a make var) because the run target hardcodes
+    # `--backend fpga` before $(ARGS) and the runner keeps the LAST occurrence of a repeated
+    # flag; $EXTRA stays last so it can still override this.
     if ! make run PRESET="$PRESET" $MODEL_ARG POWER="$POWER" ${RUNENV:+ENV="$RUNENV"} \
-            ARGS="--serve $b --gen $GEN --warmup $WARMUP --reps $REPS --csv $EXTRA" \
+            ARGS="--backend $BACKEND --serve $b --gen $GEN --warmup $WARMUP --reps $REPS --csv $EXTRA" \
             > "$log" 2>&1; then
         echo "    FAILED (rc=$?) — see $log"
         failed="$failed $b"

@@ -704,6 +704,94 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   }
 
   // ──────────────────────────────────────────────────────────────────
+  // actRamStyle — the control.ActMem BlackBox replacing the inferred SyncReadMem
+  // for the activation memory. It exists to carry ram_style/cascade_height so the
+  // RAMB36E2 depth cascade can be bounded at maxN=8192 (the worst 250 MHz path).
+  // The attributes are invisible to Verilator, so what these tests pin down is the
+  // thing that WOULD break: that the hand-written SV reproduces SyncReadMem's
+  // read/write timing exactly. A one-cycle slip here desynchronises the
+  // weight/activation pairing in inQ and corrupts results silently.
+  // ──────────────────────────────────────────────────────────────────
+
+  "Core with an ActMem activation memory" - {
+    def mkActMemCore(style: String, cascade: Int) = new Core(
+      aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
+      maxN = maxN, maxM = maxM, outBeatLanes = 0,
+      axiAddrWidth = ADDR_WIDTH, axiDataWidth = DATA_WIDTH, axiIdWidth = ID_WIDTH,
+      actRamStyle = style, actCascadeHeight = cascade
+    )
+
+    // The headline claim: identical results on the same stimulus as the SyncReadMem
+    // path. Same seeds as the baseline "random workloads match reference" case above,
+    // so a divergence is attributable to the memory swap and nothing else.
+    "numeric: random workloads match reference (5 seeds)" in {
+      Seq(1L, 7L, 42L, 99L, 256L).foreach { seed =>
+        simulate(mkActMemCore("block", 2)) { dut =>
+          resetDut(dut)
+          val rng = new Random(seed)
+          val n   = 4 + rng.nextInt(maxN - 3)
+          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
+          val m = numColTiles * outLanesPerTile
+          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
+          val weights = Seq.fill(numColTiles * n) {
+            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
+          }
+          val actual   = runPipeline(dut, acts, weights, n, m)
+          val expected = referenceCompute(acts, weights, n, m)
+          withClue(s"actmem seed=$seed n=$n m=$m") { actual mustBe expected }
+        }
+      }
+    }
+
+    // Multi-col-tile: the read address wraps back to row 0 once per tile while the
+    // write port is idle. This is where a read/write-collision difference between the
+    // BlackBox and SyncReadMem would show up.
+    "numeric: multi-col-tile reads wrap per tile" in {
+      simulate(mkActMemCore("block", 2)) { dut =>
+        resetDut(dut)
+        val n = maxN
+        val m = 2 * outLanesPerTile
+        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 1) & ((1 << aWidth) - 1)))
+        val weights = Seq.fill((m / outLanesPerTile) * n)(Seq.fill(outLanesPerTile)(1))
+        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
+      }
+    }
+
+    // Write path: a second LOAD must fully overwrite the first. Mirrors the
+    // "edge: re-LOAD overwrites activation BRAM cleanly" case on the legacy path.
+    "edge: re-LOAD overwrites the activation memory cleanly" in {
+      simulate(mkActMemCore("block", 2)) { dut =>
+        resetDut(dut)
+        val n = maxN
+        val m = outLanesPerTile
+        val weights = Seq.fill(n)(Seq.fill(outLanesPerTile)(1))
+        val first   = Seq.fill(n)(Seq.fill(batchSize)(1))
+        val second  = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 2) & ((1 << aWidth) - 1)))
+        runPipeline(dut, first, weights, n, m) mustBe referenceCompute(first, weights, n, m)
+        runPipeline(dut, second, weights, n, m) mustBe referenceCompute(second, weights, n, m)
+      }
+    }
+
+    // Both ram_style values and the cascade_height=0 (attribute omitted) case have to
+    // produce SV that elaborates and compiles — an unparseable attribute list or a
+    // module-name collision between two instantiations would only surface here.
+    "every (ram_style, cascade_height) variant elaborates and computes" in {
+      Seq(("block", 0), ("block", 1), ("ultra", 2)).foreach { case (style, cascade) =>
+        simulate(mkActMemCore(style, cascade)) { dut =>
+          resetDut(dut)
+          val n = 4
+          val m = outLanesPerTile
+          val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)(i + 1))
+          val weights = Seq.fill(n)(Seq.fill(outLanesPerTile)(1))
+          withClue(s"style=$style cascade=$cascade") {
+            runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
+          }
+        }
+      }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
   // Output chunking — separate config with outBeatLanes < outLanesPerTile.
   // ──────────────────────────────────────────────────────────────────
 

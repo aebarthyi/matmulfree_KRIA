@@ -470,30 +470,63 @@ static int chunk_view(const mmfree_geom_t *g, const proj_t *pr,
     return 0;
 }
 
-/* Largest k <= want for which EVERY even boundary of an k-way split is legal. Halving
- * (rather than decrementing) keeps the boundaries a subset of the previous attempt's, so
- * a projection that only permits coarse boundaries still gets the coarse split instead of
- * failing outright. Returns 1 when no split is possible. */
-static uint32_t pick_chunks(const mmfree_geom_t *g, const proj_t *pr, uint32_t want) {
-    uint32_t tiles = (pr->M + g->outLanesPerTile - 1) / g->outLanesPerTile;
-    for (uint32_t k = want; k > 1; k /= 2u) {
-        if (tiles / k == 0) continue;               /* fewer tiles than chunks */
-        uint32_t per = tiles / k, ok = 1;
-        for (uint32_t j = 1; j < k && ok; j++) {
-            uint64_t dummy;
-            if (chunk_offset(g, pr->N, j * per, &dummy) < 0) ok = 0;
-        }
-        if (ok) return k;
-    }
-    return 1u;
-}
+/* Bounds the on-stack boundary array. The ladder only ever asks for <=8 and the k-sweep
+ * never went past 16, so this is slack, not a real limit. */
+#define SPLIT_MAX_CHUNKS 64u
 
-/* Chunk boundary walk shared by the split driver and mmfree_split_plan, so the plan you can
- * inspect is by construction the plan that runs. */
-static uint32_t chunk_bounds(uint32_t tiles, uint32_t k, uint32_t j, uint32_t *ct0) {
-    uint32_t per = tiles / k;
-    *ct0 = j * per;
-    return (j + 1 == k) ? (tiles - *ct0) : per;   /* last chunk absorbs the remainder */
+/* Tile boundaries for a split, shared by the split driver and mmfree_split_plan so the plan
+ * you can inspect is by construction the plan that runs. Fills bnd[0..return] with
+ * bnd[0]=0 .. bnd[n]=tiles, strictly increasing; chunk j spans [bnd[j], bnd[j+1]).
+ *
+ * Each interior boundary starts at the EVEN split point `j*(tiles/want)` and, if that tile
+ * is not a legal DMA start on this blob, SNAPS outward to the nearest legal tile. When every
+ * even boundary is already legal the snap is a no-op at distance 0, so the 2-bit path and
+ * 2.7B-packed are byte-identical to the previous even-split behaviour (their measured
+ * numbers stay valid).
+ *
+ * Snapping replaces a halve-until-legal loop that gave up at k=1. It matters because with
+ * olt=256 (== 1 mod 5) legality reduces to t*N == 0 mod 5, so a hidden dim not divisible by
+ * 5 only permits t == 0 mod 5:
+ *   370M gate_proj (N=1024, 22 tiles, want 2): even boundary 11 illegal -> was k=1, snaps to 10 -> k=2
+ *   1.3B gate_proj (N=2048, 44 tiles, want 4): even 11/22/33 illegal   -> was k=1, snaps      -> k=4
+ * lm_head is unaffected either way — 125/8 = 15 is already a multiple of 5 — and down_proj /
+ * o_proj are k=1 by the ladder regardless, so gate_proj (~41% of 370M weight traffic) is
+ * exactly what this recovers. Uneven chunks are already a supported case (CoreSpec pins
+ * "deliberately UNEVEN chunks, since boundaries come from blob alignment not evenness").
+ *
+ * Returns the achieved chunk count, which can be less than `want` if snapping collapses
+ * adjacent boundaries; 1 means no split. */
+static uint32_t chunk_boundaries(const mmfree_geom_t *g, const proj_t *pr,
+                                 uint32_t tiles, uint32_t want, uint32_t *bnd) {
+    bnd[0] = 0;
+    if (want > SPLIT_MAX_CHUNKS) want = SPLIT_MAX_CHUNKS;
+    const uint32_t per = (want >= 2u) ? tiles / want : 0u;
+    if (per == 0u) { bnd[1] = tiles; return 1u; }   /* fewer tiles than chunks, or want<2 */
+
+    uint32_t n = 1;
+    for (uint32_t j = 1; j < want; j++) {
+        const uint32_t ideal = j * per;
+        uint32_t found = 0;
+        /* Search outward from the even point, nearer candidates first, so chunks stay as
+         * even as legality permits. d==0 is the even point itself. */
+        for (uint32_t d = 0; d < tiles && !found; d++) {
+            uint32_t cand[2];
+            uint32_t nc = 0;
+            if (ideal >= d)                cand[nc++] = ideal - d;
+            if (d != 0u && ideal + d < tiles) cand[nc++] = ideal + d;
+            for (uint32_t c = 0; c < nc; c++) {
+                const uint32_t t = cand[c];
+                uint64_t dummy;
+                if (t <= bnd[n - 1] || t >= tiles) continue;   /* keep strictly increasing */
+                if (chunk_offset(g, pr->N, t, &dummy) < 0) continue;
+                bnd[n++] = t;
+                found = 1;
+                break;
+            }
+        }
+    }
+    bnd[n] = tiles;
+    return n;
 }
 
 int mmfree_split_plan(const mmfree_lib_t *h, int proj_id, uint32_t want_chunks,
@@ -503,11 +536,13 @@ int mmfree_split_plan(const mmfree_lib_t *h, int proj_id, uint32_t want_chunks,
     const mmfree_geom_t *g = &h->ctx.geom;
     const uint32_t olt = g->outLanesPerTile;
     const uint32_t tiles = (pr->M + olt - 1) / olt;
-    const uint32_t k = (want_chunks < 2u) ? 1u : pick_chunks(g, pr, want_chunks);
+    uint32_t bnd[SPLIT_MAX_CHUNKS + 1u];
+    const uint32_t k = (want_chunks < 2u) ? 1u : chunk_boundaries(g, pr, tiles, want_chunks, bnd);
 
     uint32_t n = 0;
     for (uint32_t j = 0; j < k && n < max; j++) {
-        uint32_t ct0, ctiles = chunk_bounds(tiles, k, j, &ct0);
+        uint32_t ct0 = (k < 2u) ? 0u : bnd[j];
+        uint32_t ctiles = (k < 2u) ? tiles : (bnd[j + 1] - bnd[j]);
         proj_t cv;
         if (chunk_view(g, pr, ct0, ctiles, &cv) < 0) return -EINVAL;
         out[n].first_tile  = ct0;
@@ -536,7 +571,8 @@ int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int16_t 
 
     const uint32_t olt = g->outLanesPerTile;
     const uint32_t tiles = (pr->M + olt - 1) / olt;
-    const uint32_t k = (want_chunks < 2u) ? 1u : pick_chunks(g, pr, want_chunks);
+    uint32_t bnd[SPLIT_MAX_CHUNKS + 1u];
+    const uint32_t k = (want_chunks < 2u) ? 1u : chunk_boundaries(g, pr, tiles, want_chunks, bnd);
     /* Nothing to overlap with a single chunk — take the plain blocking path, which also
      * keeps the phase stats meaningful for the un-split case. The callback still fires (over
      * the whole column range) so the caller's work happens exactly once either way; it just
@@ -562,7 +598,8 @@ int mmfree_bitlinear_batch_split_cb(mmfree_lib_t *h, int proj_id, const int16_t 
     int have_prev = 0;
 
     for (uint32_t j = 0; j < k; j++) {
-        uint32_t ct0, ctiles = chunk_bounds(tiles, k, j, &ct0);
+        const uint32_t ct0 = bnd[j];
+        const uint32_t ctiles = bnd[j + 1] - bnd[j];
         if (chunk_view(g, pr, ct0, ctiles, &cur) < 0) return -EINVAL;
 
         /* The COMPUTE window is issue -> wait-done. It is charged to compute_ns WHOLE, even

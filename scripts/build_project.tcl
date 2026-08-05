@@ -179,13 +179,44 @@ set rpt_file [file join $rpt_dir "$cfg_tag.rpt"]
 set fh [open $rpt_file w]
 puts $fh "# Resource utilization — preset $cfg_preset"
 puts $fh "# CoreConfig: aWidth=[_rpt_env MMFREE_AWIDTH] xDim=[_rpt_env MMFREE_XDIM] batch=[_rpt_env MMFREE_BATCH] maxN=[_rpt_env MMFREE_MAXN] maxM=[_rpt_env MMFREE_MAXM] maxAcc=[_rpt_env MMFREE_MAXACC] accWidth=[_rpt_env MMFREE_ACC_WIDTH] headroom=[_rpt_env MMFREE_ACC_HEADROOM] signed=[_rpt_env MMFREE_SIGNED]"
+# Requested vs CONSTRAINED clock. PL_CLK_MHZ is only a REQUEST: PL0_REF exists on
+# discrete rungs (300/250/200/166.67/142.86/100 on this part — see
+# scripts/probe_pl_clk.tcl) and the PS IP snaps anything else DOWN to the rung
+# below. Every setup path is timed against the snapped rate, so reporting the
+# request — which this script did until 2026-08-04 — made both the "Target clock"
+# line and the Est. Fmax derived from it wrong: e.g. PL_CLK_MHZ=230 builds were
+# constrained at 199.998 MHz, so a WNS of +0.118 ns meant Fmax 204.8, not 235.2.
+# Read the real constrained period off the clock object instead.
 set _clk [_rpt_env PL_CLK_MHZ]
-puts $fh "# Target clock: $_clk MHz   post-route WNS: $wns ns"
-if {[string is double -strict $_clk] && $_clk > 0} {
-    set _period [expr {1000.0 / $_clk}]
+set _act ""
+set _clkobj [get_clocks -quiet clk_pl_0]
+if {$_clkobj ne ""} { set _act [expr {1000.0 / [get_property PERIOD $_clkobj]}] }
+if {$_act eq "" && [info exists ::mmfree_pl_clk_act]} { set _act $::mmfree_pl_clk_act }
+
+if {$_act ne ""} {
+    set _snapped [expr {[string is double -strict $_clk] && abs($_act - $_clk) > 0.5}]
+    puts $fh [format "# Target clock: %s MHz requested -> %.3f MHz CONSTRAINED%s   post-route WNS: %s ns" \
+              $_clk $_act [expr {$_snapped ? "  *** SNAPPED to a PL0_REF rung ***" : ""}] $wns]
+    set _period [expr {1000.0 / $_act}]
     if {$wns < $_period} {
-        puts $fh [format "# Est. Fmax: %.1f MHz" [expr {1000.0 / ($_period - $wns)}]]
+        puts $fh [format "# Est. Fmax: %.1f MHz   (against the %.3f ns constrained period)" \
+                  [expr {1000.0 / ($_period - $wns)}] $_period]
     }
+    if {$_snapped} {
+        puts $fh "# WARNING: PL_CLK_MHZ=$_clk is not a reachable PL0_REF rung. This build is a"
+        puts $fh "#          [format %.3f $_act] MHz build wearing a $_clk MHz label; set plClkMhz to a rung."
+        puts stderr "WARNING: PL_CLK_MHZ=$_clk snapped to [format %.3f $_act] MHz — the bitstream is"
+        puts stderr "         constrained at the rung, not at the request. Set plClkMhz to one of"
+        puts stderr "         300/250/200/167/143/100 (see scripts/probe_pl_clk.tcl)."
+    }
+    # Machine-readable, for build_all.sh to fold into the shipped manifest so the
+    # board's fclk0 is set from the CONSTRAINED rate rather than the request.
+    set _ch [open [file join $repo_root build pl_clk_actual.env] w]
+    puts $_ch "PL_CLK_ACT_MHZ=[format %.3f $_act]"
+    puts $_ch "PL_CLK_REQ_MHZ=$_clk"
+    close $_ch
+} else {
+    puts $fh "# Target clock: $_clk MHz requested (constrained rate unavailable)   post-route WNS: $wns ns"
 }
 puts $fh ""
 # Concise table: pull only the headline site types out of report_utilization.
@@ -204,6 +235,40 @@ foreach _line [split [report_utilization -return_string] "\n"] {
 }
 close $fh
 puts "==> resource report: $rpt_file"
+
+# ─── Timing-path detail: WHY it failed (or how close it came) ────────────────
+# Until 2026-08-03 the only timing artefact was the single WNS number above, so answering
+# "what is the critical path?" meant a full 40-minute rebuild. Two files per build now:
+#   <tag>.timing.rpt   full report_timing_summary + the 30 worst setup paths, full detail
+#   <tag>.paths.txt    one line per path: slack, logic/route split, levels, start -> end
+# The digest is the useful one: the logic-vs-route split says immediately whether a path is
+# fixable by pipelining (logic-dominated) or is a placement/congestion problem (route-
+# dominated), and the repeated start/end pairs show which structure is actually binding.
+set tim_file [file join $rpt_dir "$cfg_tag.timing.rpt"]
+report_timing_summary -delay_type max -max_paths 10 -file $tim_file
+report_timing -setup -max_paths 30 -nworst 1 -path_type full_clock_expanded \
+    -input_pins -file $tim_file -append
+puts "==> timing report: $tim_file"
+
+set dig_file [file join $rpt_dir "$cfg_tag.paths.txt"]
+set dh [open $dig_file w]
+puts $dh "# 30 worst setup paths — preset $cfg_preset @ [expr {$_act ne "" ? [format %.3f $_act] : [_rpt_env PL_CLK_MHZ]}] MHz constrained (WNS $wns ns)"
+puts $dh "# route% high => placement/congestion bound (pipelining will not help)"
+puts $dh "# logic% high => add a pipeline stage / shorten the chain"
+puts $dh [format "%9s %9s %9s %6s %6s  %s" "slack" "logic" "route" "route%" "levels" "startpoint -> endpoint"]
+foreach pth [get_timing_paths -setup -max_paths 30 -nworst 1] {
+    set sl  [get_property SLACK $pth]
+    set dly [get_property DATAPATH_DELAY $pth]
+    set lg  [get_property DATAPATH_LOGIC_DELAY $pth]
+    set rt  [get_property DATAPATH_NET_DELAY $pth]
+    set lv  [get_property LOGIC_LEVELS $pth]
+    set sp  [get_property STARTPOINT_PIN $pth]
+    set ep  [get_property ENDPOINT_PIN $pth]
+    set pct [expr {$dly > 0 ? 100.0 * $rt / $dly : 0.0}]
+    puts $dh [format "%9.3f %9.3f %9.3f %5.1f%% %6s  %s -> %s" $sl $lg $rt $pct $lv $sp $ep]
+}
+close $dh
+puts "==> path digest: $dig_file"
 
 if {$wns < 0} {
     if {[info exists ::env(ALLOW_TIMING_FAIL)] && $::env(ALLOW_TIMING_FAIL) eq "1"} {

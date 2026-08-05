@@ -650,6 +650,20 @@ Port;FD4A0000;FD4AFFFF;1|FPD;DPDMA;FD4C0000;FD4CFFFF;1|FPD;DDR_XMPU5_CFG;FD05000
   if { $pl_clk_mhz != 100 } {
     set_property CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $pl_clk_mhz $zynq_ultra_ps_e_0
   }
+  # PL0_REF only exists on the discrete rungs the PS clock tree can synthesise, so
+  # the REQUESTED FREQMHZ above is not necessarily what gets constrained: the IP
+  # recomputes ACT_FREQMHZ and THAT is the rate the generated clock (and hence every
+  # setup path) is timed against. Until 2026-08-04 nothing read it back, so a build
+  # labelled "230 MHz" recorded a WNS against an unknown period — and two presets
+  # (225/230) produced byte-identical bitstreams without anything explaining why.
+  # Publish it as a global so build_project.tcl can record the real constrained rate.
+  set ::mmfree_pl_clk_req $pl_clk_mhz
+  set ::mmfree_pl_clk_act \
+      [get_property CONFIG.PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ $zynq_ultra_ps_e_0]
+  puts [format "==> PL0_REF: requested %s MHz -> ACT_FREQMHZ %s MHz%s" \
+        $::mmfree_pl_clk_req $::mmfree_pl_clk_act \
+        [expr {abs($::mmfree_pl_clk_act - $::mmfree_pl_clk_req) > 0.5 \
+               ? "   *** SNAPPED — the design is constrained at the ACT rate ***" : ""}]]
 
   # Extra HP ports for DMAs 1..N-1: enable S_AXI_GP{2+i} at 128 bits and flip
   # the S_AXI_HP{i}_FPD token in PROTECTION__MASTERS (GP2->HP0 is enabled in

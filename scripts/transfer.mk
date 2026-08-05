@@ -56,7 +56,15 @@ RUNNER_BIN   := $(RUNNER_DIR)/build/mmfree-cli-fpga
 MANIFEST_MODEL   := $(shell grep -hE '^MMFREE_MODEL=' $(MANIFEST) 2>/dev/null | cut -d= -f2)
 MODEL            ?= $(MANIFEST_MODEL)
 MODEL_DIR        ?= models/$(MODEL)
-PACKED_DIR       ?= $(MODEL_DIR)/packed
+# Which packed blob a preset needs is decided by the BITSTREAM, so derive it from the manifest
+# instead of defaulting to the 2-bit dir: packedWeights is an RTL parameter (the unpack gearbox
+# only exists when it is set) and the runner hard-errors on a blob/bitstream format mismatch.
+# Before this, a packed preset defaulted to $(MODEL_DIR)/packed and failed with a bare
+# "manifest: cannot open .../packed/weights.manifest.tsv" — or, worse, found a 2-bit blob there
+# and only then reported the mismatch. Every sweep script had to pass --packed-dir by hand and
+# a forgotten one looked like a gate bug. An explicit PACKED_DIR= still overrides.
+MANIFEST_PACKED  := $(shell grep -hE '^MMFREE_PACKED_WEIGHTS=' $(MANIFEST) 2>/dev/null | cut -d= -f2)
+PACKED_DIR       ?= $(MODEL_DIR)/$(if $(filter 1,$(MANIFEST_PACKED)),packed-1p6,packed)
 BLOB             ?= $(MODEL_DIR)/model.mmfree
 
 POS_ARGS = $(CORE_PHYS) $(DMA_PHYS) $(UIO_DEV) $(ACT_UDMA) $(WT_UDMA) $(OUT_UDMA)
@@ -129,6 +137,8 @@ help:
 	@echo "  make gen    PRESET=<p> [MODEL=<hf-id>] PROMPT=\"...\" [GEN=n]   interactive generate"
 	@echo "  make sweep  PRESET=<p> [MODEL=<hf-id>] [GEN=n] [REPS=n]      batch sweep b=1..batchSize -> CSV"
 	@echo "    (one row per batch: ttft / prefill / token latency / tok-s + op & engine breakdowns)"
+	@echo "    BACKEND=cpu  same ladder, engine out of the loop = the CPU baseline (-> _cpu CSV)"
+	@echo "    BACKEND=cpu-tq1  CPU arm with 1.6-bit TQ1_0 weights (bit-identical, ~0.6-0.8x on A53)"
 	@echo
 	@echo "  This preset's model: $(if $(strip $(MODEL)),$(MODEL),(none — bench-only))"
 	@echo
@@ -178,11 +188,15 @@ run: runner-bin
 # loaded (sudo make deploy-hw PRESET=… first) — the sweep does not touch the hardware.
 # BATCHES="1 2 4" sweeps an explicit list; GEN/REPS/WARMUP/OUT tune the runs.
 #   make sweep PRESET=k26_mmfree370m_a16_b6 GEN=64 REPS=3
+# BACKEND=cpu runs the same ladder with the engine out of the loop — the CPU baseline for
+# the speedup number. No overlay or packed blob needed, and it writes a separate _cpu CSV:
+#   make sweep PRESET=k26_mmfree1_3b_a16_b6_dsp_s8_200 BACKEND=cpu
 SWEEP_VARS = $(if $(MODEL),MODEL=$(MODEL),) $(if $(GEN),GEN=$(GEN),) \
              $(if $(REPS),REPS=$(REPS),) $(if $(WARMUP),WARMUP=$(WARMUP),) \
              $(if $(BATCHES),BATCHES='$(BATCHES)',) $(if $(OUT),OUT=$(OUT),) \
              $(if $(POWER),POWER=$(POWER),) $(if $(EXTRA),EXTRA='$(EXTRA)',) \
-             $(if $(TAG),TAG=$(TAG),) $(if $(ENV),ENV='$(ENV)',)
+             $(if $(TAG),TAG=$(TAG),) $(if $(ENV),ENV='$(ENV)',) \
+             $(if $(BACKEND),BACKEND=$(BACKEND),)
 sweep: runner-bin
 	$(need_manifest)
 	$(need_blob)
