@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# final_sweep_xeon.sh — the x86 half of the final report data set.
+#
+#   ./scripts/final_sweep_xeon.sh                    # everything (~2 h)
+#
+# Wraps bench_host_cpu.sh to produce the Xeon arm at the same shape as the board arms:
+# 3 models x 3 weight encodings x b=1..6, PASSES independent passes, RAPL power on every row.
+#
+# ── WHY IT SWEEPS THREAD COUNTS ─────────────────────────────────────────────────────
+# The optimal OpenMP thread count on this host is MODEL- AND ENCODING-dependent, measured:
+# 370M wants 10 (physical cores — it fits the 13.75 MB L3 and is issue-bound, so SMT siblings
+# only contend), while 1.3B/2.7B are memory-bound and gain from 20 (SMT hides DRAM latency).
+# A single fixed thread count therefore handicaps some rows, and picking per-row winners out
+# of an undocumented sweep is what made the previous xeon_best.csv unquotable — it silently
+# mixed 10T and 20T rows.
+#
+# So this runs BOTH and records `omp_threads` on every row. The aggregator then selects the
+# better one per (model, encoding, batch) and carries the thread count into the output, which
+# turns "best of a sweep" from a hidden caveat into a stated method: the Xeon baseline is
+# given its best configuration, and the table says which.
+#
+# ── RAPL ────────────────────────────────────────────────────────────────────────────
+# energy_uj is 0400 on stock Ubuntu (PLATYPUS mitigation). Without read access the power
+# columns come out EMPTY and this data set is not final. One-time, resets on reboot:
+#
+#     sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj
+#
+# This script REFUSES to start without it rather than producing a half-empty CSV.
+#
+# ── MACHINE MUST BE IDLE ────────────────────────────────────────────────────────────
+# bench_host_cpu.sh has a load guard, but note this host is also the Vivado build server:
+# a concurrent build makes a CPU sweep measure contention, not the model. Do not start a
+# build while this runs.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PASSES="${PASSES:-3}"
+THREAD_SET="${THREAD_SET:-10 20}"
+MODELS="${MODELS:-ridger/MMfreeLM-370M ridger/MMfreeLM-1.3B ridger/MMfreeLM-2.7B}"
+BACKENDS="${BACKENDS:-cpu cpu-2bit cpu-1p6}"
+BATCHES="${BATCHES:-1 2 3 4 5 6}"
+GEN="${GEN:-64}"
+REPS="${REPS:-3}"
+OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/reports/host_cpu/final}"
+
+# Hard-refuse without RAPL: a "final" data set with empty power columns is not final.
+ok=0
+for d in /sys/class/powercap/intel-rapl:*; do
+    [ -r "$d/energy_uj" ] && case "$(cat "$d/name" 2>/dev/null)" in package-*) ok=1 ;; esac
+done
+if [ "$ok" != "1" ]; then
+    cat >&2 <<'EOF'
+ERROR: no readable RAPL package counter, so every power column would be empty.
+
+  sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj
+
+(resets on reboot). Re-run this script afterwards. Set ALLOW_NO_POWER=1 to override, but
+then the result is NOT the final data set.
+EOF
+    [ "${ALLOW_NO_POWER:-0}" = "1" ] || exit 1
+fi
+
+RUNNER="$REPO_ROOT/software/integration/fpga_runner/build/mmfree-cli-fpga"
+[ -x "$RUNNER" ] || { echo "ERROR: build the runner first: make -C software/integration/fpga_runner" >&2; exit 1; }
+
+echo "############################################################"
+echo "# Xeon final sweep: $PASSES passes x {$THREAD_SET} threads"
+echo "#   models   : $MODELS"
+echo "#   backends : $BACKENDS"
+echo "#   batches  : $BATCHES   gen=$GEN reps=$REPS"
+echo "#   out      : $OUT_ROOT"
+echo "############################################################"
+
+t0=$(date +%s); failed=""
+for pass in $(seq 1 "$PASSES"); do
+    for th in $THREAD_SET; do
+        out="$OUT_ROOT/t${th}_p${pass}"
+        echo
+        echo "=== [$(date -Is)] pass $pass, ${th} threads -> $out ==="
+        OMP_THREADS="$th" MODELS="$MODELS" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
+        GEN="$GEN" REPS="$REPS" OUT="$out" \
+            ./scripts/bench_host_cpu.sh || failed="$failed t${th}p${pass}"
+    done
+done
+
+echo
+echo "############################################################"
+echo "# DONE in $(( ($(date +%s) - t0) / 60 )) min"
+echo "############################################################"
+echo "Per-pass CSVs: $OUT_ROOT/t*_p*/host_cpu_sweep.csv"
+echo "Aggregate with: ./scripts/final_dataset.py"
+[ -n "$failed" ] && { echo "# FAILURES:$failed"; exit 1; }
+echo "# all passes complete"

@@ -130,7 +130,15 @@ for b in $BATCHES; do
     # --backend goes in ARGS (not a make var) because the run target hardcodes
     # `--backend fpga` before $(ARGS) and the runner keeps the LAST occurrence of a repeated
     # flag; $EXTRA stays last so it can still override this.
-    if ! make run PRESET="$PRESET" $MODEL_ARG POWER="$POWER" ${RUNENV:+ENV="$RUNENV"} \
+    # BATCH=$b and a per-arm POWER_DIR are what make the power samples usable. power_bench.sh
+    # names its output <preset>_a..x..b<B>_n..m.._<mode>.samples, taking B from this BATCH and
+    # falling back to the manifest's compile-time batchSize when it is unset. Without BATCH
+    # every b in the ladder resolved to the SAME name and overwrote the last, so a POWER=1
+    # sweep left exactly one samples file — the final batch — and per-batch perf/W was
+    # unobtainable. POWER_DIR then separates arms and passes, which the name alone does not:
+    # two passes of one preset, or the same preset at two backends, still collide otherwise.
+    if ! make run PRESET="$PRESET" $MODEL_ARG POWER="$POWER" BATCH="$b" \
+            POWER_DIR="power/${PRESET}${SLUG}" ${RUNENV:+ENV="$RUNENV"} \
             ARGS="--backend $BACKEND --serve $b --gen $GEN --warmup $WARMUP --reps $REPS --csv $EXTRA" \
             > "$log" 2>&1; then
         echo "    FAILED (rc=$?) — see $log"
