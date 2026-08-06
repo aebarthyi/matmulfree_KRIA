@@ -35,8 +35,8 @@ else
   SIMD_FLAGS :=
 endif
 
-.PHONY: all split packed tq1 clean
-all: split packed tq1
+.PHONY: all split readback packed tq1 clean
+all: split readback packed tq1
 
 # test_split_chunks.c #includes mmfree_lib.c to drive the real static chunk math, so it
 # needs mmfree_runtime.c linked in for the symbols it references (none are called).
@@ -46,6 +46,15 @@ $(BUILD)/test_split_chunks: test_split_chunks.c ../libmmfree/mmfree_lib.c $(SW)/
 
 split: $(BUILD)/test_split_chunks
 	$(BUILD)/test_split_chunks
+
+# Same #include-the-real-source trick, but -fopenmp: without it the threaded readback path
+# compiles away and the test would pass without ever having run the code it exists to check.
+$(BUILD)/test_readback: test_readback.c ../libmmfree/mmfree_lib.c $(SW)/bench/mmfree_runtime.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -fopenmp $(INCS) test_readback.c $(SW)/bench/mmfree_runtime.c -o $@
+
+readback: $(BUILD)/test_readback
+	$(BUILD)/test_readback
 
 packed:
 	cd .. && PYTHONPATH=. python3 tests/test_packed_roundtrip.py

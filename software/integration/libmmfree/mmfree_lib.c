@@ -26,6 +26,41 @@ static inline uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* ---- readback threading knobs (see readback_rows_at) ----
+ *
+ * DEFAULT OFF, deliberately. The final data set's five board passes were measured with a
+ * serial readback, and a B6-vs-B8 comparison has to hold the software constant — a silent
+ * across-the-board speedup would confound exactly the delta being measured. Turn it on
+ * explicitly to A/B it, and only flip the default once the campaign it would perturb is
+ * finished:
+ *
+ *     MMFREE_RB_THREADS=4     threads for the readback loop (0 or 1 = serial, the default)
+ *     MMFREE_RB_MIN_ELEMS=N   below N = b*M elements, stay serial regardless (default 4096)
+ *
+ * Both are read once and cached: getenv on every projection call would itself be a cost in
+ * a phase measured in microseconds. */
+#define RB_COL_BLOCK 512u
+
+static int rb_threads(void) {
+    static int t = -1;
+    if (t < 0) {
+        const char *e = getenv("MMFREE_RB_THREADS");
+        long v = (e && *e) ? strtol(e, NULL, 0) : 0;
+        t = (v < 0) ? 0 : (int)v;
+    }
+    return t;
+}
+
+static size_t rb_min_elems(void) {
+    static size_t n = 0;
+    if (n == 0) {
+        const char *e = getenv("MMFREE_RB_MIN_ELEMS");
+        long v = (e && *e) ? strtol(e, NULL, 0) : 4096;
+        n = (v <= 0) ? 4096u : (size_t)v;
+    }
+    return n;
+}
+
 /* Open one resident udmabuf and name the failure precisely.
  *
  * These three failures need three different fixes and used to print one message
@@ -330,6 +365,42 @@ static void readback_rows_at(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, ui
     if (h->out.cached && g->outLaneBytes == 4 && g->accWidth <= 32) {
         const uint32_t sh = 32u - g->accWidth;
         const uint32_t *ob = (const uint32_t *)h->out.vaddr;
+#ifdef _OPENMP
+        /* Readback is the one phase that still scales ~linearly with batch (13.1 us/row on
+         * 370M, 21.1 on 2.7B) and the only one left running on a single core while the other
+         * three idle. Measured on the board (bench_readback.c, b=6, cold source):
+         *
+         *     M=1024   12.0 -> 6.4 us (1.9x)      M=8192   108.1 -> 29.9 us (3.6x)
+         *     M=2816   33.0 -> 12.6 us (2.6x)     M=32000  387.4 -> 195.6 us (2.0x)
+         *
+         * One core sustains a flat ~4.0 GB/s on this loop at every shape; four reach 8-13,
+         * so the ceiling is cluster memory bandwidth, not cores — hence 32000 tops out at
+         * 2x while 8192 gets 3.6x.
+         *
+         * The threshold is not optional. At b=1, M=1024 the whole call is 2.2 us and the
+         * parallel region alone costs ~1.8 us, so threading it is a 0.55x SLOWDOWN. Small
+         * projections must stay serial.
+         *
+         * Partitioning is (row x column block), not rows alone: rows alone would leave b=1
+         * fully serial and would not divide 6 rows over 4 cores, which is the same
+         * ceil(b/4) wave problem the host vector ops have. */
+        const int nt = rb_threads();
+        if (nt > 1 && (size_t)b * pr->M >= rb_min_elems()) {
+            const uint32_t nblk = (pr->M + RB_COL_BLOCK - 1u) / RB_COL_BLOCK;
+#pragma omp parallel for collapse(2) schedule(static) num_threads(nt)
+            for (uint32_t i = 0; i < b; i++) {
+                for (uint32_t cb = 0; cb < nblk; cb++) {
+                    const uint32_t m0 = cb * RB_COL_BLOCK;
+                    const uint32_t m1 = (m0 + RB_COL_BLOCK < pr->M) ? m0 + RB_COL_BLOCK : pr->M;
+                    const uint32_t *row = ob + (size_t)i * pr->n_outputs;
+                    int32_t *ar = acc + (size_t)i * acc_stride + col0;
+                    for (uint32_t m = m0; m < m1; m++)
+                        ar[m] = (int32_t)(row[m] << sh) >> sh;
+                }
+            }
+            return;
+        }
+#endif
         for (uint32_t i = 0; i < b; i++) {
             const uint32_t *row = ob + (size_t)i * pr->n_outputs;
             int32_t *ar = acc + (size_t)i * acc_stride + col0;

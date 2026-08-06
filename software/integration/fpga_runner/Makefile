@@ -69,7 +69,10 @@ endif
 BUILD    := build
 INCS     := -I$(SUBMOD)/include -I$(SW)/include -I$(LIBMMFREE)
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -fopenmp
-CFLAGS   ?= -O2 -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L
+# -fopenmp on the C side too: mmfree_lib.c's readback loop can be threaded across the four
+# A53s (MMFREE_RB_THREADS). Without the flag the pragma is ignored and readback stays
+# single-threaded — it still builds and is still correct, just slower.
+CFLAGS   ?= -O2 -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -fopenmp
 # OPT is APPENDED to CXXFLAGS/CFLAGS (GCC takes the last -O), so it raises the optimization
 # level for the runner glue + C engine driver without having to restate the whole flag set.
 # This is not just cosmetic: fpga_backend.cpp holds the int32->int16 narrowing loops and
