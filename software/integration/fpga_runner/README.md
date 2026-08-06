@@ -81,6 +81,29 @@ sudo ./build/mmfree-cli-fpga $ARGS --backend fpga --bench --gen 128 --reps 5 --p
 Run **(a) first** — it must print `GATE PASS (CPU == FPGA)` before the timing numbers in
 (b)/(c) mean anything.
 
+### (d) batched decode: does row b land in stream b?
+
+```bash
+sudo ./build/mmfree-cli-fpga $ARGS --backend fpga --serve 8 --distinct-prompts --gen 32 \
+     --prompt "The quick brown fox jumps over the lazy dog while a tired old bear watches"
+```
+
+`--serve N` alone gives every stream the same prompt, and sampling is greedy, so the N
+streams are identical by construction: the `streams_ok` it prints proves batched decode
+equals single-stream decode and that no stream was dropped, but identical streams are
+invariant under permutation — a drain that wrote row 2 into stream 5 passes it.
+
+`--distinct-prompts` gives stream *b* its own prompt (a left-rotation of the ids, so every
+prompt has the same length and the timings stay comparable) and compares it against its
+OWN single-stream reference. A swap then shows up as one stream reproducing another's
+reference verbatim, which is reported as `ROW PERMUTATION` rather than a bare mismatch.
+It costs N single-stream generations up front, so it is a per-bitstream check, not a
+per-sweep one. The prompt must tokenize to at least N tokens; the runner refuses a config
+where two rotations coincide instead of reporting a weaker check as a pass. The `--csv`
+row carries `distinct_prompts` and `distinct_refs` (how many references actually differed
+— streams sharing a reference stay interchangeable) so a saved row says which check it was.
+On the board: `sudo make streams PRESET=<preset>`.
+
 ### One-shot comparison
 
 `compare_backends.sh` does all three in order (gate → CPU bench → FPGA bench), refuses to

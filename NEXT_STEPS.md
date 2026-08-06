@@ -2,15 +2,22 @@
 
 ## 0. TOMORROW, in this order
 
-1. **Distinct-prompt stream check.** `--serve N` gives every stream the SAME prompt
-   (`main_fpga.cpp:483`) and sampling is greedy, so `streams_ok` compares streams that are
-   identical by construction. It proves batched decode matches b=1 and that no stream is
-   dropped — it CANNOT see a row permutation or cross-contamination between identical
-   values. Simulation covers this (`BenchMirrorSpec` drives distinct per-row activations);
-   hardware never has. ~20 lines: give each stream a different prompt, check each against
-   its OWN single-stream reference. `generate_serve` already takes a vector of prompts.
-   **Do this before benchmarking B8** — eight independent streams instead of six. And do
-   not rebuild the board binary while a comparison run is in flight.
+1. ~~**Distinct-prompt stream check.**~~ WRITTEN 2026-08-06, not yet run on hardware.
+   `--distinct-prompts` gives stream *b* its own prompt (a left-rotation of the ids, so all
+   B keep the same length and the timings stay comparable) and checks each against its OWN
+   single-stream reference; a swap is reported as `ROW PERMUTATION` rather than a bare
+   mismatch. It refuses a config where two rotations coincide, and the `--csv` row carries
+   `distinct_prompts` / `distinct_refs` so a saved row says which check produced its
+   `streams_ok`. Verified on the build server against the 370M blob with `--backend cpu`,
+   including fault-injected swap and dropped-stream cases (both caught, and the shared-prompt
+   run passes the same injected swap — that is the blind spot, demonstrated).
+
+   **On the board it still has to run.** After `make deploy` from here:
+
+       cd ~/transfer && make build && sudo make streams PRESET=mmfree_370m
+
+   Then once per B8 bundle. The sweep still uses the shared prompt (unchanged, so the
+   passes 1–3 data stays comparable); this is a per-bitstream check, not a per-sweep one.
 
 2. **Board FPGA passes 4–5**, for a median robust to one bad pass:
 
@@ -27,8 +34,10 @@
 
        ./scripts/final_dataset.py --board ~/results/final --xeon reports/host_cpu/final
 
-5. **B8 on the board** once 1 passes: three bundles are built and waiting in
-   `transfer/presets/mmfree_*_b8/`. Needs `make deploy` first.
+5. **B8 on the board** once 1 passes there: three bundles are built and waiting in
+   `transfer/presets/mmfree_*_b8/`. Needs `make deploy` first. `sudo make streams
+   PRESET=mmfree_370m_b8` before any sweep — eight rows is the widest drain yet, and the
+   sweep's own `streams_ok` cannot see a mis-ordered one.
 
 ---
 

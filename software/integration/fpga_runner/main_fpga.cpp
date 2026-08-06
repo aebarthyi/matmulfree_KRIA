@@ -39,6 +39,13 @@
 //   --serve N          serve N concurrent streams (same prompt) with batched decode — one
 //                      engine call per projection/step. Prints aggregate tok/s + asserts
 //                      every stream matches single-stream generate. Best with N=batchSize.
+//   --distinct-prompts give each --serve stream its OWN prompt and check it against its OWN
+//                      single-stream reference. With the default shared prompt the streams
+//                      are identical by construction, so streams_ok proves batched decode ==
+//                      single-stream and that no stream was dropped, but it is blind to a row
+//                      permutation or to cross-contamination between equal values. Prompts
+//                      are left-rotations of the ids, so all B have the SAME length and the
+//                      timings stay comparable to a shared-prompt run.
 //   --gen N            tokens to generate (default 32)
 //   --temp F           sampling temperature (0 = greedy, default); >0 enables sampling
 //   --top-k K          restrict sampling to the top-K logits (<=0 = full vocab)
@@ -263,7 +270,7 @@ int main(int argc, char** argv) {
 
   std::string blob = "model.mmfree", packed_dir = ".", prefix = "weights", tok_path;
   std::string backend = "fpga", mode = "fixed", ids_arg, prompt;
-  bool bench = false, profile = false, no_eos = false, csv = false;
+  bool bench = false, profile = false, no_eos = false, csv = false, distinct_prompts = false;
   int frac = 10, warmup = 1, reps = 3, serve = 0, top_k = 0;
   std::size_t gen = 32;
   float temperature = 0.0f;             // 0 => greedy
@@ -288,6 +295,7 @@ int main(int argc, char** argv) {
     else if (k == "--profile") profile = true;
     else if (k == "--csv") csv = true;
     else if (k == "--serve") serve = std::atoi(next());
+    else if (k == "--distinct-prompts") distinct_prompts = true;
     else if (k == "--temp") temperature = (float)std::atof(next());
     else if (k == "--top-k") top_k = std::atoi(next());
     else if (k == "--seed") seed = (std::uint64_t)std::strtoull(next(), nullptr, 0);
@@ -333,6 +341,38 @@ int main(int argc, char** argv) {
     ids = {1, 415, 310, 29871, 13, 306, 626, 263};  // fixed pseudo-prompt (no tokenizer)
   }
   if (ids.empty()) { std::fprintf(stderr, "no input ids\n"); return 2; }
+
+  // ---- per-stream prompts for --serve ----
+  // Default: every stream gets the SAME prompt, which with greedy sampling makes all B
+  // streams identical by construction. That checks batched decode == single-stream decode
+  // and that no stream is dropped, but identical streams are invariant under permutation:
+  // if the engine's drain landed row 2 in stream 5, nothing here would move. --distinct-
+  // prompts rotates the ids per stream so each stream has its own continuation, and the
+  // check below compares each against its own single-stream reference. Rotation (rather
+  // than a longer/shorter prompt) keeps every prompt the same length, so prefill cost and
+  // the reported timings stay comparable to a shared-prompt run. Built here, before the
+  // engine is opened, so a degenerate configuration fails before touching the hardware.
+  std::vector<std::vector<std::int64_t>> prompts;
+  if (serve > 0) {
+    prompts.assign((std::size_t)serve, ids);
+    if (distinct_prompts) {
+      for (std::size_t b = 0; b < prompts.size(); ++b)
+        std::rotate(prompts[b].begin(), prompts[b].begin() + (b % ids.size()), prompts[b].end());
+      // Rotations repeat once B exceeds the prompt length (and earlier for a periodic
+      // prompt). Two equal prompts would silently reopen the permutation blind spot for
+      // that pair, so refuse rather than report a weaker check as a passing one.
+      for (std::size_t b = 1; b < prompts.size(); ++b)
+        for (std::size_t c = 0; c < b; ++c)
+          if (prompts[b] == prompts[c]) {
+            std::fprintf(stderr,
+                         "--distinct-prompts: streams %zu and %zu got the same prompt "
+                         "(rotations of a %zu-token prompt repeat at B>%zu). Pass a longer "
+                         "--prompt/--ids.\n",
+                         c, b, ids.size(), ids.size());
+            return 2;
+          }
+    }
+  }
 
   // Report the SIMD backend the kernels were COMPILED with. Not decoration: the CPU side is
   // ~57% of wall time on the FPGA path, and a scalar libmmfreecpu.a produces bit-identical
@@ -480,12 +520,30 @@ int main(int argc, char** argv) {
   // ---- serving: B concurrent streams, batched decode (one engine call per projection/step) ----
   if (serve > 0) {
     const std::size_t Bn = static_cast<std::size_t>(serve);
-    std::vector<std::vector<std::int64_t>> prompts(Bn, ids);  // same prompt across streams
     Sampling samp;  // greedy → deterministic, so every stream must match the single-stream ref
 
-    // Correctness reference: one stream decoded the existing (single-stream) way. This also
-    // warms the resident weights / udmabuf mapping before anything is timed.
-    std::vector<std::int64_t> ref = model.generate(ids, gen, /*eos=*/-1, samp);
+    // Correctness reference: each prompt decoded the existing (single-stream) way. This also
+    // warms the resident weights / udmabuf mapping before anything is timed. With the shared
+    // prompt one reference serves every stream; with --distinct-prompts each stream needs its
+    // own, which costs B single-stream generations up front (untimed).
+    std::vector<std::vector<std::int64_t>> ref;
+    ref.push_back(model.generate(prompts[0], gen, /*eos=*/-1, samp));
+    if (distinct_prompts)
+      for (std::size_t b = 1; b < Bn; ++b)
+        ref.push_back(model.generate(prompts[b], gen, /*eos=*/-1, samp));
+    auto ref_for = [&](std::size_t b) -> const std::vector<std::int64_t>& {
+      return ref[distinct_prompts ? b : 0];
+    };
+
+    // How many of the references are actually distinct. A permutation can only be SEEN
+    // where two streams' expected outputs differ, so this is the check's real strength:
+    // Bn means every pair is separable, 1 means the run proves nothing about row order.
+    std::size_t distinct_refs = 0;
+    for (std::size_t b = 0; b < ref.size(); ++b) {
+      bool novel = true;
+      for (std::size_t c = 0; c < b && novel; ++c) novel = ref[b] != ref[c];
+      if (novel) ++distinct_refs;
+    }
 
     using clk = std::chrono::steady_clock;
     auto secs = [](clk::duration d) { return std::chrono::duration<double>(d).count(); };
@@ -553,10 +611,55 @@ int main(int argc, char** argv) {
     const double pre_tps  = prefill > 0 ? (double)(Bn * ids.size()) / prefill : 0.0;
 
     std::size_t bad = 0;
-    for (const auto& st : out) if (st != ref) ++bad;
+    std::vector<std::string> notes;
+    char note[256];
+    for (std::size_t b = 0; b < out.size(); ++b) {
+      if (out[b] == ref_for(b)) continue;
+      ++bad;
+      // A row swap has a signature the plain mismatch count hides: stream b reproduces
+      // ANOTHER stream's reference exactly. Say so — that distinguishes "the drain wrote
+      // the wrong slot" from "the arithmetic is wrong", which need different fixes.
+      std::size_t matched = ref.size();
+      for (std::size_t c = 0; c < ref.size(); ++c)
+        if (c != b && out[b] == ref[c]) { matched = c; break; }
+      if (matched < ref.size())
+        snprintf(note, sizeof(note),
+                 "  stream %zu MISMATCH — it is stream %zu's reference verbatim "
+                 "(ROW PERMUTATION, not an arithmetic error)", b, matched);
+      else {
+        std::size_t at = 0;
+        while (at < out[b].size() && at < ref_for(b).size() && out[b][at] == ref_for(b)[at]) ++at;
+        snprintf(note, sizeof(note), "  stream %zu MISMATCH — diverges at token %zu of %zu",
+                 b, at, out[b].size());
+      }
+      notes.emplace_back(note);
+    }
+    if (out.size() != Bn) {   // a dropped stream is a failure even if the survivors match
+      snprintf(note, sizeof(note), "  serve returned %zu streams, expected %zu",
+               out.size(), Bn);
+      notes.emplace_back(note);
+      bad += Bn - std::min(out.size(), Bn);
+    }
+    // Without distinct prompts the streams are identical by construction and a permutation
+    // is undetectable. Say what the check did and did not cover rather than letting an
+    // "OK" line imply more than it proves.
+    if (!distinct_prompts)
+      notes.emplace_back("  (shared prompt: proves batched == single-stream and no stream "
+                         "dropped; blind to row order — rerun with --distinct-prompts)");
+    else if (distinct_refs < Bn) {
+      snprintf(note, sizeof(note),
+               "  WARN: only %zu of %zu references are distinct — streams sharing a "
+               "reference stay interchangeable. Try a longer --gen or --prompt.",
+               distinct_refs, Bn);
+      notes.emplace_back(note);
+    }
 
     std::printf("serve B=%zu: %s\n", Bn,
-                bad ? "STREAM MISMATCH (serve != single-stream)" : "OK (all streams == single-stream)");
+                bad ? "STREAM MISMATCH (serve != single-stream)"
+                    : (distinct_prompts
+                           ? "OK (every stream == its OWN single-stream reference)"
+                           : "OK (all streams == single-stream)"));
+    for (const auto& s : notes) std::printf("%s\n", s.c_str());
     std::printf("  ttft (1st stream):   %8.1f ms\n", ttft * 1e3);
     std::printf("  prefill (all %zu):    %8.1f ms  (%.2f tok/s over %zu prompt tokens)\n",
                 Bn, prefill * 1e3, pre_tps, Bn * ids.size());
@@ -587,6 +690,12 @@ int main(int argc, char** argv) {
       row.add("gen_tokens", (double)gen_per, 0);
       row.add("reps", (double)rr, 0);
       row.add("streams_ok", bad ? "0" : "1");
+      // How strong that streams_ok is. distinct_prompts=0 means the streams were identical
+      // by construction, so the row carries no evidence about row order; =1 means each
+      // stream was checked against its own reference, and distinct_refs is how many of
+      // those references were actually different (Bn = every pair separable).
+      row.add("distinct_prompts", distinct_prompts ? 1.0 : 0.0, 0);
+      row.add("distinct_refs", (double)distinct_refs, 0);
       row.add("ttft_ms", ttft * 1e3, 3);
       row.add("prefill_ms", prefill * 1e3, 3);
       row.add("prefill_tok_s", pre_tps, 3);
@@ -644,6 +753,10 @@ int main(int argc, char** argv) {
       row.add("gen_tokens", (double)br.gen_tokens, 0);
       row.add("reps", (double)reps, 0);
       row.add("streams_ok", "1");
+      // One stream, so row order is trivially right and there is exactly one reference —
+      // present only to keep this row column-compatible with the --serve rows.
+      row.add("distinct_prompts", 0.0, 0);
+      row.add("distinct_refs", 1.0, 0);
       row.add("ttft_ms", br.avg_prefill_s * 1e3, 3);
       row.add("prefill_ms", br.avg_prefill_s * 1e3, 3);
       row.add("prefill_tok_s",

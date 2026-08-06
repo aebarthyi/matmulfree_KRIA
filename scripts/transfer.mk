@@ -122,7 +122,7 @@ define need_blob
 	@[ -f "$(BLOB)" ] || { echo "ERROR: blob '$(BLOB)' not found — the '$(MODEL)' model isn't in this bundle. Build it on the build server (make model PRESET=$(PRESET)) and re-deploy, or pass BLOB=<f>." >&2; exit 1; }
 endef
 
-.PHONY: help build bench-bin runner-bin deploy-hw bench gate run gen sweep
+.PHONY: help build bench-bin runner-bin deploy-hw bench gate streams run gen sweep
 
 help:
 	@echo "matmulfree_KRIA board runner (PRESET=$(PRESET))"
@@ -131,6 +131,9 @@ help:
 	@echo "  sudo make deploy-hw PRESET=<preset>           load bitstream overlay + u-dma-buf driver"
 	@echo "  make bench  PRESET=<p> [BATCH=N] [ARGS=...]   native sweep benchmark (+ power)"
 	@echo "  make gate   PRESET=<p> [MODEL=<hf-id>]        fpga_runner exact-match gate (CPU==FPGA)"
+	@echo "  make streams PRESET=<p> [STREAMS=n]           batched decode with a DIFFERENT prompt per"
+	@echo "                                                stream, each vs its own single-stream run"
+	@echo "                                                (the row-order check the sweep cannot do)"
 	@echo "  make run    PRESET=<p> [MODEL=<hf-id>]        fpga_runner FPGA decode (timed/profiled, + power)"
 	@echo "    (bench/run sample rail power via xlnx_platformstats -> power/<geom>_<mode>.{log,samples};"
 	@echo "     POWER=0 disables, POWER_INTERVAL / POWER_ARGS / POWER_DIR tune it)"
@@ -174,6 +177,30 @@ gate: runner-bin
 	$(need_manifest)
 	$(need_blob)
 	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) --backend both $(ARGS)
+
+# ─── fpga_runner — per-stream row-order check ────────────────────────────────
+# The sweep's streams_ok column runs every stream from the SAME prompt, so with greedy
+# sampling the streams are identical by construction: it proves batched decode == single-
+# stream decode and that no stream was dropped, but it cannot see the engine's drain
+# putting row 2 into stream 5. This runs B streams from B DIFFERENT prompts (rotations of
+# STREAMS_PROMPT, same length so the timings stay comparable) and checks each against its
+# OWN single-stream decode — a swap then shows up as one stream reproducing another's
+# reference verbatim, which the runner reports as ROW PERMUTATION. Non-zero exit on any
+# mismatch. Run it once per bitstream, not per sweep; it costs B single-stream generations
+# on top of the serve run. STREAMS defaults to the preset's compile-time batch.
+#   sudo make streams PRESET=mmfree_370m_b8            # all 8 rows of a B8 build
+#   sudo make streams PRESET=mmfree_2_7b STREAMS=6 GEN=32
+# STREAMS_PROMPT must tokenize to at least STREAMS tokens — the runner refuses a config
+# where two rotations coincide rather than reporting a weaker check as a pass.
+STREAMS ?= $(if $(BATCH),$(BATCH),$(shell sed -n 's/^MMFREE_BATCH=//p' $(MANIFEST) 2>/dev/null))
+STREAMS_PROMPT ?= The quick brown fox jumps over the lazy dog while a tired old bear watches from the hill above the river
+streams: runner-bin
+	$(need_manifest)
+	$(need_blob)
+	@[ -n "$(strip $(STREAMS))" ] || { echo "ERROR: no stream count — the manifest has no MMFREE_BATCH; pass STREAMS=<n>." >&2; exit 1; }
+	sudo env $(GEOM_ENV) $(abspath $(RUNNER_BIN)) $(POS_ARGS) $(RUNNER_ARTIFACTS) \
+	    --backend fpga --serve $(STREAMS) --distinct-prompts --gen $(GEN) \
+	    --prompt "$(STREAMS_PROMPT)" $(ARGS)
 
 # ─── fpga_runner — FPGA decode ───────────────────────────────────────────────
 run: runner-bin

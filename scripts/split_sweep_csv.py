@@ -36,6 +36,7 @@ ID_COLS = ["preset", "clk_mhz", "hw_batch", "packed_weights", "model", "batch"]
 # skipped rather than emitted empty, so this tolerates older/newer runner versions.
 SUMMARY_COLS = [
     "prompt_tokens", "gen_tokens", "reps", "streams_ok",
+    "distinct_prompts", "distinct_refs",
     "ttft_ms", "prefill_ms", "prefill_tok_s",
     "token_latency_ms",
     "decode_tok_s", "decode_tok_s_per_stream", "overall_tok_s",

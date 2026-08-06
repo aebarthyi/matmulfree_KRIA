@@ -12,6 +12,13 @@
 # with streams_ok=0 is a CORRECTNESS failure and its timings mean nothing — check that column
 # before reading any number in the row.
 #
+# What streams_ok here does NOT cover: the sweep gives every stream the SAME prompt, and
+# sampling is greedy, so the streams are identical by construction (distinct_prompts=0 in
+# the CSV). That catches a dropped stream and any divergence from single-stream decode, but
+# identical streams are invariant under permutation — it cannot see the drain writing row 2
+# into stream 5. `make streams PRESET=<p>` runs the same path with a different prompt per
+# stream and checks each against its own reference; run it once per bitstream.
+#
 # This is the BOARD-side script (staged into the bundle by build_all.sh); run it from
 # ~/transfer with the target overlay already loaded:
 #
