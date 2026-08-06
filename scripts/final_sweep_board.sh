@@ -49,8 +49,12 @@ CPU_REPS="${CPU_REPS:-1}"    # A53 arms: one shot, they are slow
 GATE_GEN="${GATE_GEN:-8}"
 export POWER=1               # non-negotiable for this data set; see above
 
-PRESETS="mmfree_370m mmfree_1_3b mmfree_2_7b"
+PRESETS="${PRESETS:-mmfree_370m mmfree_1_3b mmfree_2_7b}"
 CPU_BACKENDS="${CPU_BACKENDS:-cpu cpu-2bit cpu-1p6}"
+# Pass numbering starts here, so a top-up run adds passes instead of overwriting them:
+#   PRESETS=mmfree_1_3b PASS_START=4 PASSES=6 sudo ./final_sweep_board.sh fpga
+# adds passes 4..6 for one arm, leaving 1..3 (and the other arms) untouched.
+PASS_START="${PASS_START:-1}"
 
 mkdir -p results/logs
 failed=""
@@ -74,7 +78,7 @@ fi
 # ── FPGA arms ────────────────────────────────────────────────────────────────
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "fpga" ]; then
     for preset in $PRESETS; do
-        say "FPGA  $preset  ($PASSES passes, reps=$FPGA_REPS, power on)"
+        say "FPGA  $preset  (passes $PASS_START..$PASSES, reps=$FPGA_REPS, power on)"
 
         wt=$(grep -hE '^UDMABUF_WT_SZ=' "presets/$preset/preset.env" | cut -d= -f2)
         nd=$(grep -hE '^NUM_DMA=' "presets/$preset/preset.env" | cut -d= -f2)
@@ -85,7 +89,7 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "fpga" ]; then
         [ "$need" -gt "$(( free + ${held:-0} ))" ] && \
             echo "   !! WARNING: WT need exceeds the CMA budget — reboot or run ./cma_reclaim.sh"
 
-        for pass in $(seq 1 "$PASSES"); do
+        for pass in $(seq "$PASS_START" "$PASSES"); do
             # Fresh overlay load per pass: it re-runs the udmabuf allocation, so CMA placement
             # differs between passes. That is deliberate — placement is one of the things the
             # spread is supposed to capture.
@@ -97,9 +101,10 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "fpga" ]; then
             fi
             grep -E "fclk0|WARN|ERROR" "results/logs/final_deploy_${preset}_p${pass}.log" | head -4 | sed 's/^/     /'
 
-            # Gate once per preset, on the first pass. The bitstream does not change between
-            # passes, so re-gating each one buys nothing and costs minutes at 2.7B.
-            if [ "$pass" = "1" ]; then
+            # Gate once per preset, on the first pass of this invocation. The bitstream does
+            # not change between passes, so re-gating each one buys nothing and costs minutes
+            # at 2.7B — but a top-up run still gates once, since it may be a different day.
+            if [ "$pass" = "$PASS_START" ]; then
                 echo "  -- gate (CPU == FPGA, bit-exact) --"
                 if ! make gate PRESET="$preset" ARGS="--gen $GATE_GEN" \
                         > "results/logs/final_gate_$preset.log" 2>&1; then
