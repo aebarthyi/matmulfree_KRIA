@@ -13,8 +13,10 @@ Emits reports/final/dataset.csv, one row per (platform, arm, model, weight_fmt, 
     batch        1..6
     threads      Xeon OpenMP threads (blank on the board)
     passes       independent runs behind the mean
-    decode_tok_s mean across passes
-    spread_pct   (max-min)/mean across passes, 0 when passes==1
+    decode_tok_s MEDIAN across passes — robust to the one-perturbed-pass failure mode
+    mean_tok_s   arithmetic mean, for comparison
+    spread_pct   (max-min)/median across passes, 0 when passes==1
+    median_shift_pct  how far the median moves if any single pass is dropped (jackknife)
     watts        mean board SOM rail power / Xeon RAPL package+DRAM, SAME run as the tok/s
     tok_per_joule decode_tok_s / watts
     streams_ok   1 = every stream matched a single-stream decode (FPGA arms)
@@ -149,13 +151,32 @@ def collapse(recs, spread_limit):
     for r in recs:
         by[(r['platform'], r['arm'], r['model'], r['weight_fmt'], r['batch'], r['threads'])].append(r)
 
+    def med(xs):
+        v = sorted(xs); n = len(v)
+        return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
     means = {}
     for k, rs in by.items():
         ds = [r['decode'] for r in rs]
         ws = [r['watts'] for r in rs if r['watts'] is not None]
-        mean = sum(ds) / len(ds)
-        means[k] = dict(mean=mean, spread=(max(ds) - min(ds)) / mean * 100 if len(ds) > 1 else 0.0,
-                        n=len(ds), watts=(sum(ws) / len(ws)) if ws else None,
+        # MEDIAN, not mean, is the headline. The observed failure mode on both platforms is
+        # ONE perturbed pass out of three — a transient that drags a mean but not a median.
+        # Measured here: Xeon 2.7B t20 2bit pass 1 ran 8.5% slow while passes 2 and 3 agreed
+        # to 0.9%, and kria 1.3B b=6 pass 2 ran 6% slow while 1 and 3 agreed to 0.04%. Pass 1
+        # is NOT systematically slow (every other cell sits within +-1%), so these are machine
+        # transients, not warm-up. The full range is still reported as spread_pct, so nothing
+        # is hidden — the median just stops one transient from moving the number.
+        m = med(ds)
+        # Jackknife: is the median itself robust? Recompute it leaving each pass out; if any
+        # single pass can move it by more than the limit, the cell needs more passes. This is
+        # a better flag than raw spread, which condemns a cell whose median is rock solid.
+        jack = max(abs(med([d for j, d in enumerate(ds) if j != i]) - m) / m * 100
+                   for i in range(len(ds))) if len(ds) > 2 else (
+                   (max(ds) - min(ds)) / m * 100 if len(ds) > 1 else 0.0)
+        means[k] = dict(mean=m, mean_arith=sum(ds) / len(ds),
+                        spread=(max(ds) - min(ds)) / m * 100 if len(ds) > 1 else 0.0,
+                        jack=jack,
+                        n=len(ds), watts=(med(ws) if ws else None),
                         streams_ok=min((r['streams_ok'] for r in rs if r['streams_ok'] != ''), default=''),
                         preset=rs[0]['preset'])
 
@@ -187,7 +208,7 @@ def collapse(recs, spread_limit):
     for ck, k in sorted(best.items(), key=lambda kv: (kv[0][0], kv[0][2], kv[0][3], kv[0][4])):
         v = means[k]
         plat, arm, model, fmt, batch = ck
-        flag = 'OUTLIER' if v['spread'] > spread_limit else ''
+        flag = 'UNSTABLE' if v['jack'] > spread_limit else ''
         if v['watts'] is None:
             flag = (flag + ' NO_POWER').strip()
         if arm == 'fpga' and v['streams_ok'] not in ('1', ''):
@@ -196,7 +217,9 @@ def collapse(recs, spread_limit):
             platform=plat, arm=arm, model=model, weight_fmt=fmt, batch=batch,
             threads=k[5], passes=v['n'],
             decode_tok_s=round(v['mean'], 3),
+            mean_tok_s=round(v['mean_arith'], 3),
             spread_pct=round(v['spread'], 2),
+            median_shift_pct=round(v['jack'], 2),
             watts=round(v['watts'], 3) if v['watts'] is not None else '',
             tok_per_joule=round(v['mean'] / v['watts'], 4) if v['watts'] else '',
             streams_ok=v['streams_ok'], preset=v['preset'], flag=flag))
@@ -228,7 +251,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     dest = os.path.join(a.out, 'dataset.csv')
     cols = ['platform', 'arm', 'model', 'weight_fmt', 'batch', 'threads', 'passes',
-            'decode_tok_s', 'spread_pct', 'watts', 'tok_per_joule', 'streams_ok', 'preset', 'flag']
+            'decode_tok_s', 'mean_tok_s', 'spread_pct', 'median_shift_pct',
+            'watts', 'tok_per_joule', 'streams_ok', 'preset', 'flag']
     with open(dest, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
