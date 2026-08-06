@@ -12,12 +12,20 @@
    including fault-injected swap and dropped-stream cases (both caught, and the shared-prompt
    run passes the same injected swap — that is the blind spot, demonstrated).
 
-   **On the board it still has to run.** After `make deploy` from here:
+   **PASSED ON HARDWARE 2026-08-06**, `mmfree_370m` at B=6: `OK (every stream == its OWN
+   single-stream reference)`, six distinct prompts, six distinct references, no permutation.
+   That is the first time batched row independence has been shown on the board rather than in
+   simulation — decode 105.38 tok/s aggregate on that run, in family with the 103.16 median.
 
-       cd ~/transfer && make build && sudo make streams PRESET=mmfree_370m
+   **Still to check, one per distinct bitstream** (this is a per-bitstream check, not a
+   per-sweep one; the sweep still uses the shared prompt, unchanged, so passes 1–5 stay
+   comparable):
 
-   Then once per B8 bundle. The sweep still uses the shared prompt (unchanged, so the
-   passes 1–3 data stays comparable); this is a per-bitstream check, not a per-sweep one.
+       sudo make deploy-hw PRESET=mmfree_2_7b && sudo make streams PRESET=mmfree_2_7b
+
+   `mmfree_2_7b` is the other geometry (maxN=8192, and 1.3B runs that same bitstream, so one
+   run covers both). Then each B8 bundle — eight rows is the widest drain yet and the reason
+   the check exists.
 
 2. ~~**Board FPGA passes 4–5**~~ DONE 2026-08-06 (all three models, pulled back into
    `~/results/final/`). ⚠️ For any future top-up: the variables go AFTER `sudo` — it resets
