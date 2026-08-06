@@ -60,7 +60,29 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "the deployable set is exactly the three released checkpoints" in {
-      CoreConfig.presets.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
+      // `presets` also carries candidates (buildable, not shipped); `deployable` is what the
+      // board bundle and the report quote, and that must not grow by accident.
+      CoreConfig.deployable.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
+    }
+
+    "candidates are buildable but never mistaken for deployable" in {
+      CoreConfig.candidates.keySet.intersect(CoreConfig.deployable.keySet) mustBe empty
+      CoreConfig.presets mustBe (CoreConfig.deployable ++ CoreConfig.candidates)
+      CoreConfig.candidates.keys.foreach { n => CoreConfig.byName(n) mustBe CoreConfig.candidates(n) }
+    }
+
+    // B8 fits only because the lane accumulators move into DSP48s (~22 pp of LUT at B6);
+    // without dspAccum the same array was a ~95% LUT capacity wall. Pin that so a B8
+    // candidate cannot be built in the configuration already known not to fit.
+    "the B8 candidates carry dspAccum, the condition that makes B8 fit at all" in {
+      CoreConfig.candidates.filter(_._1.endsWith("_b8")).foreach { case (n, c) =>
+        withClue(n) {
+          c.batchSize   mustBe 8
+          c.dspAccum    mustBe true
+          c.colBankSize mustBe 4     // 800 spilled lanes need the shortest broadcast domains
+          c.packedWeights mustBe true
+        }
+      }
     }
 
     // These four fields ARE the conclusion of the optimization program: B6 amortizes the
@@ -69,7 +91,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     // is the top reachable rung. Any preset that loses one of them is a regression, not a
     // variant — an ablation belongs on the `exploration` branch.
     "every deployable preset carries the full optimization stack" in {
-      CoreConfig.presets.foreach { case (name, c) =>
+      CoreConfig.deployable.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
           c.batchSize      mustBe 6
           c.outBeatLanes   mustBe 4
@@ -81,7 +103,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "the a16 / 4-HP-port engine geometry is identical across all three sizes" in {
-      CoreConfig.presets.foreach { case (name, c) =>
+      CoreConfig.deployable.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
           c.aWidth          mustBe 16
           c.xDim            mustBe 32

@@ -524,14 +524,58 @@ object CoreConfig {
                   colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
                   implDirectives = b4TimingLevers250)
 
-    /** The deployable set — what `make build PRESET=` and the board bundle consume.
-      * Dev fixtures above are deliberately absent; ablations live on `exploration`.
+    /** The deployable set — what the board bundle ships and what the report quotes.
+      * Dev fixtures above are deliberately absent; closed ablations live on `exploration`.
       */
-    val presets: Map[String, CoreConfig] = Map(
+    val deployable: Map[String, CoreConfig] = Map(
         "mmfree_370m" -> MMFree_370M,
         "mmfree_1_3b" -> MMFree_1_3B,
         "mmfree_2_7b" -> MMFree_2_7B
     )
+
+    // ─── Candidates ────────────────────────────────────────────────────────
+    // Buildable and benchable, but NOT shipped: configurations being evaluated against the
+    // deployable set. Kept separate so `deployable` stays exactly the three the report
+    // quotes, while `make build PRESET=` can still reach these. A candidate either wins and
+    // is promoted, or loses and moves to `exploration` with its result recorded.
+    //
+    // ── B8: the one batch that is optimal on BOTH sides ───────────────────────
+    // batchSize=8 was written off as a ~95% LUT capacity wall — but that was MEASURED on
+    // 370M B8 with fabric accumulators, before dspAccum existed, and moving the lane
+    // accumulators into DSP48s is worth ~22 pp of LUT. Extrapolating the two measured
+    // 2.7B DSP+packed points (B4 49839 LUT, B6 70338) linearly and correcting for the extra
+    // DSP spill puts B8 at ~81% LUT, 47% registers, 20% CARRY8, 49% BRAM, 50% URAM. That
+    // fits. dspAccum is not an optimization here, it is the enabling condition — which is
+    // why 370M gains it below despite closing 250 without it at B6.
+    //
+    // WHY B8 IS WORTH A BUILD: it is the only point that helps engine and host at once. The
+    // engine amortizes the weight stream over 8 tokens instead of 6 (B4->B6 measured
+    // +11.8%). The host's vector ops are omp-static over the batch on 4 A53 cores, so they
+    // cost ceil(b/4) waves — b=8 runs two full waves at 100% efficiency where b=6 wastes a
+    // quarter of the second wave. b=5..8 all pay two waves and only b=8 amortizes them.
+    //
+    // THE RISK IS TIMING, NOT CAPACITY. Full DSP coverage wants xDim*batch*nLanes =
+    // 32*8*8 = 2048 against the K26's 1248, so 800 lanes spill to fabric versus 288 at B6 —
+    // and that spill is exactly what created the route-bound broadcast path colBankSize=4
+    // was added to fix. B6 closes 250 at +0.025 ns with all 30 worst paths clustered in
+    // 0.042-0.063 ns on one congestion family, so there is no margin to give away. If these
+    // miss 250, drop to the 200 rung: it costs ~5% and B8's upside is larger than that.
+    val MMFree_370M_B8: CoreConfig =
+        MMFree_370M.copy(batchSize = 8, dspAccum = true, colBankSize = 4)
+    // maxN=8192 keeps the ActMem cascade cap it needs at B6 — batch widens actBram
+    // (8*16 = 128 bits vs 96) but does not deepen it, so the 8-deep RAMB36E2 chain that
+    // lever bounds is unchanged.
+    val MMFree_1_3B_B8: CoreConfig = MMFree_1_3B.copy(batchSize = 8)
+    val MMFree_2_7B_B8: CoreConfig = MMFree_2_7B.copy(batchSize = 8)
+
+    val candidates: Map[String, CoreConfig] = Map(
+        "mmfree_370m_b8" -> MMFree_370M_B8,
+        "mmfree_1_3b_b8" -> MMFree_1_3B_B8,
+        "mmfree_2_7b_b8" -> MMFree_2_7B_B8
+    )
+
+    /** Everything `make build PRESET=` / EmitCore can reach. */
+    val presets: Map[String, CoreConfig] = deployable ++ candidates
 
     def byName(name: String): CoreConfig = {
         val key = name.toLowerCase
