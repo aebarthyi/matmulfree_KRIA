@@ -19,18 +19,21 @@
    Then once per B8 bundle. The sweep still uses the shared prompt (unchanged, so the
    passes 1–3 data stays comparable); this is a per-bitstream check, not a per-sweep one.
 
-2. **Board FPGA passes 4–5**, for a median robust to one bad pass:
+2. ~~**Board FPGA passes 4–5**~~ DONE 2026-08-06 (all three models, pulled back into
+   `~/results/final/`). ⚠️ For any future top-up: the variables go AFTER `sudo` — it resets
+   the environment. Putting them before silently ran the default passes 1..3 and overwrote
+   the data, twice. The script now prints its effective settings; check the banner.
 
-       cd ~/transfer && sudo PASS_START=4 PASSES=5 ./final_sweep_board.sh fpga
-
-   ⚠️ The variables go AFTER `sudo` — it resets the environment. Putting them before
-   silently ran the default passes 1..3 and overwrote the data, twice. The script now
-   prints its effective settings; check the banner.
+       cd ~/transfer && sudo PASS_START=6 PASSES=7 ./final_sweep_board.sh fpga
 
 3. **Xeon passes 4–5**: `PASSES=5 ./scripts/final_sweep_xeon.sh` (idempotent — skips the
-   three that exist). Deferred from 2026-08-05.
+   three that exist). Started 2026-08-06, ~3 h. Two preconditions bite every reboot:
+   RAPL needs `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj` (the script
+   refuses without it) and the box must be idle — a stuck VS Code `rg --files` was holding
+   11 cores for 50 minutes and would have measured contention.
 
-4. **Then re-aggregate** and expect a clean sheet:
+4. **Then re-aggregate** (KRIA half already done — that is where the 1.3B b=6 bimodality
+   in §1 came from):
 
        ./scripts/final_dataset.py --board ~/results/final --xeon reports/host_cpu/final
 
@@ -52,11 +55,24 @@ median moves >3% when any single pass is dropped.
 Complete: 3 arms x 3 models x b=1..6, POWER=1 everywhere, all three FPGA gates PASS bit-exact
 (1160/1160/1544 projection invocations, 0 element diffs) under the shipped preset names.
 
-**Seven cells still flagged**, all the same shape — one perturbed pass out of three:
+**Board arms are now 5 passes** (2026-08-06). The three KRIA cells that were flagged on three
+passes split into two different stories:
 
-    kria/370M/1p6/b5     kria/1.3B/1p6/b5, b6      xeon/2.7B/2bit/b3,b4,b5,b6
+* `kria/370M/b5` and `kria/1.3B/b5` were one perturbed pass each (370M: 95.0 / **70.8** /
+  95.2 / 95.8 / 95.3). Two more passes settle the median and both clear. Their pack cost is
+  NORMAL in the bad pass, so this is the host's OpenMP wave structure losing a core, not the
+  engine — see §3.
+* `kria/1.3B/b6` is **bimodal**, not noisy — 54.93 / 51.26 / 51.29 / 54.85 / 51.36, two clean
+  modes ~7% apart, and the whole gap is host `pack` (129-131 vs 167-170 us/call; engine phases
+  do not move). Decided 2026-08-06: take the 5-pass median (51.36) as the number. It is the
+  only bimodal cell — 2.7B b=6 pack is 155-158 across all five passes and every other 1.3B
+  batch is stable — and it makes 1.3B non-monotonic at the top of its ladder (b=5 52.09 >
+  b=6 51.36). Hypothesis, unmeasured: where the udmabuf-act allocation lands per process
+  changes the strided-scatter cost at that one geometry. Worth chasing under §"open items" 3,
+  since `pack` is already the top software cost.
 
-The medians already discard the bad pass; what is missing is the 5th pass proving it. See §3.
+`xeon/2.7B/2bit/b3,b4,b5,b6` are still on three passes and still flagged; passes 4-5 running
+2026-08-06.
 
 ## 2. Method — read before quoting anything
 
@@ -73,26 +89,30 @@ only cover the packed formats. Quote 2-bit as the CPU denominator on both sides.
 
 ## 3. Measured results and open items
 
-⚠️ The table below is the 2026-08-04 sweep, kept because the perf/W analysis under it is
-built on those rows. **`reports/final/dataset.csv` is now the authority** — same three
-bitstreams, but medians over three passes with per-batch power, and it agrees to ~1%
-(370M b=6 103.87 vs 102.63, 1.3B 54.9 vs 55.43). Requote from the CSV once passes 4-5 land.
-
 Three presets, one per released MMfreeLM checkpoint, all B6 + 1.6-bit packed weights +
 128-bit m_axis at a true 250 MHz. Measured on a KRIA KV260, decode tok/s, POWER=1,
 all gates PASS (engine bit-identical to the CPU reference), all `streams_ok=1`.
 
-| preset | b=1 | b=2 | b=3 | b=4 | b=5 | b=6 | WNS @250 | SOM avg W |
+**Medians over five passes**, straight from `reports/final/dataset.csv` (2026-08-06) — that
+CSV is the authority; this table is a rendering of it:
+
+| preset | b=1 | b=2 | b=3 | b=4 | b=5 | b=6 | WNS @250 | SOM avg W (b=6) |
 |---|---|---|---|---|---|---|---|---|
-| `mmfree_370m` | 41.67 | 65.32 | 79.00 | 93.10 | 95.84 | **102.63** | +0.030 | 5.37 |
-| `mmfree_1_3b` | 20.40 | 33.30 | 42.75 | 49.18 | 51.73 | **55.43** | +0.025* | 5.96 |
-| `mmfree_2_7b` | 11.72 | 19.27 | 25.16 | 29.88 | 30.97 | **34.41** | +0.025 | 6.14 |
+| `mmfree_370m` | 41.74 | 64.80 | 80.04 | 92.80 | 95.23 | **103.16** | +0.030 | 5.39 |
+| `mmfree_1_3b` | 20.45 | 33.25 | 42.77 | 49.20 | 52.09 | **51.36**† | +0.025* | 5.90 |
+| `mmfree_2_7b` | 11.75 | 19.38 | 25.08 | 30.17 | 30.93 | **34.41** | +0.025 | 6.22 |
 
 \* 1.3B runs the 2.7B bitstream, so the 2.7B WNS is its timing record.
 
-Reproducibility: `mmfree_1_3b` was re-measured in a separate session on 2026-08-05 and
-came back 49.45 / 52.22 / 54.75 at b=4/5/6 — within ~1.2% of the row above. Treat ±1–2% as
-the session-to-session band and do not read a delta smaller than that as a result.
+† The one bimodal cell (§1): five passes read 54.93 / 51.26 / 51.29 / 54.85 / 51.36 and the
+slow mode holds three of them, so the median sits there and **1.3B is non-monotonic at the
+top of its ladder** (b=5 beats b=6). The three-pass number quoted before this was 54.9, and
+the older 2026-08-04 sweep said 55.43 — both were the fast mode with a 2-of-3 majority, not
+a different measurement. Quote 51.36 and say b=5/b=6 are within the cell's own spread.
+
+Reproducibility elsewhere is good: 370M and 2.7B agree with the 2026-08-04 sweep to ~0.5%
+across the whole ladder. Treat ±1–2% as the session-to-session band and do not read a delta
+smaller than that as a result — except at 1.3B b=6, where the modes are 7% apart.
 
 Use **b=4 or b=6, never b=5** — the host's vector ops are `omp schedule(static)` over the
 batch on 4 A53 cores, so they cost `ceil(b/4)` waves and b=5 pays b=6's price for 5 streams.
@@ -102,11 +122,15 @@ batch on 4 A53 cores, so they cost `ceil(b/4)` waves and b=5 pays b=6's price fo
 Against a Xeon W-2155 running the same model at the same weight format (`reports/host_cpu/`,
 RAPL package+DRAM), at b=6:
 
+⚠️ KRIA columns are the 5-pass medians above; **Xeon columns are still 3-pass** and the
+2.7B row is flagged UNSTABLE, so the advantage ratios move when passes 4-5 land. Do not
+publish this table until they do.
+
 | model | KRIA tok/s | KRIA W | KRIA tok/J | Xeon tok/s | Xeon W | Xeon tok/J | advantage |
 |---|---|---|---|---|---|---|---|
-| 370M | 102.63 | 5.37 | 19.1 | 209.11 | 98.76 | 2.12 | **9.0x** |
-| 1.3B | 55.43 | 5.96 | 9.30 | 97.69 | 111.97 | 0.872 | **10.7x** |
-| 2.7B | 34.41 | 6.14 | 5.60 | 49.05 | 115.52 | 0.425 | **13.2x** |
+| 370M | 103.16 | 5.39 | 19.1 | 209.11 | 98.76 | 2.12 | **9.0x** |
+| 1.3B | 51.36 | 5.90 | 8.71 | 97.69 | 111.97 | 0.872 | **10.0x** |
+| 2.7B | 34.41 | 6.22 | 5.53 | 49.05 | 115.52 | 0.425 | **13.0x** |
 
 Xeon rows are the b=6 best of `xeon_best.csv` (all three land on 2-bit, 10 threads) and use
 its `total_w`, which is the column comparable to the KRIA's SOM rail figure — both include
