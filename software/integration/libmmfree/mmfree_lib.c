@@ -8,6 +8,9 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#ifdef _OPENMP
+#include <omp.h>            /* readback threading: default thread count = omp_get_max_threads */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,25 +31,58 @@ static inline uint64_t now_ns(void) {
 
 /* ---- readback threading knobs (see readback_rows_at) ----
  *
- * DEFAULT OFF, deliberately. The final data set's five board passes were measured with a
- * serial readback, and a B6-vs-B8 comparison has to hold the software constant — a silent
- * across-the-board speedup would confound exactly the delta being measured. Turn it on
- * explicitly to A/B it, and only flip the default once the campaign it would perturb is
- * finished:
+ * DEFAULT ON as of 2026-08-06, all cores. Measured on the board at b=6 against the same
+ * binary with it off — one variable, same session, POWER=1:
  *
- *     MMFREE_RB_THREADS=4     threads for the readback loop (0 or 1 = serial, the default)
- *     MMFREE_RB_MIN_ELEMS=N   below N = b*M elements, stay serial regardless (default 4096)
+ *            readback us/call    decode tok/s       SOM avg W        tok/J
+ *   370M     79.4 -> 22.3        103.30 -> 124.39   5.501 -> 5.498   +20.5%
+ *   2.7B    128.6 -> 34.8         34.71 ->  38.55   5.956 -> 6.245    +5.9%
  *
- * Both are read once and cached: getenv on every projection call would itself be a cost in
- * a phase measured in microseconds. */
+ * The loop speeds up 3.7x in both cases — that is a property of the loop. What differs is
+ * what it buys: on 370M, COMPUTE fell 20% as well, because readback overrun had been
+ * spilling into the engine wait; on 2.7B compute is 392 us/call and dwarfs readback, so
+ * there was no overrun to recover and the gain is the readback line alone.
+ *
+ * PERF/W IS NOT THE THROUGHPUT DELTA. On 370M the four cores cost nothing measurable, but on
+ * 2.7B they cost 289 mW — they stream DDR alongside a much busier engine — which eats half
+ * the gain: +11.1% throughput, only +5.9% tok/J. Measure watts per model; do not infer them.
+ *
+ * Bit-exactness is not assumed. `make gate` with MMFREE_RB_MIN_ELEMS=1 — which forces every
+ * projection through the threaded path, not just the large ones — passes on both geometries:
+ * 1160 invocations on 370M, 1544 on 2.7B, 0 element diffs.
+ *
+ *     MMFREE_RB_THREADS=N     threads for the readback loop; 1 = serial. Default: all cores.
+ *                             Set 1 to A/B against the serial path on the same binary.
+ *     MMFREE_RB_MIN_ELEMS=N   below N = b*M elements, stay serial regardless (default 4096).
+ *                             Set 1 to force the threaded path everywhere — that is how the
+ *                             gate reaches small projections, which at b=1 all fall below
+ *                             the threshold and would otherwise take the serial branch.
+ *
+ * The threshold is load-bearing: at b=1, M=1024 the whole call is 2.2 us and the parallel
+ * region alone is ~1.8, so threading it measured 0.55x. Small projections must stay serial.
+ *
+ * Any board measurement taken BEFORE this flipped is 11-20% low at b=6, including the
+ * five-pass set in reports/final/. Those numbers are not wrong, they are different software
+ * — re-measure rather than comparing across the flip.
+ *
+ * Both knobs are read once and cached: getenv on every projection call would itself be a
+ * cost in a phase measured in microseconds. */
 #define RB_COL_BLOCK 512u
 
 static int rb_threads(void) {
     static int t = -1;
     if (t < 0) {
         const char *e = getenv("MMFREE_RB_THREADS");
-        long v = (e && *e) ? strtol(e, NULL, 0) : 0;
-        t = (v < 0) ? 0 : (int)v;
+        if (e && *e) {
+            const long v = strtol(e, NULL, 0);
+            t = (v < 1) ? 1 : (int)v;      /* 0 and 1 both mean serial */
+        } else {
+#ifdef _OPENMP
+            t = omp_get_max_threads();     /* 4 on the K26's A53 cluster */
+#else
+            t = 1;                         /* built without -fopenmp: no threaded path */
+#endif
+        }
     }
     return t;
 }

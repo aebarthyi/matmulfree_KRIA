@@ -53,8 +53,14 @@ $(BUILD)/test_readback: test_readback.c ../libmmfree/mmfree_lib.c $(SW)/bench/mm
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -fopenmp $(INCS) test_readback.c $(SW)/bench/mmfree_runtime.c -o $@
 
+# Twice: once threaded (the test forces MMFREE_RB_THREADS=4 / MIN_ELEMS=1 itself) and once
+# with the kill switch on, because a knob that disables a fast path is only useful if the
+# slow path it falls back to is also right — and rb_threads() caches, so one process cannot
+# exercise both.
 readback: $(BUILD)/test_readback
 	$(BUILD)/test_readback
+	@echo "--- same shapes with the serial fallback forced ---"
+	MMFREE_RB_THREADS=1 $(BUILD)/test_readback
 
 packed:
 	cd .. && PYTHONPATH=. python3 tests/test_packed_roundtrip.py

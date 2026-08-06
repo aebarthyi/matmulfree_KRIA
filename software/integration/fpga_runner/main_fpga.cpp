@@ -381,7 +381,23 @@ int main(int argc, char** argv) {
   // side than a rebuild from the same sources and flags. A scalar build was ruled out by
   // binary size, so that one was stale code rather than a wrong backend — but nothing printed
   // enough to tell them apart at the time, which is the gap this closes.)
-  std::printf("simd backend: %s\n", mmfree::simd::backend());
+  // simd::backend() reports the ARCH family only — it returns the literal "x86-avx2" for any
+  // MMFREE_ARCH_X86 build, AVX-512 included (simd.hpp:39). That is exactly the distinction
+  // this line exists to make, so widen it here from the macros the packed-ternary kernels
+  // actually switch on (tq1.hpp:71). Measured cost of getting it wrong on the W-2155: the
+  // 1.6-bit arm runs 31% slower and the 2-bit arm 24% slower, with nothing else moving —
+  // int8 has no AVX-512 path, so a narrow build looks completely healthy in the int8 column.
+  // On 2026-08-06 a stray rebuild mid-sweep did precisely this and the old line printed
+  // "x86-avx2" before AND after, which is what made two run-groups look valid.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+  const char* simd_detail = "x86-avx512 (packed-ternary kernels: 512-bit)";
+#elif defined(MMFREE_ARCH_X86)
+  const char* simd_detail = "x86-avx2 (packed-ternary kernels: 256-bit — NOT the baseline build)";
+#else
+  const char* simd_detail = nullptr;
+#endif
+  std::printf("simd backend: %s%s%s\n", mmfree::simd::backend(),
+              simd_detail ? "  ->  " : "", simd_detail ? simd_detail : "");
 
   // ---- CPU-side weights + model (norms, scales, embeddings, wq for CPU/Float) ----
   Weights w(blob);

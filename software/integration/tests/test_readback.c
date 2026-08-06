@@ -91,11 +91,16 @@ static void check(uint32_t b, uint32_t M, uint32_t acc_stride, uint32_t col0,
 }
 
 int main(void) {
-    /* Force the threaded path on, and down to a threshold low enough that even the small
-     * shapes take it — otherwise this test would silently only ever exercise the serial
-     * branch and pass for the wrong reason. */
-    setenv("MMFREE_RB_THREADS", "4", 1);
-    setenv("MMFREE_RB_MIN_ELEMS", "1", 1);
+    /* Force the threaded path on, and the threshold low enough that even the small shapes
+     * take it — otherwise this test would only ever exercise the serial branch and pass for
+     * the wrong reason.
+     *
+     * overwrite=0, NOT 1: the caller has to be able to override these, or `make readback`'s
+     * second arm (MMFREE_RB_THREADS=1, checking the serial fallback is also correct) would
+     * be silently overridden back to 4 and re-run the identical test twice. It did exactly
+     * that when this was setenv(..., 1) — a check that could not fail. */
+    setenv("MMFREE_RB_THREADS", "4", 0);
+    setenv("MMFREE_RB_MIN_ELEMS", "1", 0);
 
 #ifdef _OPENMP
     printf("test_readback: OpenMP on, rb_threads=%d, min_elems=%zu\n",

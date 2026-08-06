@@ -2,6 +2,20 @@
 
 ## 0. TOMORROW, in this order
 
+0. **RE-MEASURE THE BOARD ARM.** Readback is now threaded by default (2026-08-06), worth
+   **+20.4% at 370M and +11.1% at 2.7B** at b=6. Every board row in
+   `reports/final/dataset.csv` was taken with the serial readback and is that much low. Both
+   geometries pass the gate with `MMFREE_RB_MIN_ELEMS=1` (full coverage), so this is a
+   measurement job, not a verification one:
+
+       cd ~/transfer && sudo PASSES=5 ./final_sweep_board.sh fpga     # ~1 h, fpga arm only
+
+   The CPU arms are unaffected (they never touch the engine), so they do not need redoing.
+   **Watts must come from the new runs, not be carried over**: threading costs 0 mW on 370M
+   but 289 mW on 2.7B, so the perf/W gain is +20.5% and +5.9% respectively — the throughput
+   delta is NOT the perf/W delta. To A/B against the old software on the same binary, set
+   `MMFREE_RB_THREADS=1`.
+
 1. ~~**Distinct-prompt stream check.**~~ WRITTEN 2026-08-06, not yet run on hardware.
    `--distinct-prompts` gives stream *b* its own prompt (a left-rotation of the ids, so all
    B keep the same length and the timings stay comparable) and checks each against its OWN
@@ -160,6 +174,7 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
 
 | lever | gain | notes |
 |---|---|---|
+| threaded readback | **+20.4% (370M), +11.1% (2.7B)** | the largest software lever found; default on since 2026-08-06 |
 | B4 → B6 | +11.8% | the big one. B8 also fits and closes 250 — see below — but is unbenchmarked |
 | 2-bit → 1.6-bit packing | +4.3% at 2.7B | grows with model size, decays with batch — only ~+1.4% at 1.3B b=6 |
 | column-tile split (k=4) | +4.4% at b=4 | hides readback under COMPUTE; the ladder is already optimal |
@@ -188,7 +203,20 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
 
 3. **Host `pack` is now the top software cost** at 1.1–1.2 s/run at b=6 on the large models,
    larger than STORE and readback combined. It is a strided int16 scatter into udmabuf-act;
-   nothing has tried to vectorize or block it.
+   nothing has tried to vectorize or block it. Note that threading readback worked and is the
+   same shape of problem (per-row host work on one core while three idle) — but `pack` WRITES
+   into a cacheable udmabuf whose lines then have to be flushed, and the one previous attempt
+   to restructure it ([[activation-pack-fusion-negative]]) came out 10–14% slower, so this is
+   not a free copy of the readback win. Measure the loop standalone first, the way
+   `software/bench/bench_readback.c` did.
+
+4. **Readback: what is left after threading.** The loop is now bandwidth-bound, not
+   core-bound — one A53 sustains ~4.0 GB/s on it and four reach 8–13, which is the cluster
+   ceiling. So more threads buy nothing and the remaining ideas are about moving less data:
+   consume the drained values straight from the mapped udmabuf instead of staging them into
+   `acc` (needs udmabuf-out double-buffered so the next chunk's drain does not overwrite what
+   is being read), and STORE ‖ COMPUTE (item 1), which raises how much readback can hide.
+   Both are worth less now than they were this morning: 3.7× is already banked.
 
 ---
 
