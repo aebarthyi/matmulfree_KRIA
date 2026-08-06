@@ -292,6 +292,22 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
     h->max_proj = cfg->max_proj ? cfg->max_proj : 128u;
     h->projs = calloc(h->max_proj, sizeof(proj_t));
     if (!h->projs) goto fail;
+
+    /* Record the readback configuration in every run's output. It changes decode by 11-20%
+     * at b=6, so a log that does not state it cannot be compared with one that does — and a
+     * config visible only in the source is one nobody can verify after the fact. That is
+     * exactly how a whole afternoon of Xeon rows got taken on the wrong SIMD build on
+     * 2026-08-06: the line that should have identified the build printed the same string
+     * either way. Cheap insurance, printed once per process. */
+    printf("# readback: %s",
+           rb_threads() > 1 ? "threaded" : "serial (1 thread)");
+    if (rb_threads() > 1)
+        printf(" x%d threads, threshold %zu elements (b*M below it stays serial)",
+               rb_threads(), rb_min_elems());
+#ifndef _OPENMP
+    printf("  [built WITHOUT OpenMP — threading unavailable]");
+#endif
+    printf("\n");
     return h;
 
 fail:

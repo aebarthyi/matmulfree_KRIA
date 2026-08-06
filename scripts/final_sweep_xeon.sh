@@ -108,6 +108,39 @@ EOF
     echo "# SIMD: AVX-512 build confirmed ($zmm zmm instructions)"
 fi
 
+# ── The binary must not CHANGE mid-sweep ────────────────────────────────────────────
+# The check above runs once, at startup, which is where it was blind: on 2026-08-06 an
+# unrelated `make` in the runner directory relinked this binary three hours into a sweep,
+# with the Makefile's default -mavx2 rather than X86_512. The two run-groups that followed
+# read 24-31% low on the packed-ternary arms (int8 was untouched — it has no AVX-512 path,
+# so the int8 column looked perfectly healthy) and had to be thrown away and redone.
+# Nothing in the CSV or the per-run banner showed it: the runner's "simd backend:" line
+# reported the ARCH family, identical before and after.
+#
+# So: fingerprint the binary now and re-check before every run-group. Abort rather than
+# warn — the runs already completed are still good, and the script is idempotent, so
+# stopping costs only the group that has not started yet.
+BIN_FINGERPRINT=$(stat -c '%Y %s' "$RUNNER")
+assert_binary_unchanged() {
+    local now; now=$(stat -c '%Y %s' "$RUNNER")
+    [ "$now" = "$BIN_FINGERPRINT" ] && return 0
+    cat >&2 <<EOF
+
+ERROR: $RUNNER changed during the sweep
+       (was "$BIN_FINGERPRINT", now "$now" — mtime size).
+
+Something rebuilt it while measurements were in flight, so runs before and after this point
+are not the same binary and cannot go in one data set. Every group already written is
+untouched and still valid; this aborts before starting another.
+
+  1. rebuild deliberately:  make -C software/integration/fpga_runner clean
+                            MMFREE_SIMD=X86_512 make -C software/integration/fpga_runner
+  2. delete any group whose runs straddle the rebuild
+  3. re-run this script — it skips what is complete and redoes only the gaps
+EOF
+    exit 1
+}
+
 echo "############################################################"
 echo "# Xeon final sweep: $PASSES passes x {$THREAD_SET} threads"
 echo "#   models   : $MODELS"
@@ -157,6 +190,7 @@ for model in $MODELS; do
             rm -rf "$out"          # partial output would append and duplicate rows
             echo
             echo "=== [$(date -Is)] $slug pass $pass, ${th} threads, gen=$g -> $out ==="
+            assert_binary_unchanged
             settle
             OMP_THREADS="$th" MODELS="$model" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
             GEN="$g" REPS="$REPS" OUT="$out" \
