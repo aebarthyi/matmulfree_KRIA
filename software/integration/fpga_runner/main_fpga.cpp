@@ -478,12 +478,16 @@ int main(int argc, char** argv) {
 
     lib = mmfree_lib_open(&cfg);
     if (!lib) {
+      // The line above this one says WHICH buffer failed and how (missing / unopenable /
+      // short). Only the short case is a sizing problem, so lead with the sizes rather
+      // than with advice that assumes it: a missing device means the overlay is not loaded.
       std::fprintf(stderr,
-                   "mmfree_lib_open failed — the resident weights need udmabuf sizes:\n"
-                   "  wt  >= %llu B/port  (manifest total_bytes_per_port)\n"
+                   "mmfree_lib_open failed. This model needs, per the manifest:\n"
+                   "  wt  >= %llu B/port  (total_bytes_per_port)\n"
                    "  act >= %zu B/port\n  out >= %zu B\n"
-                   "Regenerate the DT overlay with a larger wt buffer (e.g. "
-                   "UDMABUF_WT_SZ=0x01800000) and redeploy; see fpga_runner/README.md.\n",
+                   "If a buffer is genuinely too small, regenerate the DT overlay with a "
+                   "larger wt buffer (e.g. UDMABUF_WT_SZ=0x01800000) and redeploy; see "
+                   "fpga_runner/README.md.\n",
                    (unsigned long long)cfg.weight_bytes_per_port, cfg.act_bytes_per_port,
                    cfg.out_bytes);
       return 1;

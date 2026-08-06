@@ -26,6 +26,45 @@ static inline uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Open one resident udmabuf and name the failure precisely.
+ *
+ * These three failures need three different fixes and used to print one message
+ * ("too small/failed"), whose advice — regenerate the overlay with a bigger wt buffer —
+ * is wrong for two of them:
+ *   ENOENT  the device node/sysfs entry is not there at all. The preset's DT overlay is
+ *           not loaded (or u-dma-buf is not inserted). Nothing about size. This is the
+ *           common one after a reboot, and it cost a debugging round trip on 2026-08-06.
+ *   other   present but unopenable — permissions (needs sudo), or the driver is wedged.
+ *   short   present and opened, genuinely smaller than the model needs. Only here does
+ *           the "regenerate with UDMABUF_WT_SZ=..." advice apply, so print both sizes.
+ */
+static int open_buf_checked(mmfree_buf_t *b, const char *dev, size_t need, int cached,
+                            const char *what, int port) {
+    char tag[64];
+    if (port >= 0) snprintf(tag, sizeof(tag), "%s buf port %d", what, port);
+    else           snprintf(tag, sizeof(tag), "%s buf", what);
+
+    int rc = mmfree_buf_open(b, dev, need, cached);
+    if (rc == -ENOENT) {
+        fprintf(stderr, "mmfree_lib_open: %s (%s) does not exist — the preset's DT overlay "
+                        "is not loaded.\n  Load it first: sudo make deploy-hw PRESET=<preset>"
+                        "  (overlays do not survive a reboot; fclk0 does, so a stale 250 MHz "
+                        "clock is not evidence the overlay is up.)\n", tag, dev);
+        return -1;
+    }
+    if (rc < 0) {
+        fprintf(stderr, "mmfree_lib_open: %s (%s) failed to open: %s\n",
+                tag, dev, strerror(-rc));
+        return -1;
+    }
+    if (b->size < need) {
+        fprintf(stderr, "mmfree_lib_open: %s (%s) too small: %zu B, model needs %zu B\n",
+                tag, dev, b->size, need);
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- pure-software helpers (no hardware; unit-tested on the host) ---- */
 
 /* Write one activation beat: signed value in the low `abytes` bytes (two's
@@ -161,19 +200,12 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
          * static zero slice — leave those non-cached. Only act port 0 (re-packed
          * every op) and the output (drained every op) are hot, so map those
          * cacheable and sync them per call in mmfree_bitlinear. */
-        if (mmfree_buf_open(&h->wt[p], cfg->wt_dev[p], cfg->weight_bytes_per_port, 0) < 0 ||
-            h->wt[p].size < cfg->weight_bytes_per_port) {
-            fprintf(stderr, "mmfree_lib_open: weight buf port %u (%s) too small/failed\n",
-                    p, cfg->wt_dev[p]);
+        if (open_buf_checked(&h->wt[p], cfg->wt_dev[p], cfg->weight_bytes_per_port,
+                             /*cached=*/0, "weight", (int)p) < 0)
             goto fail;
-        }
-        if (mmfree_buf_open(&h->act[p], cfg->act_dev[p], cfg->act_bytes_per_port,
-                            /*cached=*/p == 0) < 0 ||
-            h->act[p].size < cfg->act_bytes_per_port) {
-            fprintf(stderr, "mmfree_lib_open: act buf port %u (%s) too small/failed\n",
-                    p, cfg->act_dev[p]);
+        if (open_buf_checked(&h->act[p], cfg->act_dev[p], cfg->act_bytes_per_port,
+                             /*cached=*/p == 0, "act", (int)p) < 0)
             goto fail;
-        }
         /* Every activation port slice is zero outside the low aWidth bits, and
          * ports 1..P-1 are zero entirely — clear once. Port 0 is cacheable and
          * per op we only rewrite the low aWidth bytes of each beat, relying on
@@ -182,11 +214,8 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
         if (p == 0) mmfree_buf_sync_for_device(&h->act[0], h->act[0].size);
         h->open_bufs = (int)(p + 1);
     }
-    if (mmfree_buf_open(&h->out, cfg->out_dev, cfg->out_bytes, /*cached=*/1) < 0 ||
-        h->out.size < cfg->out_bytes) {
-        fprintf(stderr, "mmfree_lib_open: out buf (%s) too small/failed\n", cfg->out_dev);
+    if (open_buf_checked(&h->out, cfg->out_dev, cfg->out_bytes, /*cached=*/1, "out", -1) < 0)
         goto fail;
-    }
     h->out_open = 1;
 
     h->max_proj = cfg->max_proj ? cfg->max_proj : 128u;
