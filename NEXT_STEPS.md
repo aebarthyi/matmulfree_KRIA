@@ -1,13 +1,73 @@
-# Where things stand — 2026-08-05
+# Where things stand — 2026-08-06
 
-`main` was cleaned down to three deployable presets on this date. **The full session-by-session
-handoff, every ablation preset and the harness that produced these numbers are on the
-`exploration` branch** — `git show exploration:NEXT_STEPS.md` for the long-form history,
-including the reasoning behind each lever and the dead ends that were ruled out.
+## 0. TOMORROW, in this order
+
+1. **Distinct-prompt stream check.** `--serve N` gives every stream the SAME prompt
+   (`main_fpga.cpp:483`) and sampling is greedy, so `streams_ok` compares streams that are
+   identical by construction. It proves batched decode matches b=1 and that no stream is
+   dropped — it CANNOT see a row permutation or cross-contamination between identical
+   values. Simulation covers this (`BenchMirrorSpec` drives distinct per-row activations);
+   hardware never has. ~20 lines: give each stream a different prompt, check each against
+   its OWN single-stream reference. `generate_serve` already takes a vector of prompts.
+   **Do this before benchmarking B8** — eight independent streams instead of six. And do
+   not rebuild the board binary while a comparison run is in flight.
+
+2. **Board FPGA passes 4–5**, for a median robust to one bad pass:
+
+       cd ~/transfer && sudo PASS_START=4 PASSES=5 ./final_sweep_board.sh fpga
+
+   ⚠️ The variables go AFTER `sudo` — it resets the environment. Putting them before
+   silently ran the default passes 1..3 and overwrote the data, twice. The script now
+   prints its effective settings; check the banner.
+
+3. **Xeon passes 4–5**: `PASSES=5 ./scripts/final_sweep_xeon.sh` (idempotent — skips the
+   three that exist). Deferred from 2026-08-05.
+
+4. **Then re-aggregate** and expect a clean sheet:
+
+       ./scripts/final_dataset.py --board ~/results/final --xeon reports/host_cpu/final
+
+5. **B8 on the board** once 1 passes: three bundles are built and waiting in
+   `transfer/presets/mmfree_*_b8/`. Needs `make deploy` first.
 
 ---
 
-## 1. The result
+## 1. The data set
+
+`reports/final/dataset.csv`, keyed by (platform, arm, model, weight_fmt, batch). Headline is
+the MEDIAN across passes; `mean_tok_s`, `spread_pct`, `median_shift_pct` (jackknife), `watts`
+and `tok_per_joule` alongside. The aggregator refuses to call it clean unless the expected
+matrix is complete, every cell has power, all FPGA rows are `streams_ok=1`, and no cell's
+median moves >3% when any single pass is dropped.
+
+Complete: 3 arms x 3 models x b=1..6, POWER=1 everywhere, all three FPGA gates PASS bit-exact
+(1160/1160/1544 projection invocations, 0 element diffs) under the shipped preset names.
+
+**Seven cells still flagged**, all the same shape — one perturbed pass out of three:
+
+    kria/370M/1p6/b5     kria/1.3B/1p6/b5, b6      xeon/2.7B/2bit/b3,b4,b5,b6
+
+The medians already discard the bad pass; what is missing is the 5th pass proving it. See §3.
+
+## 2. Method — read before quoting anything
+
+See [[final-dataset-methodology]] in memory for the full rationale. The short version:
+POWER=1 on every arm so tok/s and watts come from the same run; passes are separate
+PROCESSES, not reps; GEN is per model so every b=1 window is >=2 s; the Xeon MUST be built
+`MMFREE_SIMD=X86_512` (AVX2 costs 29% and nothing in the CSV would show it); the Xeon thread
+count is swept and chosen per (model, encoding) across the whole ladder so one curve is one
+configuration.
+
+**2-bit is the fastest weight encoding on BOTH platforms** — int8 is not, which corrects the
+older note. Xeon b=6: 2bit 97.95 vs int8 53.74 at 1.3B, because the AVX-512 ternary kernels
+only cover the packed formats. Quote 2-bit as the CPU denominator on both sides.
+
+## 3. Measured results and open items
+
+⚠️ The table below is the 2026-08-04 sweep, kept because the perf/W analysis under it is
+built on those rows. **`reports/final/dataset.csv` is now the authority** — same three
+bitstreams, but medians over three passes with per-batch power, and it agrees to ~1%
+(370M b=6 103.87 vs 102.63, 1.3B 54.9 vs 55.43). Requote from the CSV once passes 4-5 land.
 
 Three presets, one per released MMfreeLM checkpoint, all B6 + 1.6-bit packed weights +
 128-bit m_axis at a true 250 MHz. Measured on a KRIA KV260, decode tok/s, POWER=1,
@@ -59,14 +119,14 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
 
 | lever | gain | notes |
 |---|---|---|
-| B4 → B6 | +11.8% | the big one. B8 is a ~95% LUT capacity wall even with DSP accum |
+| B4 → B6 | +11.8% | the big one. B8 also fits and closes 250 — see below — but is unbenchmarked |
 | 2-bit → 1.6-bit packing | +4.3% at 2.7B | grows with model size, decays with batch — only ~+1.4% at 1.3B b=6 |
 | column-tile split (k=4) | +4.4% at b=4 | hides readback under COMPUTE; the ladder is already optimal |
 | 200 → 250 MHz | ~+5% | **the least valuable axis** — decode is weight-bandwidth-bound |
 
 ---
 
-## 2. Open
+### Open engineering items
 
 1. **STORE ‖ COMPUTE (RTL), ~+5%.** `m_axis` is a separate physical port from `s_axis`, so
    STORE and COMPUTE can overlap; the only conflict is `outBram` (STORE reads while the
@@ -91,7 +151,33 @@ Measured, not estimated, at b=6 — worth knowing before spending a build on any
 
 ---
 
-## 3. Things that will bite you
+
+### B8 — built 2026-08-06, both close 250 MHz
+
+    preset            WNS@250    LUT      Reg     CARRY8   BRAM     URAM     DSP
+    mmfree_2_7b_b8    +0.002   83.18%   49.76%   25.92%   49.65%   50.00%   100%
+    mmfree_370m_b8    +0.011   81.42%   48.30%   25.92%   29.51%   53.13%   100%
+    mmfree_1_3b_b8    clone of the 2.7B bitstream (RTL sha256 identical, wt repatched)
+
+Overturns the "~95% LUT capacity wall" verdict, which was measured on 370M B8 with FABRIC
+accumulators before `dspAccum` existed. Unbenchmarked. The 2.7B's +0.002 ns is thin enough
+that a different seed could miss — sweep seeds or take the 200 rung before shipping it.
+They live in `CoreConfigs.candidates`, not `deployable`. See [[b8-closes-250]].
+
+### b=5 is the least trustworthy operating point, twice over
+
+Already known degenerate (host vector ops cost ceil(b/4) waves on 4 A53 cores, so b=5 pays
+b=6's price for five streams). Now also the least stable to MEASURE: 370M b=5 pass 2 read
+70.82 tok/s against 95.04/95.23, and the phase breakdown puts it entirely host-side —
+rmsnorm +184%, scan +181%, swishgate +56%, engine phases only +8-14%. That is the OpenMP
+wave structure collapsing when a core is stolen.
+
+**Suspect POWER=1 as the thief.** `xlnx_platformstats` sampling is a process competing for
+one of four cores. It costs ~2% on average, but can evidently cost 25% when it lands badly,
+and two of the three flagged KRIA cells are b=5. If b=5 matters to you, measure it POWER=0
+separately. Otherwise use b=4 or b=6 — b=6 is clean.
+
+### Things that will bite you
 
 - **`sudo` on the board needs a password**, so board sweeps cannot be driven over SSH from
   the build server. Hand over a script and run it there.

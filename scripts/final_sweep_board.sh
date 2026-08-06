@@ -51,14 +51,21 @@ export POWER=1               # non-negotiable for this data set; see above
 
 PRESETS="${PRESETS:-mmfree_370m mmfree_1_3b mmfree_2_7b}"
 CPU_BACKENDS="${CPU_BACKENDS:-cpu cpu-2bit cpu-1p6}"
-# Pass numbering starts here, so a top-up run adds passes instead of overwriting them:
-#   PRESETS=mmfree_1_3b PASS_START=4 PASSES=6 sudo ./final_sweep_board.sh fpga
-# adds passes 4..6 for one arm, leaving 1..3 (and the other arms) untouched.
+# Pass numbering starts here, so a top-up run adds passes instead of overwriting them.
+#
+# ⚠️ THE VARIABLES MUST GO AFTER `sudo`, NOT BEFORE IT. sudo resets the environment, so
+#      PASS_START=4 PASSES=5 sudo ./final_sweep_board.sh fpga     <-- SILENTLY IGNORED
+# runs the default passes 1..3 and overwrites the data you meant to extend. That has now
+# happened twice. The working form is
+#      sudo PASS_START=4 PASSES=5 ./final_sweep_board.sh fpga
+# (or `sudo -E`). The banner below prints the values actually in effect — check it.
 PASS_START="${PASS_START:-1}"
 
 mkdir -p results/logs
 failed=""
 t0=$(date +%s)
+echo "# effective settings: WHICH=$WHICH PRESETS='$PRESETS' passes ${PASS_START}..${PASSES}"
+echo "#   (if that is not what you asked for, the env went BEFORE sudo and was stripped)"
 say() { echo; echo "############################################################"; echo "# $*"; echo "############################################################"; }
 
 # ── A53 CPU-only arms ────────────────────────────────────────────────────────
