@@ -47,7 +47,29 @@ PASSES_EXPECTED="${PASSES_EXPECTED:-3}"
 THREADS_EXPECTED="${THREADS_EXPECTED:-10 20}"
 EXPECT_ROWS="${EXPECT_ROWS:-18}"       # backends x batches per pass
 
-xeon_busy() { pgrep -f 'bench_host_cpu\.sh|final_sweep_xeon\.sh' >/dev/null 2>&1; }
+# Our own ancestry, captured once. pgrep -f matches any process whose FULL COMMAND LINE
+# contains the pattern — including a shell that merely quotes those names. That is not
+# hypothetical: this script was launched from a `git commit -m` whose message described the
+# gate and therefore contained the literal strings "bench_host_cpu.sh" and
+# "final_sweep_xeon.sh", so the gate matched its own grandparent and waited on itself for an
+# hour after the sweep had finished. Excluding our ancestors is the fix; matching on word
+# boundaries is not, because the message contained the names as whole words too.
+MY_CHAIN=" "
+_p=$$
+while [ "${_p:-1}" -gt 1 ]; do
+    MY_CHAIN="$MY_CHAIN$_p "
+    _p=$(awk '{print $4}' "/proc/$_p/stat" 2>/dev/null || echo 1)
+done
+
+xeon_busy() {
+    local pids p
+    pids=$(pgrep -f 'bench_host_cpu\.sh|final_sweep_xeon\.sh' 2>/dev/null) || return 1
+    for p in $pids; do
+        case "$MY_CHAIN" in *" $p "*) continue ;; esac   # us, or something that launched us
+        return 0
+    done
+    return 1
+}
 
 xeon_complete() {
     local m t p d n
