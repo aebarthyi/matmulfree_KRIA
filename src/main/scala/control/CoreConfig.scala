@@ -499,7 +499,7 @@ object CoreConfig {
                  aWidth = 16, xDim = 32, outBeatLanes = 1, signedAct = true,
                  plClkMhz = 250, shapes = "370m", model = "ridger/MMfreeLM-370M",
                  packedWeights = true)
-            .copy(batchSize = 6, outBeatLanes = 4, colBankSize = 8,
+            .copy(batchSize = 8, outBeatLanes = 4, colBankSize = 4, dspAccum = true,
                   implDirectives = b4TimingLevers250)
 
     /** MMfreeLM-1.3B — hidden 2048, intermediate 5632, vocab 32000, 24 layers.
@@ -509,7 +509,7 @@ object CoreConfig {
     val MMFree_1_3B: CoreConfig =
         forModel(hidden = 2048, intermediate = 5632, vocab = 32000, layers = 24,
                  shapes = "1.3b", model = "ridger/MMfreeLM-1.3B", packedWeights = true)
-            .copy(batchSize = 6, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
+            .copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
                   colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
                   implDirectives = b4TimingLevers250)
 
@@ -520,7 +520,7 @@ object CoreConfig {
     val MMFree_2_7B: CoreConfig =
         forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
                  shapes = "2.7b", model = "ridger/MMfreeLM-2.7B", packedWeights = true)
-            .copy(batchSize = 6, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
+            .copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
                   colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
                   implDirectives = b4TimingLevers250)
 
@@ -560,18 +560,34 @@ object CoreConfig {
     // was added to fix. B6 closes 250 at +0.025 ns with all 30 worst paths clustered in
     // 0.042-0.063 ns on one congestion family, so there is no margin to give away. If these
     // miss 250, drop to the 200 rung: it costs ~5% and B8's upside is larger than that.
-    val MMFree_370M_B8: CoreConfig =
-        MMFree_370M.copy(batchSize = 8, dspAccum = true, colBankSize = 4)
-    // maxN=8192 keeps the ActMem cascade cap it needs at B6 — batch widens actBram
-    // (8*16 = 128 bits vs 96) but does not deepen it, so the 8-deep RAMB36E2 chain that
-    // lever bounds is unchanged.
-    val MMFree_1_3B_B8: CoreConfig = MMFree_1_3B.copy(batchSize = 8)
-    val MMFree_2_7B_B8: CoreConfig = MMFree_2_7B.copy(batchSize = 8)
+    // ── B8 was PROMOTED to deployable 2026-08-06 ──────────────────────────────
+    // The three configs above now carry batchSize = 8; the reasoning that used to sit here
+    // is preserved because it is what the promotion rests on. What the build measured:
+    //
+    //     preset            WNS@250    LUT      Reg     CARRY8   BRAM     URAM     DSP
+    //     mmfree_2_7b       +0.002   83.18%   49.76%   25.92%   49.65%   50.00%   100%
+    //     mmfree_370m       +0.011   81.42%   48.30%   25.92%   29.51%   53.13%   100%
+    //
+    // ⚠️ 2.7B's +0.002 ns is the thinnest margin anything shipped has ever had, and a
+    // different placement seed could miss. That risk was accepted on promotion rather than
+    // retired: it has NOT been seed-swept, and the 200 MHz rung (~5% slower, far more
+    // margin) remains the fallback if the board shows intermittent trouble. The gate is the
+    // check that matters here — bit-exactness at temperature, per bitstream, per session.
+    //
+    // The B6 configurations are kept BUILDABLE below rather than moved to `exploration`,
+    // because they are the measured baseline B8 has to beat and the comparison is not
+    // finished: the five-pass board set was taken at B6 with a serial readback, and readback
+    // threading (+11-20%) landed the same day, so B8-vs-B6 has to be re-taken on one
+    // software build before the promotion can be called quantitatively justified.
+    val MMFree_370M_B6: CoreConfig =
+        MMFree_370M.copy(batchSize = 6, dspAccum = false, colBankSize = 8)
+    val MMFree_1_3B_B6: CoreConfig = MMFree_1_3B.copy(batchSize = 6)
+    val MMFree_2_7B_B6: CoreConfig = MMFree_2_7B.copy(batchSize = 6)
 
     val candidates: Map[String, CoreConfig] = Map(
-        "mmfree_370m_b8" -> MMFree_370M_B8,
-        "mmfree_1_3b_b8" -> MMFree_1_3B_B8,
-        "mmfree_2_7b_b8" -> MMFree_2_7B_B8
+        "mmfree_370m_b6" -> MMFree_370M_B6,
+        "mmfree_1_3b_b6" -> MMFree_1_3B_B6,
+        "mmfree_2_7b_b6" -> MMFree_2_7B_B6
     )
 
     /** Everything `make build PRESET=` / EmitCore can reach. */

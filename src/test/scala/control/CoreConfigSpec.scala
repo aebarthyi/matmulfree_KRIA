@@ -72,10 +72,11 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     // B8 fits only because the lane accumulators move into DSP48s (~22 pp of LUT at B6);
-    // without dspAccum the same array was a ~95% LUT capacity wall. Pin that so a B8
-    // candidate cannot be built in the configuration already known not to fit.
-    "the B8 candidates carry dspAccum, the condition that makes B8 fit at all" in {
-      CoreConfig.candidates.filter(_._1.endsWith("_b8")).foreach { case (n, c) =>
+    // without dspAccum the same array was a ~95% LUT capacity wall. B8 is now DEPLOYABLE, so
+    // pin that condition on the shipped set — a shipped preset must not be buildable in the
+    // configuration already measured not to fit.
+    "every deployable preset carries dspAccum, the condition that makes B8 fit at all" in {
+      CoreConfig.deployable.foreach { case (n, c) =>
         withClue(n) {
           c.batchSize   mustBe 8
           c.dspAccum    mustBe true
@@ -85,15 +86,31 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       }
     }
 
-    // These four fields ARE the conclusion of the optimization program: B6 amortizes the
-    // weight stream (+11.8% over B4), 1.6-bit packing cuts the binding traffic ~20%
-    // (+4.3% at 2.7B b=6), 128-bit m_axis stops STORE being the batch bottleneck, and 250
-    // is the top reachable rung. Any preset that loses one of them is a regression, not a
-    // variant — an ablation belongs on the `exploration` branch.
+    // The B6 configs are retained as candidates, not archived, because they are the baseline
+    // B8 was promoted over and that comparison is not finished (the five-pass board set was
+    // B6 with a serial readback; readback threading landed the same day). They must stay
+    // genuinely B6 — an accidental copy of the shipped config would make the control useless
+    // while still appearing to run.
+    "the retained B6 baselines are actually B6" in {
+      CoreConfig.candidates.filter(_._1.endsWith("_b6")).foreach { case (n, c) =>
+        withClue(n) {
+          c.batchSize     mustBe 6
+          c.packedWeights mustBe true
+          c.plClkMhz      mustBe 250     // same rung, so a B6-vs-B8 delta is not a clock delta
+        }
+      }
+      CoreConfig.candidates.count(_._1.endsWith("_b6")) mustBe 3
+    }
+
+    // These four fields ARE the conclusion of the optimization program: batching amortizes
+    // the weight stream (B4->B6 measured +11.8%, B8 promoted 2026-08-06), 1.6-bit packing
+    // cuts the binding traffic ~20% (+4.3% at 2.7B b=6), 128-bit m_axis stops STORE being the
+    // batch bottleneck, and 250 is the top reachable rung. Any preset that loses one of them
+    // is a regression, not a variant — an ablation belongs on the `exploration` branch.
     "every deployable preset carries the full optimization stack" in {
       CoreConfig.deployable.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
-          c.batchSize      mustBe 6
+          c.batchSize      mustBe 8
           c.outBeatLanes   mustBe 4
           c.packedWeights  mustBe true
           c.plClkMhz       mustBe 250
@@ -241,11 +258,16 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
           c.actCascadeHeight mustBe 2
         }
       }
-      // 370M is maxN=4096 — a 4-deep cascade that closes 250 on banking alone, so it
-      // deliberately carries neither the cascade cap nor the DSP spill that comes with it.
-      m370.maxN        mustBe 4096
-      m370.dspAccum    mustBe false
-      m370.colBankSize mustBe 8
+      // 370M is maxN=4096, so it still carries NEITHER cascade lever — a 4-deep RAMB36E2
+      // chain is not the path that fails there. It does now carry dspAccum and the short
+      // broadcast domains, which is not a change of mind about its timing: at B6 it closed
+      // 250 on banking alone (dspAccum = false, colBankSize = 8), but B8 spills 800 lanes to
+      // fabric instead of 288, and dspAccum is the condition that makes that fit at all.
+      m370.maxN             mustBe 4096
+      m370.dspAccum         mustBe true
+      m370.colBankSize      mustBe 4
+      m370.actRamStyle      mustBe ""      // no cascade cap: maxN=4096 does not need it
+      m370.actCascadeHeight mustBe 0
     }
   }
 

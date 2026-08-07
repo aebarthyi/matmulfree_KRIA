@@ -2,6 +2,38 @@
 
 ## 0. TOMORROW, in this order
 
+0a. **FINISH THE B8 PROMOTION — bundle assembly, not yet done.** The Chisel side landed
+   2026-08-06: `mmfree_370m/_1_3b/_2_7b` are now batchSize=8 + dspAccum, the B6 configs are
+   retained as `mmfree_*_b6` candidates, and `CoreConfigSpec` passes (23/23). **No Vivado is
+   needed** — a clean re-emit of the promoted presets is byte-identical to the already-built
+   B8 bitstreams (`mmfree_370m` sha 04645d6c… == `mmfree_370m_b8`; `mmfree_2_7b` 223bf241…
+   == `mmfree_2_7b_b8`), so the bundles are a clone away.
+
+   What is NOT done, and why: `transfer/presets/mmfree_370m` holds the ONLY local copy of the
+   B6 bitstream, `transfer/` is gitignored, and a B6 sweep was in flight on the board. Do this
+   only after that sweep finishes, in this order:
+
+       # 1. preserve the B6 bitstreams under their new candidate names FIRST
+       for m in 370m 1_3b 2_7b; do rm -rf generated/mmfree_${m}_b6; \
+           ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_${m}_b6 generated/mmfree_${m}_b6; done
+       # move the built B6 bundle aside, then drop in the _b6 manifest (bit.bin/dtbo are
+       # unchanged — same RTL, only manifest fields differ)
+       # 2. then assemble the B8 bundles under the shipped names
+       ./scripts/clone_preset_hw.sh mmfree_370m_b8 mmfree_370m
+       ./scripts/clone_preset_hw.sh mmfree_2_7b_b8 mmfree_2_7b
+       ./scripts/clone_preset_hw.sh mmfree_2_7b_b8 mmfree_1_3b     # 1.3B shares 2.7B's RTL
+       # 3. deploy, gate EVERY preset (the 2.7B margin is +0.002 ns), then streams at B=8
+       make deploy && ssh board 'cd transfer && sudo make deploy-hw PRESET=mmfree_2_7b \
+           && sudo make gate PRESET=mmfree_2_7b && sudo make streams PRESET=mmfree_2_7b'
+
+   Two open items the promotion creates, neither a script fix:
+   * `final_dataset.py:274` asserts `want_batches = set(range(1, 7))`. B8 sweeps 1..8, so the
+     ceiling has to become per-cell (read `MMFREE_BATCH` from the preset) or the B8 set can
+     never validate and the retained B6 set stops validating the moment you widen it.
+   * **The Xeon arm has no b=7/8 rows at all.** The CPU has no batch ceiling, so at b=8 the
+     FPGA currently has no denominator. Extending it is ~3 h AND can legitimately change which
+     thread count wins per (model, encoding), since that is chosen across the whole ladder.
+
 0. **RE-MEASURE THE BOARD ARM.** Readback is now threaded by default (2026-08-06), worth
    **+20.4% at 370M and +11.1% at 2.7B** at b=6. Every board row in
    `reports/final/dataset.csv` was taken with the serial readback and is that much low. Both
