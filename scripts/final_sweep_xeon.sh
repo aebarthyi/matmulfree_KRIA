@@ -88,24 +88,45 @@ RUNNER="$REPO_ROOT/software/integration/fpga_runner/build/mmfree-cli-fpga"
 # silently, with nothing in the CSV to show for it. So: if the host advertises avx512f and
 # the binary contains no zmm register use, refuse.
 if grep -qw avx512f /proc/cpuinfo; then
-    # grep -c, NOT grep -q: -q exits on the first match, which SIGPIPEs objdump, and under
-    # `set -o pipefail` the pipeline then reports objdump's 141 rather than grep's success —
-    # so the check fired on a binary that DID contain zmm. -c consumes the whole stream.
-    zmm=$(objdump -d "$RUNNER" 2>/dev/null | grep -c zmm || true)
-    if [ "${zmm:-0}" -eq 0 ]; then
-        cat >&2 <<EOF
-ERROR: this host supports AVX-512 but $RUNNER
-       was built without it (no zmm instructions found). That understates the Xeon
-       baseline by ~29% and would inflate every FPGA-vs-Xeon comparison drawn from it.
+    # ASK THE BINARY, do not count instructions. Counting zmm anywhere in the file was too
+    # weak and passed the exact build it existed to reject: on 2026-08-06 a plain `make`
+    # relinked the runner with the default -mavx2, and the file still contained 167 zmm from
+    # libmmfreecpu.a (which was not rebuilt) while the header-only packed-ternary kernels
+    # compiled into main_fpga.o had dropped to 256-bit. 167 != 0, so the guard said fine, and
+    # the rows that followed read 24-31% low on exactly those kernels.
+    #
+    # The runner now self-reports from the macros tq1.hpp actually switches on, so a probe run
+    # is authoritative where an instruction count is circumstantial. The banner prints before
+    # any weights are loaded or devices opened, so a deliberately bogus blob is enough to get
+    # it — and stderr/exit status are irrelevant, we only want that line.
+    simd_line=$("$RUNNER" 0 0 - - - - --backend cpu --blob /nonexistent-probe 2>/dev/null \
+                | grep -m1 '^simd backend:' || true)
+    case "$simd_line" in
+        *avx512*) echo "# SIMD: ${simd_line#simd backend: }" ;;
+        "")
+            echo "WARNING: could not read the SIMD banner from $RUNNER — probe produced no" >&2
+            echo "         'simd backend:' line. Falling back to an instruction count." >&2
+            zmm=$(objdump -d "$RUNNER" 2>/dev/null | grep -c zmm || true)
+            echo "# SIMD: unverified, $zmm zmm instructions present (count is NOT proof)" >&2
+            [ "${ALLOW_NARROW_SIMD:-0}" = "1" ] || exit 1
+            ;;
+        *)
+            cat >&2 <<EOF
+ERROR: this host supports AVX-512 but the runner reports:
+           $simd_line
+
+That is a 256-bit build of the packed-ternary kernels. It understates the Xeon baseline by
+~29% and would inflate every FPGA-vs-Xeon comparison drawn from it. Rebuild — and note that
+a plain \`make\` here defaults to -mavx2, so the SIMD variable is not optional:
 
   make -C software/integration/fpga_runner clean
   MMFREE_SIMD=X86_512 make -C software/integration/fpga_runner
 
 Set ALLOW_NARROW_SIMD=1 to override, but then this is NOT the final data set.
 EOF
-        [ "${ALLOW_NARROW_SIMD:-0}" = "1" ] || exit 1
-    fi
-    echo "# SIMD: AVX-512 build confirmed ($zmm zmm instructions)"
+            [ "${ALLOW_NARROW_SIMD:-0}" = "1" ] || exit 1
+            ;;
+    esac
 fi
 
 # ── The binary must not CHANGE mid-sweep ────────────────────────────────────────────

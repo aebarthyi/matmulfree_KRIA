@@ -398,6 +398,11 @@ int main(int argc, char** argv) {
 #endif
   std::printf("simd backend: %s%s%s\n", mmfree::simd::backend(),
               simd_detail ? "  ->  " : "", simd_detail ? simd_detail : "");
+  // Flush it NOW. Piped stdout is fully buffered, so anything that aborts later — a missing
+  // blob, an uncaught exception — discards this line, and a caller probing the binary for its
+  // build (final_sweep_xeon.sh does exactly that) sees nothing and cannot tell a narrow build
+  // from an unreadable one. The banner has to survive the process dying after it.
+  std::fflush(stdout);
 
   // ---- CPU-side weights + model (norms, scales, embeddings, wq for CPU/Float) ----
   Weights w(blob);
