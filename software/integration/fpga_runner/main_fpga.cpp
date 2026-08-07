@@ -705,6 +705,13 @@ int main(int argc, char** argv) {
       // The rate the fabric ACTUALLY ran at, which clk_mhz above does not give.
       row.add("fclk_hz", fclk_hz_str());
       row.add("hw_batch", getenv_or("MMFREE_BATCH", "?"));
+      // The BITSTREAM's compile-time batchSize, which hw_batch above is NOT: bench_batch.sh
+      // passes BATCH=b per run, so MMFREE_BATCH carries the runtime batch and hw_batch just
+      // duplicates the `batch` column. The ceiling has to come from the manifest, and it is
+      // what tells a downstream aggregator which batch ladder this row is a complete or
+      // partial cover of — b=1..batchSize all come out of one build (cmpBatch), b>batchSize
+      // is physically impossible, so 1..this IS the expected sweep.
+      row.add("hw_batch_max", getenv_or("MMFREE_HW_BATCH", getenv_or("MMFREE_BATCH", "?").c_str()));
       row.add("packed_weights", getenv_or("MMFREE_PACKED_WEIGHTS", "0"));
       row.add("model", blob);
       // CPU-side weight representation, so an int8 arm and a TQ1_0 arm are
@@ -768,6 +775,9 @@ int main(int argc, char** argv) {
       // The rate the fabric ACTUALLY ran at, which clk_mhz above does not give.
       row.add("fclk_hz", fclk_hz_str());
       row.add("hw_batch", getenv_or("MMFREE_BATCH", "?"));
+      // The bitstream's compile-time batchSize (see the --serve row above): the ceiling of
+      // the batch ladder, as opposed to hw_batch's per-run value.
+      row.add("hw_batch_max", getenv_or("MMFREE_HW_BATCH", getenv_or("MMFREE_BATCH", "?").c_str()));
       row.add("packed_weights", getenv_or("MMFREE_PACKED_WEIGHTS", "0"));
       row.add("model", blob);
       // CPU-side weight representation, so an int8 arm and a TQ1_0 arm are

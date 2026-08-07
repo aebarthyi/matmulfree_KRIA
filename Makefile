@@ -62,13 +62,14 @@ define need_manifest
 	@[ -f "$(MANIFEST)" ] || { echo "ERROR: no manifest for '$(PRESET)' — run 'make build PRESET=$(PRESET)' first." >&2; exit 1; }
 endef
 
-.PHONY: help sim build model provision pack deploy
+.PHONY: help sim build stage model provision pack deploy
 
 help:
 	@echo "matmulfree_KRIA build-server runner (PRESET=$(PRESET))"
 	@echo
 	@echo "  make sim    [SPEC=substr]                     mill tests"
 	@echo "  make build  PRESET=<preset>                   Chisel -> bitstream -> transfer/presets/<p>/ + stage src/"
+	@echo "  make stage                                    re-stage transfer/{Makefile,*.sh,src/} only (no Vivado)"
 	@echo "  make model  PRESET=<preset>                   provision + pack the preset's model -> transfer/models/<hf-id>/"
 	@echo "  make deploy BOARD=user@host [DEPLOY_MODELS=\"ridger/MMfreeLM-1.3B\"]   rsync transfer/ -> <board>:$(BOARD_DEST)/transfer/"
 	@echo
@@ -91,6 +92,14 @@ endif
 # ─── host: Chisel → bitstream + bundle (emits the manifest as step 1) ────────
 build:
 	PRESET=$(PRESET) ./scripts/build_all.sh
+
+# ─── host: re-stage the board-side sources only ──────────────────────────────
+# The board compiles the runner from transfer/src/ and drives it from transfer/Makefile,
+# both of which are COPIES. Editing software/ or scripts/ without re-staging means the next
+# board run silently measures the previous code, so this is the step between any such edit
+# and `make deploy`. No Vivado, no preset, no bitstream touched.
+stage:
+	STAGE_ONLY=1 ./scripts/build_all.sh
 
 # ─── host: model = provision + pack (the one command you need) ───────────────
 # Derives the HF checkpoint from the preset (MMFREE_MODEL) and the pack geometry from

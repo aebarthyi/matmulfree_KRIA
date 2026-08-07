@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
 # final_sweep_board.sh — the KRIA half of the final report data set.
 #
-#   cd ~/transfer && sudo ./final_sweep_board.sh              # everything (~4-5 h)
-#   cd ~/transfer && sudo ./final_sweep_board.sh fpga         # FPGA arms only  (~1 h)
-#   cd ~/transfer && sudo ./final_sweep_board.sh cpu          # A53 arms only   (~3-4 h)
+#   cd ~/transfer && sudo ./final_sweep_board.sh              # everything (~7-8 h)
+#   cd ~/transfer && sudo ./final_sweep_board.sh fpga         # FPGA arms only  (~2-3 h)
+#   cd ~/transfer && sudo ./final_sweep_board.sh cpu          # A53 arms only   (~4-5 h)
 #
-# Produces, for all three model sizes, at every batch b=1..6, WITH board rail power on
-# every single row:
+# The estimates are for the defaults below at B8: 5 FPGA passes over an 8-rung ladder, and
+# one CPU pass over the same ladder at three encodings. They were ~4-5 h in total at B6 with
+# 3 passes; two more passes and two more rungs is where the rest went. Nothing needs babysitting
+# — every arm logs, and a failure in one is recorded and skipped rather than aborting the run.
+#
+# Produces, for all three model sizes, at every batch b=1..MMFREE_BATCH (8 on the shipped
+# B8 bitstreams — the ladder comes from the preset manifest, not from this script), WITH
+# board rail power on every single row:
 #
 #   arm "fpga"  the three shipped presets (mmfree_370m / _1_3b / _2_7b), 1.6-bit weights,
-#               engine + A53 host. PASSES independent runs each, gated bit-exact first.
+#               engine + A53 host. PASSES independent runs each, gated bit-exact first, and
+#               row-independence checked once per bitstream with distinct prompts.
 #   arm "cpu"   the same three models on the four A53s with the engine OUT of the loop, at
 #               all three weight encodings (int8 / 2-bit / 1.6-bit). ONE pass, REPS=1 — these
 #               are slow (2.7B decodes at ~1.3 tok/s) and a second pass would cost hours to
 #               resolve a difference the FPGA arms already bound.
+#
+# The CPU arms sweep the SAME ladder as the FPGA arms, which is why they read the preset
+# manifest too: they are the denominator, and a CPU row that stops at b=6 against an FPGA
+# row that reaches b=8 leaves the top of the ladder with no speedup to quote. final_dataset.py
+# enforces this — it reads the ceiling from the CSV's hw_batch_max column and reports any arm
+# that falls short of it.
 #
 # ── DESIGN NOTES, because this is meant to be quotable without asterisks ─────────────
 #
@@ -34,6 +47,14 @@
 # gate is bit-exact CPU vs engine over every projection. streams_ok is NOT a substitute — it
 # compares the engine against itself, so a uniform error corrupts the reference too.
 #
+# AND CHECK ROW INDEPENDENCE ONCE PER BITSTREAM. The sweep's own streams_ok gives every
+# stream the SAME prompt, so the streams are identical by construction and the check is
+# invariant under permutation: it cannot see the drain writing row 2 into stream 5. `make
+# streams` re-runs the same path with a DIFFERENT prompt per stream against per-stream
+# references, which can. It is a property of the bitstream, not of a batch or a pass, so it
+# runs once per preset here rather than per row — and it matters most at B8, eight rows being
+# the widest drain this design has ever done.
+#
 # ORDER: CPU arms first, per size, before that size's overlay is loaded. They need no CMA at
 # all, so running them first keeps the FPGA arms' allocations off a fragmented pool.
 set -uo pipefail
@@ -42,11 +63,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run under sudo (overlay load + /dev/mem): sudo ./final_sweep_board.sh" >&2; exit 1; }
 
 WHICH="${1:-all}"
-PASSES="${PASSES:-3}"        # independent FPGA passes per preset
+# Five, not three. The headline is the MEDIAN across passes, and with n=3 dropping any single
+# pass leaves two whose median is their average — so one transient still moves it, which is
+# exactly what the jackknife flagged on the 3-pass sets. At n=5 it cannot.
+PASSES="${PASSES:-5}"        # independent FPGA passes per preset
 GEN="${GEN:-64}"
 FPGA_REPS="${FPGA_REPS:-3}"  # in-process reps for the FPGA arms
 CPU_REPS="${CPU_REPS:-1}"    # A53 arms: one shot, they are slow
 GATE_GEN="${GATE_GEN:-8}"
+STREAMS_GEN="${STREAMS_GEN:-32}"   # per-stream generation for the row-independence check
+DO_STREAMS="${DO_STREAMS:-1}"      # 0 skips it (it is a per-bitstream property, not per-run)
 export POWER=1               # non-negotiable for this data set; see above
 
 PRESETS="${PRESETS:-mmfree_370m mmfree_1_3b mmfree_2_7b}"
@@ -65,8 +91,39 @@ mkdir -p results/logs
 failed=""
 t0=$(date +%s)
 echo "# effective settings: WHICH=$WHICH PRESETS='$PRESETS' passes ${PASS_START}..${PASSES}"
+echo "#   gen=$GEN fpga_reps=$FPGA_REPS cpu_reps=$CPU_REPS streams=$DO_STREAMS power=1"
 echo "#   (if that is not what you asked for, the env went BEFORE sudo and was stripped)"
+# The batch ladder is the bitstream's, so print it: a bundle that was not re-deployed after a
+# preset change is otherwise indistinguishable from one that was, until the CSVs come up short.
+for p in $PRESETS; do
+    printf '#   %-14s batch ceiling %s   model %s\n' "$p" \
+        "$(sed -n 's/^MMFREE_BATCH=//p' "presets/$p/preset.env" 2>/dev/null || echo '?')" \
+        "$(sed -n 's/^MMFREE_MODEL=//p' "presets/$p/preset.env" 2>/dev/null || echo '?')"
+done
 say() { echo; echo "############################################################"; echo "# $*"; echo "############################################################"; }
+
+# ── Preflight: get the PREVIOUS final set out of the way ─────────────────────
+# The CSV name is <preset>[_<backend>]_final[_pN], which does NOT encode the bitstream. So a
+# B8 run under the shipped preset names writes over a B6 run under the same names — and if
+# this run fails partway, what is left in results/ is a MIX of two bitstreams' rows under one
+# set of filenames, which the aggregator has no way to separate and will happily merge into
+# one median. Archive first, so a half-finished run can only ever be incomplete, never wrong.
+#
+# Skipped when PASS_START > 1, which IS the deliberate top-up case: those runs are meant to
+# land alongside the passes already there.
+if [ "$PASS_START" = "1" ] && [ "${ARCHIVE:-1}" = "1" ]; then
+    prev=$(ls -d results/*_final*_batch_sweep.csv 2>/dev/null | wc -l)
+    if [ "$prev" -gt 0 ]; then
+        arc="results/prev_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$arc"
+        mv results/*_final* "$arc"/ 2>/dev/null || true
+        # Power dirs are named the same way and are just as ambiguous.
+        for d in power/*_final*; do [ -e "$d" ] && mv "$d" "$arc"/ 2>/dev/null; done
+        echo "#"
+        echo "#   archived $prev previous *_final* CSV(s) + their power dirs -> $arc/"
+        echo "#   (they were written by whatever bitstream was loaded then; this run's are new)"
+    fi
+fi
 
 # ── A53 CPU-only arms ────────────────────────────────────────────────────────
 # No overlay and no gate: the runner installs the CPU backend before it ever opens /dev/mem,
@@ -120,6 +177,24 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "fpga" ]; then
                     failed="$failed $preset(GATE)"; break
                 fi
                 grep -E "GATE|checked" "results/logs/final_gate_$preset.log" | sed 's/^/     /'
+
+                # Row independence, once per bitstream (see the header). A failure here is
+                # NOT fatal to the run — the timings stay valid as timings — but it makes
+                # every batched row unquotable, so it is recorded as a failure and the
+                # aggregator's streams_ok check is what stops the number reaching a report.
+                if [ "$DO_STREAMS" = "1" ]; then
+                    echo "  -- streams (distinct prompt per row, own reference each) --"
+                    if ! make streams PRESET="$preset" GEN="$STREAMS_GEN" \
+                            > "results/logs/final_streams_$preset.log" 2>&1; then
+                        echo "  !! STREAMS FAILED — batched rows for $preset are not quotable"
+                        grep -E "PERMUTATION|mismatch|ERROR|OK \(" \
+                            "results/logs/final_streams_$preset.log" | head -8 | sed 's/^/     /'
+                        failed="$failed $preset(STREAMS)"
+                    else
+                        grep -E "OK \(|streams" "results/logs/final_streams_$preset.log" \
+                            | head -3 | sed 's/^/     /'
+                    fi
+                fi
             fi
 
             ./bench_batch.sh PRESET="$preset" TAG="final_p${pass}" \
@@ -141,3 +216,7 @@ if [ -n "$failed" ]; then echo "# FAILURES:$failed"; exit 1; fi
 echo "# every arm completed — pull with:"
 echo "#   rsync -a ubuntu@kria:'~/transfer/results/' ~/results/final/"
 echo "#   rsync -a ubuntu@kria:'~/transfer/power/'   ~/results/final/power/"
+echo "# then, on the build server:"
+echo "#   ./scripts/final_dataset.py --board ~/results/final --xeon reports/host_cpu/final"
+echo "# which is the thing that decides whether this run is quotable. It checks the ladder"
+echo "# per model against hw_batch_max, so a short arm shows up as missing b=, not as clean."

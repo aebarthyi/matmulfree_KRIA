@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 # final_sweep_xeon.sh — the x86 half of the final report data set.
 #
-#   ./scripts/final_sweep_xeon.sh                    # everything (~2 h)
+#   ./scripts/final_sweep_xeon.sh                    # everything (~8-10 h)
 #
 # Wraps bench_host_cpu.sh to produce the Xeon arm at the same shape as the board arms:
-# 3 models x 3 weight encodings x b=1..6, PASSES independent passes, RAPL power on every row.
+# 3 models x 3 weight encodings x b=1..8, PASSES independent passes, RAPL power on every row.
+#
+# ── WHY THE LADDER GOES TO 8, AND WHY THAT FORCED A FULL RE-RUN ─────────────────────
+# The board ships B8, so the FPGA has rows at b=7 and b=8. The CPU has no batch ceiling of
+# its own, but without those two rungs the top of the FPGA ladder has no denominator and
+# no speedup can be quoted there. So the ladder is 1..8 (2026-08-07, was 1..6).
+#
+# That is NOT a top-up. The winning thread count is chosen per (model, encoding) across the
+# WHOLE ladder — one curve, one configuration — so adding two rungs can legitimately change
+# which thread count wins, and a set with passes 1-3 at six rungs and passes 4-5 at eight
+# would have the winner decided on a ragged ladder. The per-pass-directory idempotence that
+# makes a top-up cheap is exactly what would hide that, so the previous output is archived
+# and all PASSES run fresh against one ladder.
 #
 # ── WHY IT SWEEPS THREAD COUNTS ─────────────────────────────────────────────────────
 # The optimal OpenMP thread count on this host is MODEL- AND ENCODING-dependent, measured:
@@ -37,11 +49,13 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PASSES="${PASSES:-3}"
+# Five, matching the board arms: with n=3 the median still moves when one pass is perturbed,
+# and on the 3-pass Xeon set the jackknife flagged four cells for exactly that.
+PASSES="${PASSES:-5}"
 THREAD_SET="${THREAD_SET:-10 20}"
 MODELS="${MODELS:-ridger/MMfreeLM-370M ridger/MMfreeLM-1.3B ridger/MMfreeLM-2.7B}"
 BACKENDS="${BACKENDS:-cpu cpu-2bit cpu-1p6}"
-BATCHES="${BATCHES:-1 2 3 4 5 6}"
+BATCHES="${BATCHES:-1 2 3 4 5 6 7 8}"
 
 # ── GEN IS PER MODEL, AND HAS TO BE ─────────────────────────────────────────────────
 # decode_tok_s is a rate, so GEN does not change the quantity being measured — only how
@@ -161,6 +175,42 @@ untouched and still valid; this aborts before starting another.
 EOF
     exit 1
 }
+
+# ── Existing output must be on the SAME ladder ───────────────────────────────────────
+# This script is idempotent per pass directory, which makes a top-up cheap and makes a LADDER
+# CHANGE dangerous: it would skip the six-rung passes already there and add eight-rung ones,
+# then the aggregator would pick the winning thread count per (model, encoding) across a
+# ladder that is ragged between passes. Refuse instead, and say what to do about it.
+stale=""
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    got=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="batch") c=i; next} {print $c}' "$f" \
+          | sort -n | uniq | tr '\n' ' ')
+    [ "$(echo $got)" = "$(echo $BATCHES)" ] || stale="$stale $(dirname "${f#$OUT_ROOT/}")[$(echo $got)]"
+done < <(find "$OUT_ROOT" -name host_cpu_sweep.csv 2>/dev/null | sort)
+if [ -n "$stale" ]; then
+    cat >&2 <<EOF
+ERROR: $OUT_ROOT already holds runs on a DIFFERENT batch ladder.
+
+  this run wants : $BATCHES
+  already there  :$stale
+
+Leaving them would give the aggregator a ladder that changes between passes, and the winning
+thread count is chosen across the whole ladder — so the choice itself would depend on which
+pass happened to be wider. Archive the old set and run all $PASSES passes fresh:
+
+  mv $OUT_ROOT ${OUT_ROOT}_b1to6_$(date +%Y%m%d)
+
+Set ARCHIVE_PREV=1 to have this script do exactly that move for you.
+EOF
+    if [ "${ARCHIVE_PREV:-0}" = "1" ]; then
+        dest="${OUT_ROOT}_prev_$(date +%Y%m%d_%H%M%S)"
+        mv "$OUT_ROOT" "$dest"
+        echo "# ARCHIVE_PREV=1: moved the previous set -> $dest" >&2
+    else
+        exit 1
+    fi
+fi
 
 echo "############################################################"
 echo "# Xeon final sweep: $PASSES passes x {$THREAD_SET} threads"

@@ -422,14 +422,19 @@ object CoreConfig {
     //
     // ── WHAT ALL THREE SHARE ──────────────────────────────────────────────────
     //
-    // batchSize = 6, outBeatLanes = 4
+    // batchSize = 8, outBeatLanes = 4
     //   Decode is weight-bandwidth-bound, so the lever that matters is tokens amortized
-    //   per weight stream. B6 measured +11.8% over B4. B8 is a device capacity wall
-    //   (~95% LUT) even with DSP accumulators, so 6 is the ceiling the K26 can hold.
+    //   per weight stream. B6 measured +11.8% over B4; B8 then measured +11.5% (370M) and
+    //   +15.4% (2.7B) over B6 at its own best point, and — the result that justified the
+    //   promotion — costs NOTHING below b=8 (b=6 lands within 0.7% of the B6 bitstream on
+    //   the same software). The "~95% LUT capacity wall" that once capped this at 6 was
+    //   measured before dspAccum existed; with the accumulators in DSP48s all three close
+    //   250 MHz at 81-83% LUT. See dspAccum below — it is the enabling condition, not a
+    //   separate optimization.
     //   outBeatLanes=4 puts m_axis at 128 bits to match the HP port width; at 32 bits the
     //   STORE was the batch bottleneck at ~1 GB/s and did not amortize.
-    //   The runtime batch count (COMPUTE flags field -> cmpBatch) makes ONE B6 bitstream
-    //   also serve b=1..5 at ~B1 cost, so there is no reason to ship a low-B build.
+    //   The runtime batch count (COMPUTE flags field -> cmpBatch) makes ONE B8 bitstream
+    //   also serve b=1..7 at ~B1 cost, so there is no reason to ship a low-B build.
     //
     // packedWeights = true — 1.6-bit weights, 5 trits/byte
     //   Cuts the binding weight traffic ~20%; measured +4.3% tok/s at 2.7B b=6, growing
@@ -456,8 +461,10 @@ object CoreConfig {
     //
     //   dspAccum = true      Maps the lane accumulators onto DSP48E2 instead of LUT/CARRY8,
     //                        worth ~22 pp LUT and ~34 pp CARRY8. Full coverage would want
-    //                        xDim*batch*nLanes = 32*6*8 = 1536 DSPs against the K26's 1248,
-    //                        so ~1/4 spill back to fabric; it is still a large net win.
+    //                        xDim*batch*nLanes = 32*8*8 = 2048 DSPs against the K26's 1248,
+    //                        so ~800 lanes spill back to fabric; it is still what makes B8
+    //                        fit. 370M carries it for the same reason, despite closing 250
+    //                        without it at B6.
     //
     //   colBankSize = 4      Halves the activation-broadcast fanout. Targets the route-bound
     //                        path (74% route over 3 levels) that the DSP spill creates by
@@ -473,26 +480,31 @@ object CoreConfig {
     // either one alone moves WNS by 0.005 ns and wastes a 50-minute build; CoreConfigSpec
     // pins that they always travel together.
     //
-    // 370M needs none of the three: maxN=4096 is a 4-deep cascade, and it closes 250 with
-    // banking alone. dspAccum there would add spill congestion for no benefit.
+    // 370M needs only the first two: maxN=4096 is a 4-deep cascade, so it closes 250 without
+    // the ActMem cap. It carries dspAccum because that is what lets B8 fit, not for timing —
+    // at B6 it closed 250 on banking alone.
     //
     // ── MEASURED — KRIA KV260, decode tok/s, POWER=1, all gates PASS, streams_ok=1 ─
+    // Five passes, median, threaded readback, on these B8 bitstreams (2026-08-06).
     //
-    //   preset        b=1    b=2    b=3    b=4    b=5    b=6   WNS@250   SOM W   tok/J
-    //   mmfree_370m  41.67  65.32  79.00  93.10  95.84  102.63  +0.030    5.37    19.1
-    //   mmfree_1_3b  20.40  33.30  42.75  49.18  51.73   55.43  +0.025*   5.96     9.30
-    //   mmfree_2_7b  11.72  19.27  25.16  29.88  30.97   34.41  +0.025    6.14     5.61
+    //   preset        b=1     b=4     b=6     b=7     b=8   WNS@250  SOM W @b8  tok/J
+    //   mmfree_370m  41.31  107.51  123.46  132.03  137.67  +0.011      5.52    24.96
+    //   mmfree_1_3b  20.38   54.05   57.89†  68.51   71.53† +0.002*     6.17    11.60
+    //   mmfree_2_7b  11.73   33.12   38.63   42.66   44.58  +0.002      6.39     6.97
     //
     //   * 1.3B runs the 2.7B bitstream, so the 2.7B WNS is its timing record.
-    //   Against a Xeon W-2155 at the same weight format, the KRIA is 1.4-2.0x SLOWER in
-    //   raw throughput and 8.8-13.2x better in tok/J, with the energy advantage growing
-    //   with model size.
+    //   † 1.3B's host `pack` cost is bimodal at some shapes, so those two cells carry a
+    //     wider spread than the other two models. See NEXT_STEPS.md.
+    //   Against a Xeon W-2155 at the same weight format the KRIA is slower in raw throughput
+    //   and ~an order of magnitude better in tok/J, the energy advantage growing with model
+    //   size. The authoritative ratios are reports/final/dataset.csv, not this comment.
     //
-    // Use b=4 or b=6, never b=5: the host's vector ops are omp static over the batch on
-    // 4 A53 cores, so they cost ceil(b/4) waves and b=5 pays b=6's price for 5 streams.
+    // b=8 is the best point, and b=1..7 come free from the same bitstream (cmpBatch). Prefer
+    // b=4 or b=8 over b=5..7: the host's vector ops are omp static over the batch on 4 A53
+    // cores, so they cost ceil(b/4) waves and only b=4 and b=8 fill the waves they pay for.
 
     /** MMfreeLM-370M — hidden 1024, intermediate 2816, vocab 32000, 24 layers.
-      * maxN=4096, ~85 MB of weight traffic per token. 102.63 tok/s at b=6.
+      * maxN=4096, ~85 MB of weight traffic per token. 137.67 tok/s at b=8.
       */
     val MMFree_370M: CoreConfig =
         forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
@@ -503,7 +515,7 @@ object CoreConfig {
                   implDirectives = b4TimingLevers250)
 
     /** MMfreeLM-1.3B — hidden 2048, intermediate 5632, vocab 32000, 24 layers.
-      * maxN=8192, ~325 MB of weight traffic per token. 55.43 tok/s at b=6.
+      * maxN=8192, ~325 MB of weight traffic per token. 71.53 tok/s at b=8.
       * Same RTL as MMFree_2_7B; assemble its bundle with scripts/clone_preset_hw.sh.
       */
     val MMFree_1_3B: CoreConfig =
@@ -514,7 +526,7 @@ object CoreConfig {
                   implDirectives = b4TimingLevers250)
 
     /** MMfreeLM-2.7B — hidden 2560, intermediate 6912, vocab 32000, 32 layers.
-      * maxN=8192, ~655 MB of weight traffic per token. 34.41 tok/s at b=6.
+      * maxN=8192, ~655 MB of weight traffic per token. 44.58 tok/s at b=8.
       * The largest checkpoint the K26 runs, and the one to build from.
       */
     val MMFree_2_7B: CoreConfig =
@@ -554,19 +566,23 @@ object CoreConfig {
     // cost ceil(b/4) waves — b=8 runs two full waves at 100% efficiency where b=6 wastes a
     // quarter of the second wave. b=5..8 all pay two waves and only b=8 amortizes them.
     //
-    // THE RISK IS TIMING, NOT CAPACITY. Full DSP coverage wants xDim*batch*nLanes =
+    // THE RISK WAS TIMING, NOT CAPACITY. Full DSP coverage wants xDim*batch*nLanes =
     // 32*8*8 = 2048 against the K26's 1248, so 800 lanes spill to fabric versus 288 at B6 —
     // and that spill is exactly what created the route-bound broadcast path colBankSize=4
-    // was added to fix. B6 closes 250 at +0.025 ns with all 30 worst paths clustered in
-    // 0.042-0.063 ns on one congestion family, so there is no margin to give away. If these
-    // miss 250, drop to the 200 rung: it costs ~5% and B8's upside is larger than that.
-    // ── B8 was PROMOTED to deployable 2026-08-06 ──────────────────────────────
-    // The three configs above now carry batchSize = 8; the reasoning that used to sit here
-    // is preserved because it is what the promotion rests on. What the build measured:
+    // was added to fix. B6 closed 250 at +0.025 ns with all 30 worst paths clustered in
+    // 0.042-0.063 ns on one congestion family, so there was no margin to give away.
+    //
+    // ── B8 was PROMOTED to deployable 2026-08-06, and the comparison is CLOSED ─
+    // The three configs above carry batchSize = 8; the reasoning above is preserved because
+    // it is what the promotion rests on. What the builds measured:
     //
     //     preset            WNS@250    LUT      Reg     CARRY8   BRAM     URAM     DSP
     //     mmfree_2_7b       +0.002   83.18%   49.76%   25.92%   49.65%   50.00%   100%
     //     mmfree_370m       +0.011   81.42%   48.30%   25.92%   29.51%   53.13%   100%
+    //
+    // and what the board measured, five passes on one software build: B8 costs nothing below
+    // b=8 (its b=6 lands within 0.7% of the B6 bitstream) and gains +11.5% (370M) / +15.4%
+    // (2.7B) at b=8. Best-point to best-point, +10.7% and +15.6%.
     //
     // ⚠️ 2.7B's +0.002 ns is the thinnest margin anything shipped has ever had, and a
     // different placement seed could miss. That risk was accepted on promotion rather than
@@ -574,21 +590,12 @@ object CoreConfig {
     // margin) remains the fallback if the board shows intermittent trouble. The gate is the
     // check that matters here — bit-exactness at temperature, per bitstream, per session.
     //
-    // The B6 configurations are kept BUILDABLE below rather than moved to `exploration`,
-    // because they are the measured baseline B8 has to beat and the comparison is not
-    // finished: the five-pass board set was taken at B6 with a serial readback, and readback
-    // threading (+11-20%) landed the same day, so B8-vs-B6 has to be re-taken on one
-    // software build before the promotion can be called quantitatively justified.
-    val MMFree_370M_B6: CoreConfig =
-        MMFree_370M.copy(batchSize = 6, dspAccum = false, colBankSize = 8)
-    val MMFree_1_3B_B6: CoreConfig = MMFree_1_3B.copy(batchSize = 6)
-    val MMFree_2_7B_B6: CoreConfig = MMFree_2_7B.copy(batchSize = 6)
-
-    val candidates: Map[String, CoreConfig] = Map(
-        "mmfree_370m_b6" -> MMFree_370M_B6,
-        "mmfree_1_3b_b6" -> MMFree_1_3B_B6,
-        "mmfree_2_7b_b6" -> MMFree_2_7B_B6
-    )
+    // The B6 configurations were retained here as the control while that comparison was open.
+    // It is now settled, B8 is the final shipped configuration, and they were removed
+    // 2026-08-07 rather than left as a second way to build a bitstream nobody should deploy.
+    // `git show d63d9f9:src/main/scala/control/CoreConfig.scala` has them if a B6 build is
+    // ever needed again, and reports/final/ retains the B6 measurements themselves.
+    val candidates: Map[String, CoreConfig] = Map.empty
 
     /** Everything `make build PRESET=` / EmitCore can reach. */
     val presets: Map[String, CoreConfig] = deployable ++ candidates

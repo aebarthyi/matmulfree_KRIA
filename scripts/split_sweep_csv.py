@@ -30,7 +30,7 @@ import os
 import sys
 
 # Identity of the run: repeated on every row of every sheet so each is self-describing.
-ID_COLS = ["preset", "clk_mhz", "hw_batch", "packed_weights", "model", "batch"]
+ID_COLS = ["preset", "clk_mhz", "hw_batch", "hw_batch_max", "packed_weights", "model", "batch"]
 
 # The headline benchmark table, in report order. Anything here that the input lacks is
 # skipped rather than emitted empty, so this tolerates older/newer runner versions.

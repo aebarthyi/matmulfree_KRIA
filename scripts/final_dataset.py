@@ -10,7 +10,7 @@ Emits reports/final/dataset.csv, one row per (platform, arm, model, weight_fmt, 
     arm          fpga (engine + A53 host) | cpu (A53 only) | cpu (Xeon)
     model        370M | 1.3B | 2.7B
     weight_fmt   1p6 | 2bit | int8
-    batch        1..6
+    batch        1..hw_batch, the bitstream's compile-time batchSize (8 on the shipped set)
     threads      Xeon OpenMP threads (blank on the board)
     passes       independent runs behind the mean
     decode_tok_s MEDIAN across passes — robust to the one-perturbed-pass failure mode
@@ -29,6 +29,11 @@ any of these hold, because each one silently invalidates a comparison drawn acro
   * streams_ok=0 on any FPGA row -> that row's timings are meaningless
   * pass disagreement > limit -> the bad-cell failure mode from 2026-08-04, where 3/3 reps
                                  inside one process agreed to 0.12 tok/s on a 12%-low number
+  * an arm short of the batch ladder -> a b=8 FPGA row with no b=8 CPU row has no denominator
+
+The expected ladder is per model, read from the sweep's own hw_batch column rather than
+hardcoded, so one aggregator validates a B8 set and a B6 set without either being wrong by
+definition. See ladders().
 """
 import argparse, csv, glob, os, re, sys
 from collections import defaultdict
@@ -83,6 +88,14 @@ def read_board(board_root):
                 batch=b, threads='', pass_id=pas or '1',
                 decode=float(r['decode_tok_s']),
                 watts=pw.get((base, b)),
+                # hw_batch_max is the bitstream's compile-time batchSize: the batch ceiling
+                # for this model, and hence the expected ladder for EVERY arm measuring it.
+                # The CPU arms carry it too — bench_batch.sh reads the same manifest with the
+                # engine out of the loop, so their b's line up with the FPGA run they are the
+                # denominator for. NOT hw_batch, which is the per-run value and duplicates
+                # `batch`; CSVs written before 2026-08-07 have only that, and are handled by
+                # ladders() refusing to guess.
+                hw_batch=int(r['hw_batch_max']) if r.get('hw_batch_max') else None,
                 streams_ok=r.get('streams_ok', ''), preset=preset))
     return recs
 
@@ -141,8 +154,50 @@ def read_xeon(xeon_root):
                 threads=r.get('omp_threads') or mt.group(1),
                 pass_id=pas,
                 decode=float(r['decode_tok_s']),
+                # No hardware ceiling on the Xeon — its expected ladder is imposed by the
+                # board's, since the point of this arm is to be the FPGA's denominator.
+                hw_batch=None,
                 watts=watts, streams_ok='', preset=r.get('host_cpu', '')))
     return recs
+
+
+def ladders(recs, override=None):
+    """model -> the set of batches every arm measuring it is expected to cover.
+
+    The ceiling is a property of the BITSTREAM, not of the report: b=1..batchSize all come
+    out of one build at runtime (COMPUTE flags -> cmpBatch), and b>batchSize is physically
+    impossible. So it is read per model from the sweep CSV's hw_batch_max column rather than
+    hardcoded — a hardcoded 1..6 cannot validate the shipped B8 set, and widening it to 1..8
+    globally would instead declare a B6 set incomplete for batches its silicon cannot run.
+
+    The CPU arms inherit the FPGA's ladder for the same model. They have no ceiling of their
+    own, but a CPU row that stops at b=6 against an FPGA row that reaches b=8 leaves the
+    speedup at b=7/8 with no denominator, which is exactly the gap this has to surface.
+
+    Refuses to GUESS. A data set with no hw_batch_max (every CSV written before 2026-08-07)
+    gets no ladder and says so, rather than inferring one from the batches present — that
+    inference is what let a half-finished sweep report CLEAN, since whatever landed is always
+    a complete cover of itself.
+
+    Returns (ladder_by_model, problems).
+    """
+    problems = []
+    seen = defaultdict(set)
+    for r in recs:
+        if r.get('hw_batch'):
+            seen[r['model']].add(r['hw_batch'])
+    out = {}
+    for model, ceilings in sorted(seen.items()):
+        if len(ceilings) > 1:
+            # Two bitstreams with different batchSize under one model: the passes are not
+            # measuring the same hardware, so their spread is meaningless and the union of
+            # their ladders is not a ladder. Take the smaller and say so.
+            problems.append(f"{model}: mixed batch ceilings {sorted(ceilings)} in one data "
+                            "set — these are different bitstreams; separate the runs")
+        out[model] = min(ceilings)
+    if override:
+        out = {m: override for m in set(out) | set(MODEL_OF.values())}
+    return {m: set(range(1, c + 1)) for m, c in out.items()}, problems
 
 
 def collapse(recs, spread_limit):
@@ -233,6 +288,11 @@ def main():
     ap.add_argument('--out', default='reports/final')
     ap.add_argument('--spread-limit', type=float, default=3.0,
                     help='flag a cell whose passes disagree by more than this %% (default 3)')
+    ap.add_argument('--max-batch', type=int, default=None,
+                    help='force the expected batch ladder to 1..N for every model. The '
+                         'default reads it per model from the sweep CSV\'s hw_batch column '
+                         '(the bitstream\'s compile-time batchSize), which is what you want '
+                         'unless you are aggregating an arm the board never measured.')
     a = ap.parse_args()
 
     recs = []
@@ -271,8 +331,17 @@ def main():
 
     # ── completeness / integrity ─────────────────────────────────────────────
     problems = [r for r in rows if r['flag']]
-    want_batches = set(range(1, 7))
     want_models = ['370M', '1.3B', '2.7B']
+    want_ladder, ladder_problems = ladders(recs, a.max_batch)
+    for m in want_models:
+        if m not in want_ladder:
+            ladder_problems.append(
+                f"{m}: no board row carries hw_batch_max, so the expected batch ladder is "
+                "unknown — re-run the sweep with a bundle built after 2026-08-07, aggregate "
+                "the board arm too, or pass --max-batch")
+    if want_ladder:
+        print("expected batch ladder (per model, from the bitstream's hw_batch_max): "
+              + ", ".join(f"{m} 1..{max(b)}" for m, b in sorted(want_ladder.items())))
     # The EXPECTED matrix, asserted rather than inferred. Checking only that whatever showed
     # up has all six batches lets a half-finished sweep report CLEAN — which it did, when five
     # of six Xeon passes were refused by the load guard and the one that landed looked
@@ -281,14 +350,20 @@ def main():
                   [('kria', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')] +
                   [('xeon', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')])
     have = {(r['platform'], r['arm'], r['model'], r['weight_fmt']) for r in rows}
-    missing = []
+    missing = list(ladder_problems)
     for cell in want_cells:
+        want_batches = want_ladder.get(cell[2])
         if cell not in have:
             missing.append(f"{'/'.join(cell)}: ENTIRELY ABSENT")
             continue
+        if want_batches is None:
+            continue                      # ladder unknown — already reported once, per model
         got = {r['batch'] for r in rows
                if (r['platform'], r['arm'], r['model'], r['weight_fmt']) == cell}
-        if got != want_batches:
+        if got - want_batches:
+            missing.append(f"{'/'.join(cell)}: b={sorted(got - want_batches)} is above this "
+                           f"model's ceiling of {max(want_batches)} — wrong bitstream?")
+        if want_batches - got:
             missing.append(f"{'/'.join(cell)}: missing b={sorted(want_batches - got)}")
     for cell in sorted(have - set(want_cells)):
         missing.append(f"{'/'.join(str(c) for c in cell)}: UNEXPECTED (not in the report matrix)")

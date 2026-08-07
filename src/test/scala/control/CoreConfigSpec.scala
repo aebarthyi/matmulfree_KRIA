@@ -60,15 +60,23 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "the deployable set is exactly the three released checkpoints" in {
-      // `presets` also carries candidates (buildable, not shipped); `deployable` is what the
-      // board bundle and the report quote, and that must not grow by accident.
+      // `deployable` is what the board bundle and the report quote, and that must not grow
+      // by accident.
       CoreConfig.deployable.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
     }
 
-    "candidates are buildable but never mistaken for deployable" in {
+    // With B8 shipped and the B6 control retired (2026-08-07) there is nothing under
+    // evaluation, so the whole buildable registry IS the deployable set. The mechanism stays
+    // — a future candidate goes back into `candidates` — but while it is empty, every name
+    // `make build PRESET=` accepts is a name the report quotes. Both halves are asserted:
+    // that candidates is empty, and that a non-empty one would still be disjoint and
+    // reachable, so re-adding one cannot silently skip the check.
+    "the buildable registry is exactly the deployable set while no candidate is open" in {
+      CoreConfig.candidates mustBe empty
       CoreConfig.candidates.keySet.intersect(CoreConfig.deployable.keySet) mustBe empty
       CoreConfig.presets mustBe (CoreConfig.deployable ++ CoreConfig.candidates)
-      CoreConfig.candidates.keys.foreach { n => CoreConfig.byName(n) mustBe CoreConfig.candidates(n) }
+      (CoreConfig.deployable.keys ++ CoreConfig.candidates.keys)
+        .foreach { n => CoreConfig.byName(n) mustBe CoreConfig.presets(n) }
     }
 
     // B8 fits only because the lane accumulators move into DSP48s (~22 pp of LUT at B6);
@@ -86,24 +94,9 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       }
     }
 
-    // The B6 configs are retained as candidates, not archived, because they are the baseline
-    // B8 was promoted over and that comparison is not finished (the five-pass board set was
-    // B6 with a serial readback; readback threading landed the same day). They must stay
-    // genuinely B6 — an accidental copy of the shipped config would make the control useless
-    // while still appearing to run.
-    "the retained B6 baselines are actually B6" in {
-      CoreConfig.candidates.filter(_._1.endsWith("_b6")).foreach { case (n, c) =>
-        withClue(n) {
-          c.batchSize     mustBe 6
-          c.packedWeights mustBe true
-          c.plClkMhz      mustBe 250     // same rung, so a B6-vs-B8 delta is not a clock delta
-        }
-      }
-      CoreConfig.candidates.count(_._1.endsWith("_b6")) mustBe 3
-    }
-
     // These four fields ARE the conclusion of the optimization program: batching amortizes
-    // the weight stream (B4->B6 measured +11.8%, B8 promoted 2026-08-06), 1.6-bit packing
+    // the weight stream (B4->B6 measured +11.8%, B6->B8 +11.5-15.4% at b=8 and free below it),
+    // 1.6-bit packing
     // cuts the binding traffic ~20% (+4.3% at 2.7B b=6), 128-bit m_axis stops STORE being the
     // batch bottleneck, and 250 is the top reachable rung. Any preset that loses one of them
     // is a regression, not a variant — an ablation belongs on the `exploration` branch.

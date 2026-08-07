@@ -103,8 +103,16 @@ MODEL_SHAPES := $(shell printf '%s' '$(notdir $(MODEL))' | sed -E 's/^MMfreeLM-/
 # ENV="K=V K=V" is appended LAST so it wins under `env` — the only way to get a tuning
 # variable to the workload, since sudo strips the caller's environment. e.g.
 #   make run PRESET=... ENV="MMFREE_SPLIT_CHUNKS=0"     # disable column-tile splitting
+#
+# MMFREE_HW_BATCH is the manifest's own MMFREE_BATCH, handed through under a name BATCH=
+# cannot shadow. It has to be separate: BATCH=b overrides MMFREE_BATCH to the RUNTIME batch,
+# which is what the engine needs (cmpBatch) but leaves nothing carrying the bitstream's
+# compile-time ceiling — so the runner's `hw_batch` column was a duplicate of `batch` and no
+# consumer could tell a b=1..6 sweep of a B6 build (complete) from the same rows out of a B8
+# build (missing two). The runner emits this as `hw_batch_max`.
 GEOM_ENV = $$(grep -E '^(MMFREE_|NUM_DMA|MM2S_WIDTH|S2MM_WIDTH)' $(MANIFEST) | tr '\n' ' ') \
            MMFREE_MANIFEST=$(MANIFEST_ABS) \
+           MMFREE_HW_BATCH=$$(sed -n 's/^MMFREE_BATCH=//p' $(MANIFEST)) \
            $(if $(BATCH),MMFREE_BATCH=$(BATCH),) \
            $(if $(strip $(MODEL_SHAPES)),MMFREE_SHAPES=$(MODEL_SHAPES),) \
            $(if $(SHAPES),MMFREE_SHAPES=$(SHAPES),) \
@@ -188,7 +196,7 @@ gate: runner-bin
 # reference verbatim, which the runner reports as ROW PERMUTATION. Non-zero exit on any
 # mismatch. Run it once per bitstream, not per sweep; it costs B single-stream generations
 # on top of the serve run. STREAMS defaults to the preset's compile-time batch.
-#   sudo make streams PRESET=mmfree_370m_b8            # all 8 rows of a B8 build
+#   sudo make streams PRESET=mmfree_370m               # all 8 rows of a B8 build
 #   sudo make streams PRESET=mmfree_2_7b STREAMS=6 GEN=32
 # STREAMS_PROMPT must tokenize to at least STREAMS tokens — the runner refuses a config
 # where two rotations coincide rather than reporting a weaker check as a pass.

@@ -33,6 +33,12 @@
 #   BITSTREAM_ONLY=0    set 1 to stop after the bitstream/XSA (steps 1-3)
 #   PACKAGE_ONLY=0      set 1 to skip steps 1-3 and package the existing
 #                       build/t_matmul.xsa into transfer/<preset>/ (steps 4-6)
+#   STAGE_ONLY=0        set 1 to re-stage ONLY the preset-independent bundle parts
+#                       (board Makefile + scripts + C++ sources) and exit. No Chisel,
+#                       no Vivado, no preset needed — this is what to run after editing
+#                       anything under software/ or scripts/, since the board compiles
+#                       from transfer/src/ and a stale bundle silently measures old code.
+#                       `make stage` is the wrapper.
 
 set -euo pipefail
 
@@ -97,6 +103,81 @@ OVERLAY_DIR="$REPO_ROOT/build/overlay"
 # the u-dma-buf driver, the board Makefile + scripts) are staged once into transfer/.
 BUNDLE_ROOT="$REPO_ROOT/transfer"
 TRANSFER_DIR="$BUNDLE_ROOT/presets/$PRESET"
+
+# Shared, preset-independent bundle parts (staged once; idempotent — safe every build).
+stage_shared() {
+    # Board entrypoint + on-board scripts (tracked sources in scripts/, staged here).
+    cp "$SCRIPT_DIR/transfer.mk"        "$BUNDLE_ROOT/Makefile"
+    cp "$SCRIPT_DIR/deploy_kria.sh"     "$BUNDLE_ROOT/deploy_kria.sh"
+    cp "$SCRIPT_DIR/power_bench.sh"     "$BUNDLE_ROOT/power_bench.sh"
+    cp "$SCRIPT_DIR/bench_batch.sh"     "$BUNDLE_ROOT/bench_batch.sh"
+    cp "$SCRIPT_DIR/sweep_all.sh"       "$BUNDLE_ROOT/sweep_all.sh"
+    cp "$SCRIPT_DIR/final_sweep_board.sh" "$BUNDLE_ROOT/final_sweep_board.sh"
+    cp "$SCRIPT_DIR/split_sweep_csv.py" "$BUNDLE_ROOT/split_sweep_csv.py"
+    cp "$SCRIPT_DIR/cma_reclaim.sh"      "$BUNDLE_ROOT/cma_reclaim.sh"
+    cp "$SCRIPT_DIR/cma_boot_raise.sh"   "$BUNDLE_ROOT/cma_boot_raise.sh"
+    chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh" \
+             "$BUNDLE_ROOT/bench_batch.sh" "$BUNDLE_ROOT/sweep_all.sh" \
+             "$BUNDLE_ROOT/final_sweep_board.sh" \
+             "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/cma_reclaim.sh" \
+             "$BUNDLE_ROOT/cma_boot_raise.sh"
+    cp "$SCRIPT_DIR/board.conf.example" "$BUNDLE_ROOT/board.conf.example" 2>/dev/null || true
+
+    # u-dma-buf driver source (vendored submodule), so the board needs no external module.
+    local UDMABUF_SRC="$REPO_ROOT/external/udmabuf"
+    if [ -f "$UDMABUF_SRC/u-dma-buf.c" ]; then
+        mkdir -p "$BUNDLE_ROOT/udmabuf"
+        cp "$UDMABUF_SRC"/u-dma-buf.c "$UDMABUF_SRC"/u-dma-buf-ioctl.h \
+           "$UDMABUF_SRC"/Makefile "$UDMABUF_SRC"/Kconfig "$UDMABUF_SRC"/LICENSE \
+           "$BUNDLE_ROOT/udmabuf/" 2>/dev/null || true
+    else
+        echo "WARN: external/udmabuf submodule not initialized — transfer/ won't carry the" >&2
+        echo "      u-dma-buf driver; run 'git submodule update --init --recursive' and rebuild." >&2
+    fi
+
+    # C++ sources the board native-compiles. The nesting is PRESERVED (software/ and
+    # matmulfreellmCPU/cpp side by side under src/) so the component sub-Makefiles —
+    # fpga_runner's ../../../matmulfreellmCPU/cpp etc. — resolve and compile unchanged.
+    # Pre-create the dest dirs: rsync won't make multiple missing parent levels
+    # (e.g. the intermediate src/matmulfreellmCPU/), and --mkpath isn't universal.
+    mkdir -p "$BUNDLE_ROOT/src/software" "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp"
+    # Exclude build artifacts and large NON-build data: stray model blobs that may sit in
+    # the submodule tree (the real model lives in transfer/models/), and the golden/ test
+    # references (validation-branch only — the board builds just the mmfreecpu lib + runner).
+    # --delete-excluded (not just --delete): prune excluded files from the dest too, so a
+    # stray model blob / host build/ already staged there is removed, not merely skipped.
+    local RSX="--delete --delete-excluded --exclude=build/ --exclude=*.o --exclude=*.a \
+               --exclude=*.so --exclude=__pycache__/ --exclude=.git --exclude=*.mmfree \
+               --exclude=*.mmtok --exclude=golden/ --exclude=golden_fixedp/"
+    if command -v rsync >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        rsync -a $RSX "$REPO_ROOT/software/"               "$BUNDLE_ROOT/src/software/"
+        # shellcheck disable=SC2086
+        rsync -a $RSX "$REPO_ROOT/matmulfreellmCPU/cpp/"   "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp/"
+    else
+        echo "WARN: rsync not found — falling back to cp (won't prune stale files)." >&2
+        mkdir -p "$BUNDLE_ROOT/src/software" "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp"
+        cp -a "$REPO_ROOT/software/."             "$BUNDLE_ROOT/src/software/"
+        cp -a "$REPO_ROOT/matmulfreellmCPU/cpp/." "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp/"
+    fi
+    [ -f "$REPO_ROOT/matmulfreellmCPU/cpp/CMakeLists.txt" ] || \
+        echo "WARN: matmulfreellmCPU submodule not initialized — fpga_runner won't build on the board." >&2
+}
+
+# A source-only change (software/, scripts/) needs the bundle re-staged but no Vivado: the
+# board compiles from transfer/src/ and reads transfer/Makefile, so an un-staged edit means
+# the next sweep measures the previous code with no sign that it did. Defined here, before
+# any build step, so STAGE_ONLY can reach it without a preset or a toolchain.
+if [ "$STAGE_ONLY" = "1" ]; then
+    echo "==> STAGE_ONLY=1: re-staging the preset-independent bundle parts only"
+    stage_shared
+    echo
+    echo "# transfer/{Makefile,*.sh,split_sweep_csv.py,src/} re-staged from the repo."
+    echo "# Nothing preset-specific was touched — no bitstream, no manifest, no model."
+    echo "# Next: make deploy BOARD=... ; then on the board: make build   (native recompile)"
+    exit 0
+fi
+
 
 # ─── Pre-flight: required tools ─────────────────────────────────────────────
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not on PATH. Source Vivado settings64.sh / install it." >&2; exit 1; }; }
@@ -198,65 +279,6 @@ if [ -f "$REPO_ROOT/build/pl_clk_actual.env" ] && [ -f "$TRANSFER_DIR/preset.env
     echo "#   constrained fabric clock: ${_act} MHz (requested ${PL_CLK_MHZ})"
 fi
 
-# Shared, preset-independent bundle parts (staged once; idempotent — safe every build).
-stage_shared() {
-    # Board entrypoint + on-board scripts (tracked sources in scripts/, staged here).
-    cp "$SCRIPT_DIR/transfer.mk"        "$BUNDLE_ROOT/Makefile"
-    cp "$SCRIPT_DIR/deploy_kria.sh"     "$BUNDLE_ROOT/deploy_kria.sh"
-    cp "$SCRIPT_DIR/power_bench.sh"     "$BUNDLE_ROOT/power_bench.sh"
-    cp "$SCRIPT_DIR/bench_batch.sh"     "$BUNDLE_ROOT/bench_batch.sh"
-    cp "$SCRIPT_DIR/sweep_all.sh"       "$BUNDLE_ROOT/sweep_all.sh"
-    cp "$SCRIPT_DIR/final_sweep_board.sh" "$BUNDLE_ROOT/final_sweep_board.sh"
-    cp "$SCRIPT_DIR/split_sweep_csv.py" "$BUNDLE_ROOT/split_sweep_csv.py"
-    cp "$SCRIPT_DIR/cma_reclaim.sh"      "$BUNDLE_ROOT/cma_reclaim.sh"
-    cp "$SCRIPT_DIR/cma_boot_raise.sh"   "$BUNDLE_ROOT/cma_boot_raise.sh"
-    chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh" \
-             "$BUNDLE_ROOT/bench_batch.sh" "$BUNDLE_ROOT/sweep_all.sh" \
-             "$BUNDLE_ROOT/final_sweep_board.sh" \
-             "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/cma_reclaim.sh" \
-             "$BUNDLE_ROOT/cma_boot_raise.sh"
-    cp "$SCRIPT_DIR/board.conf.example" "$BUNDLE_ROOT/board.conf.example" 2>/dev/null || true
-
-    # u-dma-buf driver source (vendored submodule), so the board needs no external module.
-    local UDMABUF_SRC="$REPO_ROOT/external/udmabuf"
-    if [ -f "$UDMABUF_SRC/u-dma-buf.c" ]; then
-        mkdir -p "$BUNDLE_ROOT/udmabuf"
-        cp "$UDMABUF_SRC"/u-dma-buf.c "$UDMABUF_SRC"/u-dma-buf-ioctl.h \
-           "$UDMABUF_SRC"/Makefile "$UDMABUF_SRC"/Kconfig "$UDMABUF_SRC"/LICENSE \
-           "$BUNDLE_ROOT/udmabuf/" 2>/dev/null || true
-    else
-        echo "WARN: external/udmabuf submodule not initialized — transfer/ won't carry the" >&2
-        echo "      u-dma-buf driver; run 'git submodule update --init --recursive' and rebuild." >&2
-    fi
-
-    # C++ sources the board native-compiles. The nesting is PRESERVED (software/ and
-    # matmulfreellmCPU/cpp side by side under src/) so the component sub-Makefiles —
-    # fpga_runner's ../../../matmulfreellmCPU/cpp etc. — resolve and compile unchanged.
-    # Pre-create the dest dirs: rsync won't make multiple missing parent levels
-    # (e.g. the intermediate src/matmulfreellmCPU/), and --mkpath isn't universal.
-    mkdir -p "$BUNDLE_ROOT/src/software" "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp"
-    # Exclude build artifacts and large NON-build data: stray model blobs that may sit in
-    # the submodule tree (the real model lives in transfer/models/), and the golden/ test
-    # references (validation-branch only — the board builds just the mmfreecpu lib + runner).
-    # --delete-excluded (not just --delete): prune excluded files from the dest too, so a
-    # stray model blob / host build/ already staged there is removed, not merely skipped.
-    local RSX="--delete --delete-excluded --exclude=build/ --exclude=*.o --exclude=*.a \
-               --exclude=*.so --exclude=__pycache__/ --exclude=.git --exclude=*.mmfree \
-               --exclude=*.mmtok --exclude=golden/ --exclude=golden_fixedp/"
-    if command -v rsync >/dev/null 2>&1; then
-        # shellcheck disable=SC2086
-        rsync -a $RSX "$REPO_ROOT/software/"               "$BUNDLE_ROOT/src/software/"
-        # shellcheck disable=SC2086
-        rsync -a $RSX "$REPO_ROOT/matmulfreellmCPU/cpp/"   "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp/"
-    else
-        echo "WARN: rsync not found — falling back to cp (won't prune stale files)." >&2
-        mkdir -p "$BUNDLE_ROOT/src/software" "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp"
-        cp -a "$REPO_ROOT/software/."             "$BUNDLE_ROOT/src/software/"
-        cp -a "$REPO_ROOT/matmulfreellmCPU/cpp/." "$BUNDLE_ROOT/src/matmulfreellmCPU/cpp/"
-    fi
-    [ -f "$REPO_ROOT/matmulfreellmCPU/cpp/CMakeLists.txt" ] || \
-        echo "WARN: matmulfreellmCPU submodule not initialized — fpga_runner won't build on the board." >&2
-}
 stage_shared
 
 echo
