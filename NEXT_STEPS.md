@@ -2,6 +2,47 @@
 
 ## 0. TOMORROW, in this order
 
+### ⏰ 1. RERUN THE XEON SWEEP ON A QUIET BOX — you asked to be reminded
+
+The Xeon half is the only unclean part of the data set, and the reason is contention, not the
+CPU. Two separate corruptions came from work happening on the build server WHILE it measured:
+
+* a stray VS Code `rg --files --hidden` held ~11 cores for 50 minutes;
+* my own compiles. `2.7B/t20_p5` 2-bit b=6 read **31.82** with me building, **48.64** on the
+  same binary with the box quiet. `t20` uses all 20 logical CPUs, so anything else lands
+  directly on it — `t10` survived the same window because it had ten spare threads.
+
+**Preconditions, all of which have bitten:**
+
+1. `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj` — RAPL resets on every reboot
+   and the script refuses to start without it (correctly: empty power columns are not final).
+2. Close VS Code. Its file-search `rg` is what started this.
+3. Nobody — including any agent — compiles, tests or builds on the box until it finishes.
+   Ask me to stay off it; I will.
+4. The binary must be the AVX-512 build. The guard now *probes* the binary rather than
+   counting instructions (a plain `make` leaves 167 zmm from libmmfreecpu.a while the
+   header-only ternary kernels drop to 256-bit, and the old `zmm -eq 0` test passed that), and
+   a second guard aborts if the binary changes mid-sweep. Rebuild deliberately:
+   `make -C software/integration/fpga_runner clean && MMFREE_SIMD=X86_512 make -C software/integration/fpga_runner`
+
+**Then either** re-run everything for one consistent set (~3 h for two more passes, longer for
+five), **or** top up only the flagged cells (~20 min):
+
+    PASSES=7 MODELS="ridger/MMfreeLM-2.7B" BACKENDS="cpu-2bit"         BATCHES="4 6" ./scripts/final_sweep_xeon.sh
+    PASSES=7 MODELS="ridger/MMfreeLM-370M" BACKENDS="cpu-2bit cpu-1p6" BATCHES="2"   ./scripts/final_sweep_xeon.sh
+    PASSES=7 MODELS="ridger/MMfreeLM-1.3B" BACKENDS="cpu-2bit"         BATCHES="5"   ./scripts/final_sweep_xeon.sh
+
+Note what the flags are NOT: they are multi-modal cells, not noise. int8 is stable everywhere
+(±2–6%) while the packed encodings swing up to 25% at specific batches, so more passes may
+firm up a median without collapsing the modes. Deferred deliberately 2026-08-06.
+
+**And the Xeon has no b=7/8 rows at all**, which now matters: the board ships B8, so at b=8
+the FPGA has no CPU denominator. Extending the ladder is another ~3 h and can legitimately
+change which thread count wins per (model, encoding), since that is chosen across the whole
+ladder. Decide that before quoting any b=8 speedup.
+
+### Then, shelved from 2026-08-06 (all four)
+
 0a. **FINISH THE B8 PROMOTION — bundle assembly, not yet done.** The Chisel side landed
    2026-08-06: `mmfree_370m/_1_3b/_2_7b` are now batchSize=8 + dspAccum, the B6 configs are
    retained as `mmfree_*_b6` candidates, and the full suite passes. **No Vivado is
@@ -34,19 +75,24 @@
      FPGA currently has no denominator. Extending it is ~3 h AND can legitimately change which
      thread count wins per (model, encoding), since that is chosen across the whole ladder.
 
-0. **RE-MEASURE THE BOARD ARM.** Readback is now threaded by default (2026-08-06), worth
-   **+20.4% at 370M and +11.1% at 2.7B** at b=6. Every board row in
-   `reports/final/dataset.csv` was taken with the serial readback and is that much low. Both
-   geometries pass the gate with `MMFREE_RB_MIN_ELEMS=1` (full coverage), so this is a
-   measurement job, not a verification one:
+0. **Aggregator: the b=1..6 ceiling.** `final_dataset.py:274` hardcodes
+   `want_batches = set(range(1, 7))`, so the B8 set in `~/results/final_b8/` cannot validate
+   end-to-end. Make the ceiling per-cell, read from the preset's `MMFREE_BATCH` — a global
+   widen to 1..8 would instead make the retained B6 set incomplete-by-definition, since b=7/8
+   are physically impossible on those bitstreams. Prerequisite for a clean sheet either way.
 
-       cd ~/transfer && sudo PASSES=5 ./final_sweep_board.sh fpga     # ~1 h, fpga arm only
+0b. **The 1.3B pass-3 anomaly** (§3 †). b=6 read 34.23 tok/s with a NORMAL 130 µs pack, so the
+   pack bimodality does not explain it — the phase breakdown in
+   `~/results/final_b8/mmfree_1_3b_b8_final_p3_phases.csv` will say which phase ate it. 1.3B is
+   the only model affected and it shares 2.7B's bitstream, so it is host-side and shape-
+   specific. Blocks quoting 1.3B at all.
 
-   The CPU arms are unaffected (they never touch the engine), so they do not need redoing.
-   **Watts must come from the new runs, not be carried over**: threading costs 0 mW on 370M
-   but 289 mW on 2.7B, so the perf/W gain is +20.5% and +5.9% respectively — the throughput
-   delta is NOT the perf/W delta. To A/B against the old software on the same binary, set
-   `MMFREE_RB_THREADS=1`.
+0c. **The B6 control at five passes.** Interrupted 2026-08-06 at 370M p2 (SIGINT). B8-vs-B6
+   currently rests on single A/B runs at b=6 — enough to establish "B8 is free below b=8" to
+   ~1%, not enough for a table. Run before the B6 bundles are overwritten, or from the retained
+   `mmfree_*_b6` presets after §0a assembles them. `MMFREE_RB_THREADS=1` A/Bs the old software
+   on the same binary. **Watts must come from the new runs, not be carried over**: threading
+   costs 0 mW on 370M but 289 mW on 2.7B, so perf/W and throughput deltas differ.
 
 1. ~~**Distinct-prompt stream check.**~~ WRITTEN 2026-08-06, not yet run on hardware.
    `--distinct-prompts` gives stream *b* its own prompt (a left-rotation of the ids, so all
@@ -147,8 +193,38 @@ Three presets, one per released MMfreeLM checkpoint, all B6 + 1.6-bit packed wei
 128-bit m_axis at a true 250 MHz. Measured on a KRIA KV260, decode tok/s, POWER=1,
 all gates PASS (engine bit-identical to the CPU reference), all `streams_ok=1`.
 
-**Medians over five passes**, straight from `reports/final/dataset.csv` (2026-08-06) — that
-CSV is the authority; this table is a rendering of it:
+### B8 — the shipped configuration, measured 2026-08-06
+
+Five passes, threaded readback (every one of the 120 runs logged `# readback: threaded x4`),
+POWER=1, gates PASS on all three including the +0.002 ns 2.7B. In `~/results/final_b8/`.
+
+| preset | b=1 | b=4 | b=6 | b=7 | **b=8** | W @b8 | tok/J |
+|---|---|---|---|---|---|---|---|
+| `mmfree_370m` | 41.31 | 107.51 | 123.46 | 132.03 | **137.67** | 5.52 | 24.96 |
+| `mmfree_1_3b` | 20.38 | 54.05 | 57.89† | 68.51 | **71.53**† | 6.17 | 11.60 |
+| `mmfree_2_7b` | 11.73 | 33.12 | 38.63 | 42.66 | **44.58** | 6.39 | 6.97 |
+
+**B8 is free at low batch, which is the result that justifies the promotion.** Its b=6 rows sit
+on top of the B6 bitstream's b=6 measured on the same software: 370M 123.46 vs 124.39 (−0.7%),
+2.7B 38.63 vs 38.55 (+0.2%). So the extra logic and thinner slack cost nothing below b=8, and
+b=8 adds +11.5% (370M) / +15.4% (2.7B). Best-point to best-point against B6: **370M +10.7%,
+2.7B +15.6%**. Spreads are 0.2–1.5% on 370M and 0.2–1.0% on 2.7B across all eight batches.
+
+Against the numbers still in the report (103.16 / 34.41, B6 + serial readback), the two changes
+of 2026-08-06 together are **+33% on 370M and +30% on 2.7B**.
+
+† 1.3B only. Its b=6 cell reads 62.05 / 53.79 / **34.23** / 57.89 / 62.17 — 48% spread, still
+below its own b=5 — and host `pack` (125/204/130/164/126 µs/call) explains every pass EXCEPT
+pass 3, which had a normal 130 µs pack and still read 34.23. b=8 shows the milder pack version
+(one pass at 268 µs/call dragging 71.5 → 63.5), so its median rests on 4 of 5 good passes.
+2.7B runs the SAME bitstream and is rock-solid, so this is host-side and specific to 1.3B's
+shapes. Not quotable until pass 3 is diagnosed — see §0.
+
+### B6 — the retained baseline
+
+**Medians over five passes**, straight from `reports/final/dataset.csv` (2026-08-06). ⚠️ Taken
+with the SERIAL readback, so it is 11–20% low against anything measured after that flipped —
+it is the historical record and the B8 control, not a current number:
 
 | preset | b=1 | b=2 | b=3 | b=4 | b=5 | b=6 | WNS @250 | SOM avg W (b=6) |
 |---|---|---|---|---|---|---|---|---|
