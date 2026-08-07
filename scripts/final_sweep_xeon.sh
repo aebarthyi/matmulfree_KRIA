@@ -244,6 +244,99 @@ settle() {
     done
 }
 
+# ── No FOREIGN process may be burning a core ────────────────────────────────────────
+# settle() above deliberately gives up and starts anyway after SETTLE_MAX, because its own
+# tail holds the 1-minute average over the threshold for minutes and a strict guard would
+# abort a legitimate multi-pass run. That fallback is also the hole contention comes through:
+# on 2026-08-07 a VS Code `rg --files --hidden --no-ignore --follow` walking a 9.6 GB model
+# tree held twelve cores for ten minutes, and the sweep was fifteen minutes from starting
+# underneath it — which is how the previous Xeon set was corrupted (2.7B t20 2-bit b=6 read
+# 31.82 tok/s against 48.64 on the same binary with the box quiet).
+#
+# A load average cannot separate our own decaying tail from someone else's live hog. A process
+# list can: anything in a DIFFERENT SESSION burning a core is foreign by definition, and every
+# process this script spawns shares our session. So this aborts where settle() shrugs.
+#
+# %CPU has to be instantaneous — `ps -o pcpu` is an average over the process's whole lifetime,
+# so a long-lived editor that burned CPU an hour ago reads high while idle now, and a hog that
+# just started reads low. Hence two samples of /proc/<pid>/stat.
+# Thresholds are in percent of ONE core, and there are two because one number cannot separate
+# "an editor and an agent idling at half a core each" from "something eating the machine". A
+# single foreign process at a full core is a hog; a handful adding up to 1.5 cores is a busy
+# box. Below both, the residue is a few percent of a 20-thread run and not worth aborting six
+# hours over — measured: this session's own agent process sits at ~58% while working.
+MY_SID=$(awk '{print $6}' "/proc/$$/stat" 2>/dev/null)
+FOREIGN_CPU_MAX="${FOREIGN_CPU_MAX:-100}"      # abort if any ONE foreign process exceeds this
+FOREIGN_TOTAL_MAX="${FOREIGN_TOTAL_MAX:-150}"  # ...or if all of them together do
+FOREIGN_CPU_SHOW="${FOREIGN_CPU_SHOW:-25}"     # ...and report anything above this either way
+foreign_hogs() {
+    local interval="${1:-2}" hz f pid line rest ticks pct sid comm cl
+    hz=$(getconf CLK_TCK)
+    declare -A t0
+    for f in /proc/[0-9]*/stat; do
+        line=$(cat "$f" 2>/dev/null) || continue
+        pid=${f#/proc/}; pid=${pid%/stat}
+        rest=${line#*") "}                    # comm can contain spaces AND parens
+        set -- $rest
+        t0[$pid]=$(( ${12} + ${13} ))         # utime + stime, 1-based within rest
+    done
+    sleep "$interval"
+    for f in /proc/[0-9]*/stat; do
+        pid=${f#/proc/}; pid=${pid%/stat}
+        [ -n "${t0[$pid]:-}" ] || continue
+        # Skip kernel threads, which have no cmdline. NOT `[ -s ]`: procfs reports st_size 0
+        # for every one of these files, so a size test is false for real processes too and
+        # this guard would never fire at all — which is exactly how it first failed its own
+        # test. Read the first NUL-delimited field instead.
+        cl=""; IFS= read -r -d '' cl < "/proc/$pid/cmdline" 2>/dev/null
+        [ -n "$cl" ] || continue
+        line=$(cat "$f" 2>/dev/null) || continue
+        rest=${line#*") "}
+        comm=${line#*(}; comm=${comm%%)*}
+        set -- $rest
+        sid=${4}
+        [ "$sid" = "$MY_SID" ] && continue             # us, or something we spawned
+        ticks=$(( ${12} + ${13} - t0[$pid] ))
+        pct=$(( 100 * ticks / (hz * interval) ))
+        [ "$pct" -ge "$FOREIGN_CPU_SHOW" ] && printf '%d %d %s\n' "$pct" "$pid" "$comm"
+    done
+    return 0
+}
+assert_box_quiet() {
+    local seen max=0 total=0 pct rest
+    seen=$(foreign_hogs 2 | sort -rn)
+    [ -z "$seen" ] && return 0
+    while read -r pct rest; do
+        [ -n "$pct" ] || continue
+        [ "$pct" -gt "$max" ] && max=$pct
+        total=$((total + pct))
+    done <<< "$seen"
+    if [ "$max" -lt "$FOREIGN_CPU_MAX" ] && [ "$total" -lt "$FOREIGN_TOTAL_MAX" ]; then
+        printf '    foreign CPU: %d%% total, largest %d%% — under the limits, proceeding\n' \
+            "$total" "$max"
+        return 0
+    fi
+    local hogs; hogs=$(while read -r pct pid comm; do
+        printf '    %7s  %4s%%  %s\n' "$pid" "$pct" "$comm"; done <<< "$seen")
+    cat >&2 <<EOF
+
+ERROR: something outside this sweep is burning CPU ($total% total, largest $max%; limits are
+       $FOREIGN_CPU_MAX% for one process and $FOREIGN_TOTAL_MAX% together), so the next group
+       would measure contention rather than the model:
+
+$hogs
+
+The usual culprit is VS Code's file search (\`rg --files --hidden --no-ignore --follow\`) over
+transfer/models/ — closing the editor, or excluding that directory from search, fixes it.
+Every group already written is untouched and still valid; this aborts before starting another.
+
+Set FOREIGN_CPU_MAX/FOREIGN_TOTAL_MAX higher to relax it, or ALLOW_CONTENTION=1 to proceed —
+but then this is NOT the final data set, for the reason in the comment above this check.
+EOF
+    [ "${ALLOW_CONTENTION:-0}" = "1" ] || exit 1
+    echo "### ALLOW_CONTENTION=1: proceeding on a busy box" >&2
+}
+
 t0=$(date +%s); failed=""
 for model in $MODELS; do
     slug="${model##*-}"
@@ -262,7 +355,8 @@ for model in $MODELS; do
             echo
             echo "=== [$(date -Is)] $slug pass $pass, ${th} threads, gen=$g -> $out ==="
             assert_binary_unchanged
-            settle
+            settle                  # our own tail: waits, then shrugs
+            assert_box_quiet        # someone else's hog: waits for nothing, aborts
             OMP_THREADS="$th" MODELS="$model" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
             GEN="$g" REPS="$REPS" OUT="$out" \
                 ./scripts/bench_host_cpu.sh || failed="$failed ${slug}/t${th}p${pass}"
