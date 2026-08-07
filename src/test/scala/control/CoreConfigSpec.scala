@@ -302,15 +302,18 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       e("MMFREE_XDIM")            mustBe "32"
       e("MMFREE_SIGNED")          mustBe "1"
       e("MMFREE_SHAPES")          mustBe "370m"
-      e("MMFREE_BATCH")           mustBe "6"
+      e("MMFREE_BATCH")           mustBe "8"
       e("MMFREE_PACKED_WEIGHTS")  mustBe "1"
       e("NUM_DMA")                mustBe "4"
       e("MM2S_WIDTH")             mustBe "128"
       e("S2MM_WIDTH")             mustBe "128"       // outBeatLanes=4 * 32-bit lane
       e("PL_CLK_MHZ")             mustBe "250"
       e("UDMABUF_ACT_SZ")         mustBe "0x00010000" // maxN*portBytes = 4096*16 = 64 KiB
-      // OUT = batch*numColTilesMax*outLanesPerTile*outLaneBytes = 6*125*256*4, page-up
-      e("UDMABUF_OUT_SZ")         mustBe "0x000bc000"
+      // OUT = batch*numColTilesMax*outLanesPerTile*outLaneBytes = 8*125*256*4, page-up.
+      // This grew with the B8 promotion (B6 was 0x000bc000) and the DT overlay carries it,
+      // so a B8 bitstream on a B6 overlay is refused at mmfree_lib_open rather than silently
+      // drained into a buffer 254 KiB too small.
+      e("UDMABUF_OUT_SZ")         mustBe "0x000fa000"
     }
 
     "env udmabuf sizes equal the JSON byte counts for every preset" in {

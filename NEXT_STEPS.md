@@ -4,7 +4,7 @@
 
 0a. **FINISH THE B8 PROMOTION — bundle assembly, not yet done.** The Chisel side landed
    2026-08-06: `mmfree_370m/_1_3b/_2_7b` are now batchSize=8 + dspAccum, the B6 configs are
-   retained as `mmfree_*_b6` candidates, and `CoreConfigSpec` passes (23/23). **No Vivado is
+   retained as `mmfree_*_b6` candidates, and the full suite passes. **No Vivado is
    needed** — a clean re-emit of the promoted presets is byte-identical to the already-built
    B8 bitstreams (`mmfree_370m` sha 04645d6c… == `mmfree_370m_b8`; `mmfree_2_7b` 223bf241…
    == `mmfree_2_7b_b8`), so the bundles are a clone away.
