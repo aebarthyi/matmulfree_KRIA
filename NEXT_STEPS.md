@@ -5,13 +5,103 @@
 Both arms ran today. `reports/final/dataset.csv` is the merged set: **3 platforms-arms x 3
 models x b=1..8, five passes each on the board and the Xeon, POWER=1 on every row.** The
 aggregator's completeness check passes in full — no cell absent, no cell missing power, every
-FPGA row `streams_ok=1` — and **exactly one cell is flagged**, which is item 1 below.
+FPGA row `streams_ok=1` — and **exactly one cell is flagged**, which is item 2 below.
 
 ⚠️ `reports/` is gitignored. `dataset.csv` and every raw CSV live only on this build server
 (`~/results/final/`, `reports/host_cpu/final/`) and the board. The tables in §3 are the
 tracked copy; if the box is lost, they are what survives.
 
-### ⏰ 1. THE ONE FLAGGED CELL — `kria/1.3B/1p6/b7`, 13.97% spread. Diagnosed, not fixed.
+### ⏰ 1. BUILD THE TRUE SYSTOLIC ARRAY AND BENCH IT — planned 2026-08-07, execute next
+
+**Why.** What ships is NOT a systolic array. `SystolicArray.scala` instantiates a 2D grid of
+PEs, but no PE's input is ever driven by another PE's output — every PE reads the boundary
+pipeline and writes straight to the output port (the only cross-references in the file are
+`arr(0)(0).output.valid` and `arr(0)(doneCol).output.valid`, both completion signals). It is
+an **output-stationary broadcast MAC array**: one activation broadcasts to 32 columns, one
+weight beat broadcasts to 8 rows, each PE accumulates independently. The name is historical —
+the ORIGINAL design was systolic (weights down a per-row delay chain, bottom-row-only output)
+and was replaced when yDim became the batch dimension.
+
+That broadcast is the whole timing story of this project: one activation net drives
+**256 PE inputs**, and beating that fanout is what `actMaxFanout`, `colBankSize=4` and the
+maxN=8192 two-path fight were all about. So the experiment is: does nearest-neighbour
+dataflow buy back the slack, and is there enough of it to raise the clock rung or grow the
+array? **Do not expect tok/s to move** — decode is weight-bandwidth-bound and the 200→250
+rung was measured at only ~5%. Timing and routing headroom is the result; throughput is the
+control.
+
+**The register arithmetic says build it** (shipped geometry, xDim=32 yDim=8 aWidth=16):
+
+    dataflow                 pipeline regs   max fanout of one activation net
+    shipped  colBankSize=4      5 120 bits       32 PE inputs
+    control  colBankSize=1     20 480 bits        8
+    true systolic              16 576 bits        1     (8192 pass-through + 8384 skew)
+
+True systolic is CHEAPER in registers than the existing mechanism taken to its limit, and
+gets fanout to 1. That is the case for spending the build.
+
+**Phase 0 — the free control, do this FIRST (~15 min, no new RTL).** `colBankSize=1` is
+already a zero-RTL approximation: it stages every column, cutting fanout 32→8. OOC-synth the
+shipped 2.7B geometry at colBankSize=1 and compare WNS against the shipped colBankSize=4.
+If that alone recovers most of the slack, the true array's marginal value is small and this
+whole item shrinks to a footnote. Cheap, and it can only inform the decision:
+
+    rm -rf generated/mmfree_2_7b_cb1 && ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_2_7b_cb1 generated/mmfree_2_7b_cb1
+    vivado -mode batch -source scripts/ooc_synth.tcl -tclargs mmfree_2_7b_cb1
+
+**Phase 1 — RTL.** New module, do NOT modify `SystolicArray` (the shipped SV must stay
+byte-identical or `clone_preset_hw.sh` refuses every legitimate clone). Same IO bundle, same
+output-stationary semantics, all yDim rows exposed, so it is a drop-in for `Core` and the
+existing `SystolicArrayModel.compute` reference model applies unchanged.
+
+* per PE: `actOut := RegNext(actIn)` passed to PE(r, c+1); `wtOut := RegNext(wtIn)` passed to
+  PE(r+1, c). Nothing else crosses.
+* input skew, triangular: activation for row r delayed r cycles; weight for column c delayed
+  c cycles. Derivation — act[r][t] injected at PE(r,0) at t+r reaches PE(r,c) at t+r+c;
+  w[t][c] injected at PE(0,c) at t+c reaches PE(r,c) at t+c+r. They meet. Any pair of skews
+  differing by a constant works; (r, c) is the minimal one.
+* completion: the deepest PE is (yDim-1, xDim-1), valid at **N + xDim + yDim - 2** = N+38.
+  Reuse the `draining_state` pattern colBankSize already added — accumulators hold, so no
+  output de-skew buffer is needed.
+
+**Phase 2 — equivalence, the test that matters.** It must be bit-identical to the broadcast
+array, not merely close: same math, different dataflow. Extend `SystolicArraySpec` with the
+`runAndCheckBanked` pattern at `maxSkew = xDim + yDim` — that helper already polls for a
+late `output.valid`, which is exactly the systolic drain. Reuse `SystolicArrayModel.compute`
+untouched; if it needs changing, the dataflow is wrong.
+
+**Phase 3 — config.** Add `trueSystolic: Boolean` to `CoreConfig`, and a candidate preset
+`mmfree_2_7b_sys` = `MMFree_2_7B.copy(trueSystolic = true)`. ⚠️ **`CoreConfigSpec` will fail**
+— the test "the buildable registry is exactly the deployable set while no candidate is open"
+asserts `candidates mustBe empty` (added 2026-08-07 when B6 retired). Relax it to the
+disjoint/reachable half, which is what it was before, and keep the empty check for later.
+Build 2.7B, not 370M: maxN=8192 is the geometry that fought 250 MHz, so it is the real test.
+
+**Phase 4 — bitstream (~50 min).** `rm -rf generated/mmfree_2_7b_sys` first (EmitCore does
+not clean, and stale .sv breaks every hash comparison). ⚠️ The shipped 2.7B closes at
+**+0.002 ns** — the thinnest margin anything here has shipped with — so a new array structure
+missing 250 is a likely outcome, not a failure of the idea. If it misses, rebuild BOTH arms
+at the 200 rung and compare there; a 250-vs-200 comparison would measure the clock, not the
+dataflow.
+
+**Phase 5 — board A/B, one session, both arms.** Do NOT compare against yesterday's numbers:
+isolated cells move 6-9% between sessions ([[xeon-baseline-facts]]), so the control has to be
+re-measured in the same session as the variant.
+
+    make model PRESET=mmfree_2_7b_sys && make deploy
+    # on the board, for EACH of mmfree_2_7b and mmfree_2_7b_sys:
+    sudo make deploy-hw PRESET=$p && make gate PRESET=$p && sudo make streams PRESET=$p
+    ./bench_batch.sh PRESET=$p TAG=sysab GEN=64 REPS=3 WARMUP=1 POWER=1
+
+POWER=1 on both arms, `TAG=` on both so neither clobbers the final set. The gate is the
+correctness proof — a wrong dataflow produces plausible numbers, not a crash — and `streams`
+matters more than usual here, because skew is exactly the mechanism that could mis-order rows.
+
+**What to read.** `bl_compute_us_call` is the phase that should move; `decode_tok_s` probably
+will not. If COMPUTE improves and decode does not, that is the bandwidth wall confirmed, and
+it is a publishable result in its own right: the array was never the bottleneck.
+
+### ⏰ 2. THE ONE FLAGGED CELL — `kria/1.3B/1p6/b7`, 13.97% spread. Diagnosed, not fixed.
 
 It is the 1.3B host-`pack` bimodality again, and the evidence is unambiguous. Five passes,
 decode against the pack cost that produced it:
@@ -43,7 +133,7 @@ Start here: `bl_pack_us_call` is already in every CSV, so the mode is visible pe
 re-running anything. [[pack-bimodal-1p3b-b6]] has the history (it was b=6 last time — the
 bimodality MOVES with the batch, which is itself a clue).
 
-### ⏰ 2. STILL UNDECIDED: how to quote the FPGA-vs-Xeon ratio at b=8
+### ⏰ 3. STILL UNDECIDED: how to quote the FPGA-vs-Xeon ratio at b=8
 
 The Xeon's batch curve is non-monotonic and reproducible (§3), so at b=8 it sits in a trough
 for 370M and 1.3B. Equal-batch and best-point-vs-best-point are both defensible and they are
@@ -52,7 +142,7 @@ best thread count, which argues for best-point; equal-batch is the apples-to-app
 identical work. **Pick one deliberately and say which in the report.** I can produce either
 from the existing data; nothing needs re-measuring.
 
-### 3. What is clean and quotable right now
+### 4. What is clean and quotable right now
 
 Everything except 1.3B at b=7/b=8. Specifically: all three gates PASS bit-exact, all three
 `make streams` row-independence checks OK — **including 2.7B and including B=8, the widest
@@ -78,7 +168,7 @@ every Xeon cell is stable to <=1.7% jackknife with zero flags.
     Non-monotonic, and reproducibly so: 370M peaks at b=7 and drops 21% at b=8; 2.7B barely
     scales with batch at all. This is what makes §2 a real decision rather than a formality.
 
-**Perf/W at b=8, equal batch, 2-bit on the CPU side.** ⚠️ The 1.3B row inherits §1's caveat.
+**Perf/W at b=8, equal batch, 2-bit on the CPU side.** ⚠️ The 1.3B row inherits §2's caveat.
 
     model  KRIA t/s  KRIA W  tok/J | Xeon t/s  Xeon W  tok/J | advantage
     370M     138.19    5.56  24.84 |   164.62  100.31  1.641 |    15.1x
@@ -98,7 +188,7 @@ every Xeon cell is stable to <=1.7% jackknife with zero flags.
 
     The speedup grows with model size, which is the offload argument in one line.
 
-### 4. The Xeon arm — how it was run, 385 min, zero flagged cells
+### 5. The Xeon arm — how it was run, 385 min, zero flagged cells
 
 `reports/host_cpu/final/`, 15 groups x 24 rows = 360 rows, b=1..8, 5 passes, 20 threads,
 AVX-512 confirmed by probe, RAPL on every row. **Zero flagged cells** against five in the set
@@ -106,8 +196,8 @@ it replaces; max jackknife median-shift 1.66% (limit 3), no row missing power.
 
 Two results that change how the table gets built — both in [[xeon-baseline-facts]]:
 
-* **The Xeon's batch curve is not monotonic, and the shape is real** — see the table in §3
-  and the open decision in §2. Every cell is stable to <=1.7% and the shape reproduces to ~2%
+* **The Xeon's batch curve is not monotonic, and the shape is real** — see the table in §4
+  and the open decision in §3. Every cell is stable to <=1.7% and the shape reproduces to ~2%
   against an independent set, so more passes will not smooth it.
 * **Isolated cells do not reproduce across sessions to better than ~7%**, even when five
   fresh processes agree to 0.2% within a session.
@@ -116,7 +206,7 @@ The archived b=1..6 five-pass set is `reports/host_cpu/final_b1to6_5pass_2026080
 370M/2bit/b2 and 1.3B/2bit/b5 cells were the flagged ones and are now known to have been
 contended: today's quiet-box values read +11.3% and +8.7% against them.
 
-### 4b. How the Xeon sweep was set up
+### 5b. How the Xeon sweep was set up
 
 The defaults are now **b=1..8, five passes** (was 1..6, three). The ladder had to widen because
 the board ships B8: without b=7/8 the top of the FPGA ladder has no CPU denominator. That
@@ -156,7 +246,7 @@ it does not beat t20 there.
 threads" — that came from the 3-pass `xeon_best.csv` and is wrong on the 5-pass data, where 20
 wins everywhere. Any ratio quoted off the 10-thread rows understated the Xeon.
 
-### 5. ✅ Re-aggregated — and the ceiling is per-cell now
+### 6. ✅ Re-aggregated — and the ceiling is per-cell now
 
     ./scripts/final_dataset.py --board ~/results/final --xeon reports/host_cpu/final
 
@@ -174,7 +264,7 @@ ladder, so a CPU arm that stops at b=6 shows up as `missing b=[7, 8]` instead of
 `~/results/final_b8/` and `~/results/final_b6_serial_readback/`. Aggregate those with
 `--max-batch 8` / `--max-batch 6`.
 
-### 6. Still open, not blocking
+### 7. Still open, not blocking
 
 * **The 1.3B pass-3 anomaly** (2026-08-06: b=6 read 34.23 tok/s with a NORMAL 130 µs pack).
   DID NOT REPRODUCE on 2026-08-07 — 1.3B b=6 is now stable across five passes (62.02-62.53,
@@ -266,7 +356,7 @@ Three presets, one per released MMfreeLM checkpoint, all **B8** + dspAccum + 1.6
 weights + 128-bit m_axis at a true 250 MHz. Measured on a KRIA KV260, decode tok/s, POWER=1,
 all gates PASS (engine bit-identical to the CPU reference), all `streams_ok=1`.
 
-### B8 — first measurement, 2026-08-06. SUPERSEDED by the 2026-08-07 set in §0.3.
+### B8 — first measurement, 2026-08-06. SUPERSEDED by the 2026-08-07 set in §0.4.
 
 Kept because the 1.3B rows differ between the two sessions and that difference is now the open
 question (§0.1): this session read 1.3B b=8 = 71.53, the next read 62.42, and the mode mixture
@@ -331,7 +421,7 @@ pay for. (On the retired B6 bitstreams the same reasoning made b=4 or b=6 the an
 Against a Xeon W-2155 running the same model at the same weight format (`reports/host_cpu/`,
 RAPL package+DRAM), at b=6:
 
-⚠️ **This table is superseded and must not be published — the replacement is in §0.3.**
+⚠️ **This table is superseded and must not be published — the replacement is in §0.4.**
 Both halves moved: the KRIA column is B6 + serial readback (~30% low against the shipped
 configuration) and the Xeon column is a b=1..6 ladder measured on a contended box. Kept only
 as the historical record of what was believed before 2026-08-07.
