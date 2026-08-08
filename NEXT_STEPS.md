@@ -1,43 +1,104 @@
 # Where things stand — 2026-08-07
 
-## 0. THE FINAL DATA SET — what is ready and what is waiting on you
+## 0. THE DATA SET IS COMPLETE — 2026-08-07. Tomorrow is analysis, not collection.
 
-**B8 is the final configuration and B6 is retired.** The three shipped presets carry the whole
-optimization stack (B8 + dspAccum + colBankSize=4 + 1.6-bit packing + 128-bit m_axis @ 250,
-threaded readback on by default in the runner), `transfer/presets/mmfree_{370m,1_3b,2_7b}/`
-now hold the **B8** bitstreams under those names, and the `mmfree_*_b6` candidates are gone
-from the registry. The outgoing B6 bundles are archived at `~/results/b6_bitstreams/` and the
-B6 five-pass measurements at `~/results/final_b6_serial_readback/`; `git show d63d9f9` has the
-B6 configs if one is ever needed. Nothing below is about B6 any more.
+Both arms ran today. `reports/final/dataset.csv` is the merged set: **3 platforms-arms x 3
+models x b=1..8, five passes each on the board and the Xeon, POWER=1 on every row.** The
+aggregator's completeness check passes in full — no cell absent, no cell missing power, every
+FPGA row `streams_ok=1` — and **exactly one cell is flagged**, which is item 1 below.
 
-### ⏰ 1. KICK OFF THE KRIA SWEEP — ready now, needs your sudo
+⚠️ `reports/` is gitignored. `dataset.csv` and every raw CSV live only on this build server
+(`~/results/final/`, `reports/host_cpu/final/`) and the board. The tables in §3 are the
+tracked copy; if the box is lost, they are what survives.
 
-    cd ~/transfer && sudo ./final_sweep_board.sh          # both arms, ~7-8 h
+### ⏰ 1. THE ONE FLAGGED CELL — `kria/1.3B/1p6/b7`, 13.97% spread. Diagnosed, not fixed.
 
-Everything it needs is already on the board: the B8 bundles are deployed, the runner has been
-native-recompiled there, and the batch ladder now comes from the manifest so it sweeps b=1..8
-on its own. Five FPGA passes, one CPU pass at three encodings, POWER=1 on every row, gate +
-`make streams` (distinct prompt per row) once per bitstream before any timing. CMA was 1.39 GiB
-free at handoff against the 2.7B's ~624 MiB need, so no `cma_reclaim.sh` is required.
+It is the 1.3B host-`pack` bimodality again, and the evidence is unambiguous. Five passes,
+decode against the pack cost that produced it:
 
-It archives any previous `results/*_final*` before starting, so a half-finished run can only be
-incomplete, never a silent mix of two bitstreams' rows under one set of filenames.
+    1.3B b=7   59.51   68.47   59.06   68.57   68.10  tok/s
+       pack   215.3   140.8   218.1   138.2   142.2  us/call     <- two clean modes
+    2.7B b=7   42.26   42.49   42.50   42.38   42.24  tok/s      <- SAME bitstream
+       pack   172.5   170.3   169.3   171.7   168.1  us/call     <- dead stable
 
-Pull it back with the two rsyncs the script prints, into `~/results/final/` (the old B6 set
-there was copied aside first), then re-aggregate.
+Slow mode = pack ~216 us, fast mode = ~140 us, and decode tracks it exactly. 2.7B runs the
+identical bitstream and does not move, so this is host-side and specific to 1.3B's shapes —
+the standing hypothesis is where the udmabuf-act allocation lands per process changing the
+strided-scatter cost. Three of five passes landed fast, so the median sits in the fast mode.
 
-### 2. ✅ RAPL — done 2026-08-07 (`sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`)
+**Two things this breaks, and they are the real work for tomorrow:**
 
-Resets to 0400 on every reboot, so this comes back every time the box restarts.
+1. **b=8 is worse than b=7 for 1.3B** (62.42 vs 68.10), because b=8 landed in the SLOW mode
+   in four of five passes (pack 287/277/292/279/220 us). So 1.3B's best operating point is
+   b=7, not b=8, and its ladder is non-monotonic at the top — for a host-software reason, not
+   an engine one.
+2. **1.3B's b=8 number does not reproduce across sessions.** The 2026-08-06 B8 set read
+   **71.53** for exactly this cell; today it reads **62.42**, a 13% shift, because that
+   session drew mostly fast-mode passes and this one drew mostly slow. Neither is wrong; the
+   cell is bimodal and the mode mixture is what varies. Until that is understood, no single
+   1.3B top-of-ladder number is quotable — which is the same conclusion as yesterday, now
+   with the mechanism localized to one measurable phase.
 
-⚠️ **And close VS Code before any measurement.** On 2026-08-07 its file search
-(`rg --files --hidden --no-ignore --follow`) was walking `transfer/models` (9.6 GB) at twelve
-cores while the sweep waited to start; `settle()` would have given up and started underneath
-it fifteen minutes later. `final_sweep_xeon.sh` now aborts on any foreign process over a core
-(or 1.5 cores in total) rather than shrugging — but that aborts the RUN, so the editor still
-has to be closed. A `search.exclude` for `transfer/models` would prevent it recurring.
+Start here: `bl_pack_us_call` is already in every CSV, so the mode is visible per pass without
+re-running anything. [[pack-bimodal-1p3b-b6]] has the history (it was b=6 last time — the
+bimodality MOVES with the batch, which is itself a clue).
 
-### 3. THE XEON SWEEP — ✅ DONE 2026-08-07, 385 min, complete and clean
+### ⏰ 2. STILL UNDECIDED: how to quote the FPGA-vs-Xeon ratio at b=8
+
+The Xeon's batch curve is non-monotonic and reproducible (§3), so at b=8 it sits in a trough
+for 370M and 1.3B. Equal-batch and best-point-vs-best-point are both defensible and they are
+far apart — 370M reads 1.20x one way and 1.51x the other. The method already gives the CPU its
+best thread count, which argues for best-point; equal-batch is the apples-to-apples on
+identical work. **Pick one deliberately and say which in the report.** I can produce either
+from the existing data; nothing needs re-measuring.
+
+### 3. What is clean and quotable right now
+
+Everything except 1.3B at b=7/b=8. Specifically: all three gates PASS bit-exact, all three
+`make streams` row-independence checks OK — **including 2.7B and including B=8, the widest
+drain this design has ever done, which was the last outstanding per-bitstream check** — and
+every Xeon cell is stable to <=1.7% jackknife with zero flags.
+
+**KRIA, engine + A53 host, 1.6-bit weights. Five-pass medians, POWER=1.**
+
+    preset      b=1    b=2    b=3    b=4    b=5    b=6    b=7    b=8   W@b8  tok/J@b8
+    mmfree_370m 41.25  67.67  84.35 108.13 113.03 123.99 132.78 138.19  5.56   24.84
+    mmfree_1_3b 20.37  35.13  46.17  53.76  58.25  62.08  68.10† 62.42† 6.07   10.29
+    mmfree_2_7b 11.70  20.42  26.88  33.02  33.99  38.40  42.38  44.45  6.35    7.00
+
+    † the flagged pair — see §1. 1.3B's best point is b=7, and neither cell is quotable yet.
+
+**Xeon W-2155, 2-bit (the fastest CPU encoding), 20 threads. Five-pass medians.**
+
+    model   b=1    b=2    b=3    b=4    b=5    b=6    b=7    b=8    W@b8
+    370M   172.1  169.4  166.6  142.1  156.8  184.9  208.2  164.6  100.31
+    1.3B    89.5   92.5   93.7   87.6   80.7   97.6   96.4   83.9  112.99
+    2.7B    47.8   43.0   43.6   48.9   45.6   49.7   44.6   49.8  121.44
+
+    Non-monotonic, and reproducibly so: 370M peaks at b=7 and drops 21% at b=8; 2.7B barely
+    scales with batch at all. This is what makes §2 a real decision rather than a formality.
+
+**Perf/W at b=8, equal batch, 2-bit on the CPU side.** ⚠️ The 1.3B row inherits §1's caveat.
+
+    model  KRIA t/s  KRIA W  tok/J | Xeon t/s  Xeon W  tok/J | advantage
+    370M     138.19    5.56  24.84 |   164.62  100.31  1.641 |    15.1x
+    1.3B      62.42    6.07  10.29 |    83.92  112.99  0.743 |    13.9x
+    2.7B      44.45    6.35   7.00 |    49.76  121.44  0.410 |    17.1x
+
+    Against the old published table (9.0/10.0/13.0x) the advantage grew because the KRIA side
+    gained ~30% from B8 + threaded readback while the Xeon did not move. Best-point instead of
+    equal-batch would change the throughput column, not this one materially.
+
+**The on-board A53 control — what the engine is actually worth on this SoC**, b=8, 2-bit:
+
+    model   A53 tok/s   A53 W   engine speedup
+    370M         9.37    4.37       14.7x
+    1.3B         2.51    4.45       24.8x
+    2.7B         1.25    4.46       35.6x
+
+    The speedup grows with model size, which is the offload argument in one line.
+
+### 4. The Xeon arm — how it was run, 385 min, zero flagged cells
 
 `reports/host_cpu/final/`, 15 groups x 24 rows = 360 rows, b=1..8, 5 passes, 20 threads,
 AVX-512 confirmed by probe, RAPL on every row. **Zero flagged cells** against five in the set
@@ -45,14 +106,9 @@ it replaces; max jackknife median-shift 1.66% (limit 3), no row missing power.
 
 Two results that change how the table gets built — both in [[xeon-baseline-facts]]:
 
-* **The Xeon's batch curve is not monotonic, and the shape is real.** 2-bit medians:
-  370M peaks at b=7 (208.2) and falls 21% at b=8 (164.6); 1.3B peaks at b=6; 2.7B barely
-  scales with batch at all. Every cell is stable to <=1.7% and the shape reproduces to ~2%
-  against an independent set, so more passes will not smooth it. **At b=8 the Xeon sits in a
-  trough for 370M and 1.3B**, which means an FPGA-vs-Xeon ratio at equal batch is a different
-  number from best-point-vs-best-point (370M 1.20x vs 1.51x). ⚠️ UNDECIDED — pick one
-  deliberately and say which; the method already gives the CPU its best thread count, which
-  argues for best-point, while equal-batch is the apples-to-apples on identical work.
+* **The Xeon's batch curve is not monotonic, and the shape is real** — see the table in §3
+  and the open decision in §2. Every cell is stable to <=1.7% and the shape reproduces to ~2%
+  against an independent set, so more passes will not smooth it.
 * **Isolated cells do not reproduce across sessions to better than ~7%**, even when five
   fresh processes agree to 0.2% within a session.
 
@@ -60,7 +116,7 @@ The archived b=1..6 five-pass set is `reports/host_cpu/final_b1to6_5pass_2026080
 370M/2bit/b2 and 1.3B/2bit/b5 cells were the flagged ones and are now known to have been
 contended: today's quiet-box values read +11.3% and +8.7% against them.
 
-### 3b. Superseded — how the Xeon sweep was set up
+### 4b. How the Xeon sweep was set up
 
 The defaults are now **b=1..8, five passes** (was 1..6, three). The ladder had to widen because
 the board ships B8: without b=7/8 the top of the FPGA ladder has no CPU denominator. That
@@ -100,9 +156,12 @@ it does not beat t20 there.
 threads" — that came from the 3-pass `xeon_best.csv` and is wrong on the 5-pass data, where 20
 wins everywhere. Any ratio quoted off the 10-thread rows understated the Xeon.
 
-### 4. Then re-aggregate — the ceiling is per-cell now
+### 5. ✅ Re-aggregated — and the ceiling is per-cell now
 
     ./scripts/final_dataset.py --board ~/results/final --xeon reports/host_cpu/final
+
+Run 2026-08-07 against both finished arms: completeness passes in full, one cell flagged (§1).
+Re-run it any time — it is pure aggregation over the raw CSVs and takes seconds.
 
 `want_batches` is no longer hardcoded. The expected ladder is read per model from the sweep
 CSV's new `hw_batch_max` column (the bitstream's compile-time batchSize, handed through as
@@ -115,15 +174,16 @@ ladder, so a CPU arm that stops at b=6 shows up as `missing b=[7, 8]` instead of
 `~/results/final_b8/` and `~/results/final_b6_serial_readback/`. Aggregate those with
 `--max-batch 8` / `--max-batch 6`.
 
-### 5. Still open, not blocking
+### 6. Still open, not blocking
 
-* **The 1.3B pass-3 anomaly.** b=6 read 34.23 tok/s with a NORMAL 130 µs pack, so the pack
-  bimodality does not explain it; `~/results/final_b8/mmfree_1_3b_b8_final_p3_phases.csv` will
-  say which phase ate it. 1.3B is the only model affected and it shares 2.7B's bitstream, so it
-  is host-side and shape-specific. The new sweep may or may not reproduce it — if 1.3B comes
-  back with a wide b=6/b=8 spread again, this is why.
-* **`make streams` on the 2.7B geometry.** It has passed on 370M B6 hardware only. The board
-  sweep now runs it once per preset, so this closes itself on the next run.
+* **The 1.3B pass-3 anomaly** (2026-08-06: b=6 read 34.23 tok/s with a NORMAL 130 µs pack).
+  DID NOT REPRODUCE on 2026-08-07 — 1.3B b=6 is now stable across five passes (62.02-62.53,
+  pack 123-128 µs). The instability moved to b=7/b=8 and is fully pack-explained there, so
+  the "normal pack yet slow decode" case is currently unwitnessed. If it returns, that is a
+  different fault from §1 and the phase CSV is the place to look.
+* ~~**`make streams` on the 2.7B geometry.**~~ ✅ CLOSED 2026-08-07: all three presets passed
+  at B=8 — `OK (every stream == its OWN single-stream reference)` — which is the first time
+  row independence has been shown on the widest drain, and on the maxN=8192 geometry at all.
 
 ---
 
@@ -158,12 +218,11 @@ and `tok_per_joule` alongside. The aggregator refuses to call it clean unless th
 matrix is complete, every cell has power, all FPGA rows are `streams_ok=1`, and no cell's
 median moves >3% when any single pass is dropped.
 
-⚠️ **`reports/final/dataset.csv` is the B6 set and is being replaced.** It is 3 arms x 3 models
-x b=1..6 with the SERIAL readback, so every KRIA row in it is 11-20% low against current
-software and its ladder stops two rungs short of what the shipped bitstreams do. It stays as
-the historical record until the runs in §0 land; the raw CSVs behind it are copied to
-`~/results/final_b6_serial_readback/`. Everything in the rest of this section is about that
-set unless it says otherwise — the B8 numbers are in §3.
+⚠️ **`reports/final/dataset.csv` is now TODAY'S B8 set** (regenerated 2026-08-07) — the B6
+content this section used to describe is gone from that file. The B6 raw CSVs survive at
+`~/results/final_b6_serial_readback/`; aggregate them with `--max-batch 6` if the historical
+comparison is ever needed. **The rest of this section describes the RETIRED B6 set** and is
+kept for the failure modes it documents, not for its numbers.
 
 Complete, for that set: POWER=1 everywhere, all three FPGA gates PASS bit-exact (1160/1160/1544
 projection invocations, 0 element diffs) under the shipped preset names.
@@ -207,7 +266,11 @@ Three presets, one per released MMfreeLM checkpoint, all **B8** + dspAccum + 1.6
 weights + 128-bit m_axis at a true 250 MHz. Measured on a KRIA KV260, decode tok/s, POWER=1,
 all gates PASS (engine bit-identical to the CPU reference), all `streams_ok=1`.
 
-### B8 — the shipped configuration, measured 2026-08-06
+### B8 — first measurement, 2026-08-06. SUPERSEDED by the 2026-08-07 set in §0.3.
+
+Kept because the 1.3B rows differ between the two sessions and that difference is now the open
+question (§0.1): this session read 1.3B b=8 = 71.53, the next read 62.42, and the mode mixture
+of the host `pack` is why. The 370M and 2.7B rows agree with 2026-08-07 to ~0.5%.
 
 Five passes, threaded readback (every one of the 120 runs logged `# readback: threaded x4`),
 POWER=1, gates PASS on all three including the +0.002 ns 2.7B. In `~/results/final_b8/`.
@@ -268,11 +331,10 @@ pay for. (On the retired B6 bitstreams the same reasoning made b=4 or b=6 the an
 Against a Xeon W-2155 running the same model at the same weight format (`reports/host_cpu/`,
 RAPL package+DRAM), at b=6:
 
-⚠️ **This table is entirely superseded and must not be published.** Both halves have moved:
-the KRIA column is B6 + serial readback (~30% low against the shipped configuration) and the
-Xeon column is a b=1..6 ladder that is being re-run. It is kept only so the *shape* of the
-result — order-of-magnitude energy advantage, growing with model size — is on record while
-the replacement runs. Regenerate it from `reports/final/dataset.csv` after §0.
+⚠️ **This table is superseded and must not be published — the replacement is in §0.3.**
+Both halves moved: the KRIA column is B6 + serial readback (~30% low against the shipped
+configuration) and the Xeon column is a b=1..6 ladder measured on a contended box. Kept only
+as the historical record of what was believed before 2026-08-07.
 
 | model | KRIA tok/s | KRIA W | KRIA tok/J | Xeon tok/s | Xeon W | Xeon tok/J | advantage |
 |---|---|---|---|---|---|---|---|
