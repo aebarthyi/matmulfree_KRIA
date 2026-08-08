@@ -26,14 +26,41 @@ incomplete, never a silent mix of two bitstreams' rows under one set of filename
 Pull it back with the two rsyncs the script prints, into `~/results/final/` (the old B6 set
 there was copied aside first), then re-aggregate.
 
-### ⏰ 2. ONE COMMAND ONLY YOU CAN RUN, before the Xeon sweep
+### 2. ✅ RAPL — done 2026-08-07 (`sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`)
 
-    sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj
+Resets to 0400 on every reboot, so this comes back every time the box restarts.
 
-RAPL resets to 0400 on every reboot and `final_sweep_xeon.sh` refuses to start without it
-(correctly — empty power columns are not a final data set). It is currently unreadable.
+⚠️ **And close VS Code before any measurement.** On 2026-08-07 its file search
+(`rg --files --hidden --no-ignore --follow`) was walking `transfer/models` (9.6 GB) at twelve
+cores while the sweep waited to start; `settle()` would have given up and started underneath
+it fifteen minutes later. `final_sweep_xeon.sh` now aborts on any foreign process over a core
+(or 1.5 cores in total) rather than shrugging — but that aborts the RUN, so the editor still
+has to be closed. A `search.exclude` for `transfer/models` would prevent it recurring.
 
-### 3. THE XEON SWEEP — prepared, not started
+### 3. THE XEON SWEEP — ✅ DONE 2026-08-07, 385 min, complete and clean
+
+`reports/host_cpu/final/`, 15 groups x 24 rows = 360 rows, b=1..8, 5 passes, 20 threads,
+AVX-512 confirmed by probe, RAPL on every row. **Zero flagged cells** against five in the set
+it replaces; max jackknife median-shift 1.66% (limit 3), no row missing power.
+
+Two results that change how the table gets built — both in [[xeon-baseline-facts]]:
+
+* **The Xeon's batch curve is not monotonic, and the shape is real.** 2-bit medians:
+  370M peaks at b=7 (208.2) and falls 21% at b=8 (164.6); 1.3B peaks at b=6; 2.7B barely
+  scales with batch at all. Every cell is stable to <=1.7% and the shape reproduces to ~2%
+  against an independent set, so more passes will not smooth it. **At b=8 the Xeon sits in a
+  trough for 370M and 1.3B**, which means an FPGA-vs-Xeon ratio at equal batch is a different
+  number from best-point-vs-best-point (370M 1.20x vs 1.51x). ⚠️ UNDECIDED — pick one
+  deliberately and say which; the method already gives the CPU its best thread count, which
+  argues for best-point, while equal-batch is the apples-to-apples on identical work.
+* **Isolated cells do not reproduce across sessions to better than ~7%**, even when five
+  fresh processes agree to 0.2% within a session.
+
+The archived b=1..6 five-pass set is `reports/host_cpu/final_b1to6_5pass_20260807/`. Its
+370M/2bit/b2 and 1.3B/2bit/b5 cells were the flagged ones and are now known to have been
+contended: today's quiet-box values read +11.3% and +8.7% against them.
+
+### 3b. Superseded — how the Xeon sweep was set up
 
 The defaults are now **b=1..8, five passes** (was 1..6, three). The ladder had to widen because
 the board ships B8: without b=7/8 the top of the FPGA ladder has no CPU denominator. That
