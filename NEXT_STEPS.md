@@ -124,14 +124,49 @@ Start here: `bl_pack_us_call` is already in every CSV, so the mode is visible pe
 re-running anything. [[pack-bimodal-1p3b-b6]] has the history (it was b=6 last time — the
 bimodality MOVES with the batch, which is itself a clue).
 
-### ⏰ 3. STILL UNDECIDED: how to quote the FPGA-vs-Xeon ratio at b=8
+### ✅ 3. DECIDED 2026-08-10: quote the FPGA-vs-Xeon ratio at **EQUAL BATCH**
 
 The Xeon's batch curve is non-monotonic and reproducible (§3), so at b=8 it sits in a trough
 for 370M and 1.3B. Equal-batch and best-point-vs-best-point are both defensible and they are
-far apart — 370M reads 1.20x one way and 1.51x the other. The method already gives the CPU its
-best thread count, which argues for best-point; equal-batch is the apples-to-apples on
-identical work. **Pick one deliberately and say which in the report.** I can produce either
-from the existing data; nothing needs re-measuring.
+far apart — the Xeon's throughput advantage on 370M reads **1.19x** equal-batch at b=8 and
+**1.51x** best-point (its b=7 peak of 208.2 against the KRIA's b=8 of 138.2). Decided:
+**equal-batch**, because it is the apples-to-apples on identical work — same batch, same
+sequence length, same token count on both sides. State the convention explicitly in the
+report, and note in a sentence that the Xeon's own best point is b=7, not b=8, so best-point
+framing would widen its throughput lead to 1.51x while leaving perf/W essentially unchanged.
+
+The counter-argument, for the record: the method already grants the CPU its best thread count
+per (model, encoding), so it is not a strictly unfavoured-configuration comparison anyway.
+That asymmetry is worth one sentence in the methods section rather than a change of convention.
+
+**Equal-batch ratio across the whole ladder**, KRIA fpga 1.6-bit / Xeon 2-bit t20 — as the
+KRIA's share of Xeon throughput, so >1 would mean the board wins:
+
+    model   b=1    b=2    b=3    b=4    b=5    b=6    b=7    b=8
+    370M   0.240  0.400  0.506  0.761  0.721  0.671  0.638  0.839
+    1.3B   0.228  0.380  0.493  0.613  0.722  0.636  0.706  0.744†
+    2.7B   0.245  0.475  0.617  0.676  0.746  0.772  0.950  0.893
+
+    † inherits §2's caveat. The ratio rises with batch on every model and rises with model
+      size at the top of the ladder — 2.7B reaches 0.95 at b=7 — which is the same trend the
+      perf/W column shows, and it is the honest way to state a throughput deficit that is
+      shrinking rather than a win that is not there.
+
+**b=8 equal-batch, the publishable table.** Xeon side is 2-bit @ 20 threads (its fastest
+encoding); KRIA side is 1.6-bit packed. ⚠️ the 1.3B row inherits §2.
+
+    model  KRIA t/s  KRIA W  tok/J | Xeon t/s  Xeon W  tok/J | Xeon thru  KRIA perf/W
+    370M     138.19    5.56  24.84 |   164.62  100.31  1.641 |    1.19x       15.1x
+    1.3B      62.42    6.07  10.29 |    83.92  112.99  0.743 |    1.34x       13.9x
+    2.7B      44.45    6.35   7.00 |    49.76  121.44  0.410 |    1.12x       17.1x
+
+    The Xeon wins raw throughput by 1.12-1.34x; the KRIA wins energy by 13.9-17.1x. Both
+    columns move the same way with model size: the throughput deficit shrinks (1.34x -> 1.12x
+    from 1.3B to 2.7B) while the energy advantage grows.
+
+⚠️ Power instruments differ and are NOT equivalent — SOM rails (PS + PL + SOM DDR) against
+RAPL (package + DRAM, excluding board/PSU losses). Both are "compute silicon plus its memory";
+label them, do not claim equivalence.
 
 ### 4. What is clean and quotable right now
 
