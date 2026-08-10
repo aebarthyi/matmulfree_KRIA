@@ -4,7 +4,7 @@ import chisel3._
 import chisel3.util._
 import chisel3.experimental.annotate
 import firrtl.AttributeAnnotation
-import systolic.{SystolicArray, TrueSystolicArray}
+import systolic.SystolicArray
 import systolic.WeightUnpackGearbox
 
 /** AXI4-Stream slave (input side). Flat bundle so Vivado IP packager infers `s_axis_*`. */
@@ -96,56 +96,18 @@ class Core(
                                          // semantics and latency — a mapping choice, not a
                                          // design change. See ActMem for why maxN=8192 needs it.
     val actCascadeHeight: Int = 0,       // cascade_height for ActMem; 0 = omit the attribute.
-    val outPipeStyle: String = "legacy", // OutMemUltra read-pipeline coding style. "legacy" =
-                                         // the shipped body (separate read/write always blocks,
-                                         // shreg_extract="no" on the stages), which Vivado maps
-                                         // with "FF provided for Pipeline: 0" — i.e. NONE of its
-                                         // read stages reach the URAM cascade, leaving a fully
-                                         // combinational CAS chain that is the worst 300 MHz
-                                         // path. "absorb" = the UG901 template (one always
-                                         // block, explicit output stage, no shreg_extract) so
-                                         // the stages can be absorbed. Identical read semantics
-                                         // and latency either way; changing it changes
-                                         // OutMemUltra's module name, so shipped presets keep
-                                         // "legacy" to stay SV-identical.
-    val outBankDepth: Int = 0,           // rows per explicit bank when outPipeStyle="banked".
-                                         // 0 = auto = 4096*outCascadeHeight (one URAM cascade
-                                         // chain per bank). Overridable so a simulation-sized
-                                         // memory can still be forced into several banks — at
-                                         // the default every test config is one bank and the
-                                         // registered mux, the whole point of the style, is
-                                         // never exercised.
-    val outCascadeHeight: Int = 4,       // cascade_height for the OutMemUltra URAM output memory.
-                                         // The read side is a hard URAM288 CAS chain of this depth
-                                         // plus a fabric mux over the chain groups: shorter chain =
-                                         // less logic delay, more LUT and route. 4 is the shipped
-                                         // value and closes 250; MEASURED 2026-08-08, it is the
-                                         // path that fails 300 MHz (-0.315 ns post-synth, 82%
-                                         // LOGIC), identically for every array dataflow. Changing
-                                         // it changes OutMemUltra's module name, so existing
-                                         // presets must keep 4 to stay SV-identical.
-    val trueSystolic:    Boolean = false // swap the broadcast MAC array for the nearest-
-                                         // neighbour systolic.TrueSystolicArray: activations
-                                         // march right and weights march down through one
-                                         // register per PE, so no data net in the array has
-                                         // fanout > 1. Numerically identical (same output-
-                                         // stationary accumulation, drop-in IO); costs
-                                         // +(xDim-1)+(yDim-1) cycles of drain per op instead
-                                         // of colBankSize's +(numBanks-1). Mutually exclusive
-                                         // with colBankSize, which is the same problem solved
-                                         // from outside the array.
-    ,
-    val captureMaxFanout: Int = 0        // 0 = off (the shipped RTL, byte-identical SV). >0 =
-                                         // pipeline the tile capture one cycle through a dedicated
-                                         // cCapture state so its enable is a plain REGISTER, and
-                                         // annotate that register and drainBusy — the two CE
-                                         // drivers of the 59 392-bit tileAccums bank — with
-                                         // max_fanout = N so synthesis replicates each driver near
-                                         // its own slice. MEASURED 2026-08-08: this one enable net
-                                         // is 74.2% of everything that fails 300 MHz. Numerically
-                                         // identical (the array holds its accumulators until
-                                         // `ready`, so reading them a cycle later reads the same
-                                         // bits); costs +1 cycle per column tile.
+    val outCascadeHeight: Int = 4,       // cascade_height on each bank of the OutMemUltra URAM
+                                         // output memory. The shipped value is 1: with the banked
+                                         // read there is exactly one URAM chain per bank, so there
+                                         // is no cascade left to bound. It is baked into
+                                         // OutMemUltra's module NAME, so both maxN=8192 presets
+                                         // must carry the same value or clone_preset_hw.sh (which
+                                         // hashes the SV) refuses the 1.3B clone.
+    val outBankDepth:     Int = 0        // rows per explicit output-memory bank. 0 = auto =
+                                         // 4096*outCascadeHeight, i.e. one URAM chain per bank.
+                                         // Exposed so a simulation-sized memory can be forced
+                                         // into several banks — at the default a test config is
+                                         // a single bank and never exercises the registered mux.
 ) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0,        "aWidth must be even and >= 2")
     require(maxAcc >= 2,                           "maxAcc must be >= 2")
@@ -155,10 +117,6 @@ class Core(
     require(maxM >= 1,                             "maxM must be >= 1")
     require(accHeadroomBits == -1 || accHeadroomBits >= 0,
         s"accHeadroomBits=$accHeadroomBits must be -1 (auto) or >= 0")
-    require(!(trueSystolic && colBankSize > 0),
-        s"trueSystolic and colBankSize=$colBankSize both attack the activation-broadcast " +
-        "fanout and are mutually exclusive: banking pipelines the broadcast from outside " +
-        "the array, the systolic dataflow removes it from inside. Pick one.")
 
     val yDim            = batchSize
     val nLanes          = aWidth / 2
@@ -200,26 +158,11 @@ class Core(
 
     // ─── Systolic array with Core-local reset (PE counter quirk workaround) ──
     val arrLocalReset = WireDefault(false.B)
-    // Two dataflows behind one IO. They share the bundle types but deliberately have no
-    // common supertype: SystolicArray is NOT touched, because the shipped bitstreams'
-    // RTL must stay byte-identical for scripts/clone_preset_hw.sh to accept a clone.
-    // suggestName("arr") keeps the instance name (and hence the emitted SV) unchanged
-    // for every existing preset.
-    private val arrReset = this.reset.asBool || arrLocalReset
-    val arrBroadcast =
-        if (trueSystolic) None
-        else Some(withReset(arrReset) {
-            Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, accHeadroomBits,
-                                     dspAccum, colBankSize)).suggestName("arr")
-        })
-    val arrSystolic =
-        if (!trueSystolic) None
-        else Some(withReset(arrReset) {
-            Module(new TrueSystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, accHeadroomBits,
-                                         dspAccum)).suggestName("arr")
-        })
-    val arrInput  = arrBroadcast.map(_.input).getOrElse(arrSystolic.get.input)
-    val arrOutput = arrBroadcast.map(_.output).getOrElse(arrSystolic.get.output)
+    val arr = withReset(this.reset.asBool || arrLocalReset) {
+        Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, accHeadroomBits, dspAccum, colBankSize))
+    }
+    val arrInput  = arr.input
+    val arrOutput = arr.output
 
     // ─── On-chip storage ──────────────────────────────────────────────────────
     // actBram: maxN entries x (batchSize * aWidth) bits, 1-cycle synchronous read.
@@ -336,17 +279,7 @@ class Core(
     val sIdle :: sLoad :: sCompute :: sStore :: Nil = Enum(4)
     val state = RegInit(sIdle)
 
-    // captureMaxFanout > 0 inserts cCapture between cStream and cReset: the cycle in which
-    // tileAccums is loaded, so its enable is a decode of REGISTERED state rather than a
-    // combinational term off the FSM plus arrOutput.valid. Generated conditionally so the
-    // shipped (0) configuration keeps a 4-state, 2-bit encoding and byte-identical SV.
-    val pipelinedCapture = captureMaxFanout > 0
-    val cStates  = Enum(if (pipelinedCapture) 5 else 4)
-    val cInit    = cStates(0)
-    val cStream  = cStates(1)
-    val cReset   = cStates(2)
-    val cDone    = cStates(3)
-    val cCapture = cStates(if (pipelinedCapture) 4 else 0)   // unreachable when off
+    val cInit :: cStream :: cReset :: cDone :: Nil = Enum(4)
     val cState = RegInit(cInit)
 
     // Defaults
@@ -418,15 +351,6 @@ class Core(
     val totalTileLanes  = batchSize * outLanesPerTile
     val tileAccums      = Reg(Vec(totalTileLanes, UInt(tileAccWidth.W)))
 
-    // The two CE drivers of tileAccums: capturePend loads it (parallel), drainBusy shifts
-    // it. Between them they enable all batchSize*outLanesPerTile*tileAccWidth bits, which is
-    // the 74.2% of endpoints that fail 300 MHz — so when captureMaxFanout is set BOTH carry
-    // the attribute, not just the capture. Replicating one and leaving the other is how a
-    // fanout fix reads as no change at all.
-    // Declared only when the lever is on, so the shipped configuration emits the SV it
-    // always did (verified by diffing the emitted Core.sv, which clone_preset_hw.sh hashes).
-    val capturePend: Bool = if (pipelinedCapture) RegInit(false.B) else false.B
-
     // Drain engine (tileAccums -> outBram), runs in parallel with cStream.
     val drainBusy       = RegInit(false.B)
     val drainSubCtr     = RegInit(0.U(log2Ceil(outSubBeats + 1).W))
@@ -468,7 +392,7 @@ class Core(
         // URAM cascade (external regs would SRL-optimize and never pipeline it).
         val mem = Module(new OutMemUltra(outBramRows, effOutBeatLanes * outAccWidth, outReadLat,
                                          writeLat = outWriteLat.max(1), cascadeHeight = outCascadeHeight,
-                                         pipeStyle = outPipeStyle, bankDepth = outBankDepth))
+                                         bankDepth = outBankDepth))
         mem.io.clk   := clock
         mem.io.wen   := outWrEn
         mem.io.waddr := outWrAddr
@@ -619,24 +543,14 @@ class Core(
                 arrInput.nAcc.bits          := cmpRows
                 armSrc.ready                 := arrInput.weights_i.ready && !outPending
 
-                if (!pipelinedCapture) {
-                    when(capture) {
-                        tileAccums       := arrOutput.bits.accum.asTypeOf(tileAccums)
-                        arrOutput.ready := true.B
-                        drainBusy        := true.B
-                        drainSubCtr      := 0.U
-                        drainBatchCtr    := 0.U
-                        drainColTile     := colTileCtr
-                        cState           := cReset
-                    }
-                } else {
-                    // Decide here, load next cycle. Nothing is consumed yet: arrOutput.ready
-                    // stays low, so the array holds valid and its accumulators, and the same
-                    // bits are still there in cCapture. See cCapture below.
-                    when(capture) {
-                        capturePend := true.B
-                        cState      := cCapture
-                    }
+                when(capture) {
+                    tileAccums       := arrOutput.bits.accum.asTypeOf(tileAccums)
+                    arrOutput.ready  := true.B
+                    drainBusy        := true.B
+                    drainSubCtr      := 0.U
+                    drainBatchCtr    := 0.U
+                    drainColTile     := colTileCtr
+                    cState           := cReset
                 }
             }
 
@@ -666,44 +580,6 @@ class Core(
                 }
             }
         }
-
-        // cCapture — the load cycle, and deliberately NOT an `is` arm: Chisel's switch macro
-        // rejects any block inside it that does not begin with is(), so a conditionally
-        // generated arm cannot live there. A sibling when() on the same registered state is
-        // the identical hardware, because the switch above has no arm for this encoding and
-        // nothing else drives these signals while cState holds it.
-        //
-        // capturePend (a plain register, replicated by the max_fanout attribute below) is
-        // what enables tileAccums; the FSM only has to release the array and start the drain,
-        // exactly as the un-pipelined path did in the same cycle as the load.
-        if (pipelinedCapture) {
-            when(cState === cCapture) {
-                capturePend     := false.B
-                arrOutput.ready := true.B
-                drainBusy       := true.B
-                drainSubCtr     := 0.U
-                drainBatchCtr   := 0.U
-                drainColTile    := colTileCtr
-                cState          := cReset
-            }
-        }
-    }
-
-    // ─── Tile capture, pipelined (captureMaxFanout > 0) ──────────────────────
-    // The parallel load, moved out of the FSM so its enable is one register instead of a
-    // combinational term off state/cState/arrOutput.valid/drainBusy. max_fanout then lets
-    // synthesis replicate that register — and drainBusy, the shift enable — so each replica
-    // drives a local slice of the 59 392-bit bank rather than one net crossing the die.
-    // Placed BEFORE the drain block so a drain shift still wins on any overlap; the two are
-    // mutually exclusive anyway (capture requires !drainBusy one cycle earlier).
-    if (pipelinedCapture) {
-        when(capturePend) {
-            tileAccums := arrOutput.bits.accum.asTypeOf(tileAccums)
-        }
-        annotate(Seq(capturePend))(Seq(
-            AttributeAnnotation(capturePend.toNamed, s"max_fanout = $captureMaxFanout")))
-        annotate(Seq(drainBusy))(Seq(
-            AttributeAnnotation(drainBusy.toNamed, s"max_fanout = $captureMaxFanout")))
     }
 
     // ─── Drain engine: tileAccums -> outBram, one beat-wide row per cycle ────

@@ -80,74 +80,26 @@ case class CoreConfig(
                                   // transparent — an implementation attribute, not a design
                                   // change. Only worth setting where the cascade binds
                                   // (maxN=8192); maxN=4096 is a 4-deep chain and closes 250.
-    trueSystolic: Boolean = false,// swap the broadcast MAC array for systolic.TrueSystolicArray:
-                                  // activations march right and weights march down through one
-                                  // register per PE, so every data net inside the array has
-                                  // fanout 1 instead of the xDim*nLanes (=256 at 32x8) activation
-                                  // broadcast that route-bounds this design. Numerically
-                                  // IDENTICAL — same output-stationary accumulation, only
-                                  // retimed — and pinned so by TrueSystolicArraySpec. Costs
-                                  // +(xDim-1)+(yDim-1) drain cycles per op (~1.5% of a col-tile
-                                  // pass at N>=2560) against colBankSize's +(numBanks-1), so it
-                                  // only pays if it buys a clock rung. Mutually exclusive with
-                                  // colBankSize: same problem, opposite side of the array wall.
-    outPipeStyle: String = "legacy",// OutMemUltra read-pipeline coding style. MEASURED 2026-08-08:
-                                  // the shipped "legacy" body is mapped by Vivado with "FF provided
-                                  // for Pipeline: 0, FF absorbed: 0" and an explicit
-                                  // WARNING [Synth 8-6057] "has no pipeline registers", so its four
-                                  // read stages never reach the URAM cascade and the read path is a
-                                  // combinational CAS_IN_DOUT->CAS_OUT_DOUT chain — the design's
-                                  // worst 300 MHz path. "absorb" is the UG901 template (single
-                                  // always block, explicit output stage, no shreg_extract) written
-                                  // so the stages CAN be absorbed. Read semantics and latency are
-                                  // identical; it changes OutMemUltra's module name. "banked" is
-                                  // what SHIPS since 2026-08-09: one explicit sub-array per URAM
-                                  // chain (cascade_height=1), every bank output registered, and the
-                                  // mux over REGISTERED outputs given its own cycle. It stops asking
-                                  // Vivado to pipeline the cascade and places the registers instead,
-                                  // worth +1.068 ns post-synth / +0.018 ns post-route at 250 for
-                                  // +240 LUT, +4 registers, the same URAM count and NO latency change.
-    outBankDepth: Int = 0,        // rows per explicit bank when outPipeStyle="banked". 0 = auto
-                                  // = 4096*outCascadeHeight, i.e. exactly one URAM cascade chain
+    outBankDepth: Int = 0,        // rows per explicit output-memory bank. 0 = auto =
+                                  // 4096*outCascadeHeight, i.e. exactly one URAM cascade chain
                                   // per bank. Exposed mainly so a simulation-sized memory can be
                                   // forced into several banks; at the default a test config is a
                                   // single bank and never exercises the registered mux.
-    outCascadeHeight: Int = 4,    // cascade_height on the OutMemUltra URAM output memory. The
-                                  // read side is a hard URAM288 CAS chain this deep plus a fabric
-                                  // mux over the chain groups. 4 is the shipped value and closes
-                                  // 250; MEASURED 2026-08-08 it is the path that fails 300 MHz
-                                  // (-0.315 ns post-synth, 82% LOGIC), and it fails identically
-                                  // for every array dataflow — so it, not the array, is what
-                                  // stands between this design and the 300 rung. Shortening it
-                                  // trades logic delay for LUT and route, and MEASURED it buys only
-                                  // +0.028 ns (4 -> 2) because URAM288 CLK->DOUT is 1.837 ns before
-                                  // any cascade. With outPipeStyle="banked" the chain is gone by
-                                  // construction and the shipped value is 1. It changes OutMemUltra's
-                                  // module name, so both maxN=8192 presets must carry the SAME value
-                                  // (scripts/clone_preset_hw.sh hashes the SV).
+    outCascadeHeight: Int = 4,    // cascade_height on each bank of the OutMemUltra URAM output
+                                  // memory. THE SHIPPED VALUE IS 1: the read is banked one URAM
+                                  // chain per bank, so there is no cascade left to bound. (The
+                                  // default stays 4 because it is also the pre-banking default for
+                                  // any caller that constructs a CoreConfig directly.) MEASURED
+                                  // 2026-08-08, shortening the chain was the WRONG lever anyway —
+                                  // 4 -> 2 bought +0.028 ns and made TNS worse, because URAM288
+                                  // CLK->DOUT is 1.837 ns before any cascade. It changes
+                                  // OutMemUltra's module name, so both maxN=8192 presets must carry
+                                  // the SAME value (scripts/clone_preset_hw.sh hashes the SV).
     actCascadeHeight: Int = 0,    // cascade_height for actRamStyle != "". 0 → omit the
                                   // attribute (let Vivado choose). 1 → no cascade at all
                                   // (every depth block reads out in parallel into a fabric
                                   // mux); 2 → pairs, one hop plus a 4:1 mux at maxN=8192.
                                   // Lower = less logic delay, more LUT + route.
-    captureMaxFanout: Int = 0,    // attack the tile-capture ENABLE, which MEASURED 2026-08-08 is
-                                  // 74.2% of everything that fails 300 MHz (29 684 of the 40 000
-                                  // worst endpoints, all of family core/tileAccums_reg[*], and
-                                  // 29 681 of those driven by ONE net off core/state_reg). Core's
-                                  // `capture` is a combinational term off the FSM driving the
-                                  // enable pin of a batchSize*outLanesPerTile*tileAccWidth =
-                                  // 59 392-bit register bank spread over the whole array
-                                  // footprint. It is a high-fanout ENABLE problem, not a wide
-                                  // datapath one. 0 → off, exactly the shipped RTL (byte-identical
-                                  // SV). >0 → the capture is PIPELINED one cycle into a dedicated
-                                  // cCapture state so the enable becomes a plain register, and that
-                                  // register plus drainBusy — the two CE drivers of tileAccums —
-                                  // carry `max_fanout = N` so synthesis replicates each driver near
-                                  // its own slice. Numerically identical: the array holds its
-                                  // accumulators in done_state until `ready`, so deferring the
-                                  // read one cycle reads the same bits. Costs +1 cycle per column
-                                  // tile (~0.04% at N>=2560). A placement/fanout effect, so OOC
-                                  // synthesis cannot see it — only a full build can.
     modelName:    String = "",    // HF checkpoint id this preset targets, e.g.
                                   // "ridger/MMfreeLM-2.7B". Emitted as MMFREE_MODEL —
                                   // the single source of truth for `make model` (which
@@ -201,12 +153,7 @@ case class CoreConfig(
         s"""actRamStyle="$actRamStyle" must be "" (legacy SyncReadMem), "block" or "ultra"""")
     require(actCascadeHeight >= 0,
         s"actCascadeHeight=$actCascadeHeight must be >= 0 (0 = let Vivado choose)")
-    require(Seq("legacy", "absorb", "banked").contains(outPipeStyle),
-        s"""outPipeStyle="$outPipeStyle" must be "legacy" (shipped), "absorb" (UG901 template) """ +
-        """or "banked" (explicit banks + registered mux)""")
     require(outBankDepth >= 0, s"outBankDepth=$outBankDepth must be >= 0 (0 = auto)")
-    require(captureMaxFanout >= 0,
-        s"captureMaxFanout=$captureMaxFanout must be >= 0 (0 = off, the shipped RTL)")
     require(outCascadeHeight >= 1,
         s"outCascadeHeight=$outCascadeHeight must be >= 1 (URAM chains cannot be shorter than one)")
     require(actRamStyle.nonEmpty || actCascadeHeight == 0,
@@ -216,13 +163,6 @@ case class CoreConfig(
         s"Core requires maxN ($maxN) <= maxAcc ($maxAcc) — no inner-dim tiling yet")
     require(accHeadroomBits == -1 || accHeadroomBits >= 0,
         s"accHeadroomBits=$accHeadroomBits must be -1 (auto) or >= 0")
-    // Both attack the activation-broadcast fanout — banking pipelines the broadcast from
-    // outside the array, the systolic dataflow removes it from inside — so a preset
-    // carrying both is a configuration mistake, not a stacked optimization.
-    require(!(trueSystolic && colBankSize > 0),
-        s"trueSystolic=true and colBankSize=$colBankSize are mutually exclusive: they are two " +
-        "solutions to the same activation-broadcast fanout. Set colBankSize = 0.")
-
     val yDim:            Int = batchSize
     val nLanes:          Int = aWidth / 2
     val outLanesPerTile: Int = xDim * nLanes
@@ -305,9 +245,7 @@ case class CoreConfig(
         signedAct = signedAct, accHeadroomBits = accHeadroomBits, actMaxFanout = actMaxFanout,
         dspAccum = dspAccum, colBankSize = colBankSize, packedWeights = packedWeights,
         actRamStyle = actRamStyle, actCascadeHeight = actCascadeHeight,
-        outCascadeHeight = outCascadeHeight, trueSystolic = trueSystolic,
-        outPipeStyle = outPipeStyle, outBankDepth = outBankDepth,
-        captureMaxFanout = captureMaxFanout
+        outCascadeHeight = outCascadeHeight, outBankDepth = outBankDepth
     )
 
     def buildTop: CoreTop = new CoreTop(
@@ -317,9 +255,7 @@ case class CoreConfig(
         signedAct = signedAct, accHeadroomBits = accHeadroomBits, actMaxFanout = actMaxFanout,
         dspAccum = dspAccum, colBankSize = colBankSize, packedWeights = packedWeights,
         actRamStyle = actRamStyle, actCascadeHeight = actCascadeHeight,
-        outCascadeHeight = outCascadeHeight, trueSystolic = trueSystolic,
-        outPipeStyle = outPipeStyle, outBankDepth = outBankDepth,
-        captureMaxFanout = captureMaxFanout
+        outCascadeHeight = outCascadeHeight, outBankDepth = outBankDepth
     )
 
     /** Estimated bandwidth consumed by one cycle of COMPUTE_MM weight streaming. */
@@ -388,16 +324,12 @@ case class CoreConfig(
            |MMFREE_ACT_MAX_FANOUT=$actMaxFanout
            |MMFREE_DSP_ACCUM=${if (dspAccum) 1 else 0}
            |MMFREE_COL_BANK_SIZE=$colBankSize
-           |# 1 => nearest-neighbour systolic dataflow (systolic.TrueSystolicArray) instead of
-           |# the broadcast MAC array. RTL-only: numerically identical, so no host/blob change.
-           |MMFREE_TRUE_SYSTOLIC=${if (trueSystolic) 1 else 0}
            |# activation-BRAM mapping: "" = inferred SyncReadMem, else the control.ActMem
            |# BlackBox with this ram_style + cascade_height. Implementation only — the read
            |# semantics and latency are identical, so it never changes results.
            |MMFREE_ACT_RAM_STYLE=$actRamStyle
            |MMFREE_ACT_CASCADE_HEIGHT=$actCascadeHeight
            |MMFREE_OUT_CASCADE_HEIGHT=$outCascadeHeight
-           |MMFREE_OUT_PIPE_STYLE=$outPipeStyle
            |MMFREE_OUT_BANK_DEPTH=$outBankDepth
            |# 1 => weights stream 1.6-bit (5 trits/byte); the packed blob format MUST match.
            |MMFREE_PACKED_WEIGHTS=${if (packedWeights) 1 else 0}
@@ -457,9 +389,7 @@ case class CoreConfig(
            |  "actRamStyle": "$actRamStyle",
            |  "actCascadeHeight": $actCascadeHeight,
            |  "outCascadeHeight": $outCascadeHeight,
-           |  "outPipeStyle": "$outPipeStyle",
            |  "outBankDepth": $outBankDepth,
-           |  "trueSystolic": $trueSystolic,
            |  "udmabufActBytes": $udmabufActBytes,
            |  "udmabufWtBytes": $udmabufWtBytes,
            |  "udmabufOutBytes": $udmabufOutBytes
@@ -614,7 +544,7 @@ object CoreConfig {
                  plClkMhz = 250, shapes = "370m", model = "ridger/MMfreeLM-370M",
                  packedWeights = true)
             .copy(batchSize = 8, outBeatLanes = 4, colBankSize = 4, dspAccum = true,
-                  outPipeStyle = "banked", outCascadeHeight = 1,
+                  outCascadeHeight = 1,
                   implDirectives = b4TimingLevers250)
 
     /** MMfreeLM-1.3B — hidden 2048, intermediate 5632, vocab 32000, 24 layers.
@@ -626,7 +556,7 @@ object CoreConfig {
                  shapes = "1.3b", model = "ridger/MMfreeLM-1.3B", packedWeights = true)
             .copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
                   colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
-                  outPipeStyle = "banked", outCascadeHeight = 1,
+                  outCascadeHeight = 1,
                   implDirectives = b4TimingLevers250)
 
     /** MMfreeLM-2.7B — hidden 2560, intermediate 6912, vocab 32000, 32 layers.
@@ -638,7 +568,7 @@ object CoreConfig {
                  shapes = "2.7b", model = "ridger/MMfreeLM-2.7B", packedWeights = true)
             .copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
                   colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
-                  outPipeStyle = "banked", outCascadeHeight = 1,
+                  outCascadeHeight = 1,
                   implDirectives = b4TimingLevers250)
 
     /** The deployable set — what the board bundle ships and what the report quotes.
@@ -701,177 +631,29 @@ object CoreConfig {
     // `git show d63d9f9:src/main/scala/control/CoreConfig.scala` has them if a B6 build is
     // ever needed again, and reports/final/ retains the B6 measurements themselves.
     //
-    // ── OPEN 2026-08-08: can a real systolic dataflow reach the 300 MHz rung? ──
+    // ── CLOSED 2026-08-09: the 300 MHz question, and why nothing here is open ──
     //
-    // What ships is NOT a systolic array. SystolicArray instantiates a 2D PE grid, but no
-    // PE's input is driven by another PE's output — every PE reads the boundary beat and
-    // writes straight to the output port. It is an output-stationary BROADCAST MAC array,
-    // and that broadcast (one activation into xDim*nLanes = 256 PE inputs) is the whole
-    // timing story above: actMaxFanout, colBankSize=4 and the maxN=8192 two-path fight are
-    // all attempts to beat one net from the outside.
+    // Three levers were built and measured against the 300 rung: a real nearest-neighbour
+    // systolic array (systolic.TrueSystolicArray — the shipped SystolicArray is a BROADCAST
+    // MAC array, not a systolic one), a pipelined + replicated tile-capture enable, and the
+    // banked output memory. Only the last one shipped, and only for margin at 250.
     //
-    // systolic.TrueSystolicArray attacks it from the inside: activations march right,
-    // weights march down, one register per PE, every data net fanout 1. The register
-    // arithmetic at the shipped 32x8 geometry says it is worth trying —
+    //     banked, broadcast dataflow   @300   WNS -0.268   TNS -13241.762   94 071 failing
+    //     banked + capture + systolic  @300   WNS -0.310   TNS   -798.596    9 113 failing
     //
-    //     dataflow                 pipeline regs   fanout of one activation net
-    //     shipped  colBankSize=4      5 120 bits       32 PE inputs
-    //     control  colBankSize=1     20 480 bits        8
-    //     true systolic              16 576 bits        1
+    // Failing endpoints fell 90% and TNS 94% while WNS did not move: each fix works on its
+    // own endpoint family and uncovers the next control net of the same shape (gearbox
+    // flush, then arrLocalReset into 1 248 DSP RSTP pins at 90% route). Post-route Fmax is
+    // ~274.5 MHz, and PL0_REF has no rung between 250 and 300, so all of it buys a
+    // deployable clock of exactly ZERO. The prize at 300 was ~5% on a decode that is
+    // weight-bandwidth-bound.
     //
-    // — cheaper in registers than the existing mechanism taken to its limit, and fanout 1.
-    //
-    // THE THREE ARMS, all 2.7B because maxN=8192 is the geometry that fought 250 MHz:
-    //
-    //   mmfree_2_7b        shipped control (colBankSize=4), re-measured at the same rung
-    //   mmfree_2_7b_cb1    zero-RTL control: banking taken to its limit, fanout 32->8.
-    //                      If this alone recovers the slack, the systolic array's marginal
-    //                      value is small and the whole experiment is a footnote.
-    //   mmfree_2_7b_sys    the variant
-    //
-    // The _300 siblings carry plClkMhz = 300 — the top PL0_REF rung, one step above
-    // everything this project has shipped. Timing headroom is the RESULT here; throughput
-    // is the control. Decode is weight-bandwidth-bound and the 200->250 rung measured only
-    // ~5%, so do NOT expect tok/s to move much: if COMPUTE improves and decode does not,
-    // that is the bandwidth wall confirmed and a result in its own right.
-    private val MMFree_2_7B_CB1: CoreConfig = MMFree_2_7B.copy(colBankSize = 1)
-    private val MMFree_2_7B_SYS: CoreConfig = MMFree_2_7B.copy(colBankSize = 0, trueSystolic = true)
+    // The array and capture levers, their tests and the 300 MHz arms live on `exploration`
+    // (and in `git show 6c4abb6` on this branch). Do not re-derive them from scratch — the
+    // measurements are there. `candidates` is empty again, as it should be whenever nothing
+    // is under evaluation.
+    val candidates: Map[String, CoreConfig] = Map.empty
 
-    //
-    // ── WHAT THE FIRST 300 MHz SYNTHESIS RUN ACTUALLY MEASURED, 2026-08-08 ────
-    //
-    // All THREE arms above failed 300 MHz at EXACTLY the same WNS: -0.315 ns, -13.078 ns
-    // TNS, 115 failing endpoints, to three decimals. The top 40 failing paths in every arm
-    // are one family and it is not the array:
-    //
-    //     core/mem/mem_reg_uram_4/CLK -> ... -> core/mem/rpipe_reg[1][18]/D
-    //     3.569 ns data path, 81.7% LOGIC — a 4-deep URAM288 CAS chain (cascade_height=4)
-    //     plus the 2-LUT5 mux over the chain groups, inside OutMemUltra.
-    //
-    // Meanwhile the worst path THROUGH THE ARRAY had over a nanosecond to spare in every
-    // arm, and ranked exactly as the theory predicts:
-    //
-    //     colBankSize=4 (shipped)  +1.005 ns      the systolic array is the best of the
-    //     colBankSize=1 (control)  +1.111 ns      three, by +0.158 ns over shipped — and
-    //     trueSystolic  (variant)  +1.163 ns      it does not matter yet, because the
-    //                                             output memory fails 0.3 ns earlier.
-    //
-    // ⚠️ Post-synth uses ESTIMATED routing, and route delay is precisely where the
-    // broadcast array is weak (74% route over 3 levels on the shipped B6 build). So the
-    // array ranking above is directionally right but understates the gap, and the array
-    // question can only be settled by place-and-route. What post-synth DOES measure
-    // reliably is the URAM path, because that one is 82% hard-block logic delay.
-    //
-    // Hence the _c2 arms: same OutMemUltra with cascade_height=2 (a 2-deep chain plus a
-    // wider fabric mux — less logic, more LUT/route), which is the identical fix
-    // actRamStyle/actCascadeHeight already applies to the activation BRAM, and for the
-    // identical reason. They exist so the 300 MHz dataflow comparison is answerable at
-    // all: until the output memory clears 300, every array measures the same.
-    // (The _c2 arms are retired: 4 -> 2 bought +0.028 ns and made TNS worse. The cascade
-    // was the symptom; see below.)
-
-    //
-    // ── THE URAM WAS NEVER PIPELINED AT ALL ──────────────────────────────────
-    //
-    // Chasing the cascade with outCascadeHeight was treating the symptom. Vivado's URAM
-    // mapping report for the SHIPPED build says:
-    //
-    //     WARNING [Synth 8-6057] Memory "mem_reg" ... implemented as Ultra-Ram has no
-    //                            pipeline registers.
-    //     FF provided for Pipeline: 0     FF absorbed: 0
-    //
-    // OutMemUltra hands the tool FOUR read-pipeline stages and Vivado takes NONE of them,
-    // so the URAM read is a fully combinational CAS_IN_DOUT -> CAS_OUT_DOUT chain and the
-    // module's central design claim — that owning the module is what lets the stages pack
-    // into the cascade — has never actually held. The `_pabsorb` arms rewrite the body to
-    // the UG901 template so the stages CAN be absorbed; success is visible in the synth
-    // log without reading a timing report at all ("FF absorbed" must go non-zero).
-    //
-    // Note these are cascade_height = 4, deliberately: with the pipeline actually IN the
-    // cascade a LONGER chain is fine (each hop ends at a flop), so the right control is
-    // the shipped cascade with a working pipeline, not the shortened one.
-    // (The _pabsorb arms are retired: absorption stayed at ZERO and WNS went -0.315 -> -0.620
-    // because dropping shreg_extract let the stages become SRL16Es. See below.)
-
-    //
-    // ── ...AND "absorb" MADE IT WORSE, WHICH IS ITSELF THE ANSWER ────────────
-    // The UG901 restructure changed nothing about absorption (still `FF provided for
-    // Pipeline: 0`) and dropped WNS from -0.315 to -0.620, because without
-    // shreg_extract="no" Vivado extracted the read pipeline into SRL16Es — the failing
-    // endpoint is literally `rpipe_reg[1][18]_srl2/D`. That is exactly the hazard the
-    // original comment warned about, so the attribute is load-bearing and the coding
-    // style was never the blocker. Vivado will not put these registers in the cascade.
-    //
-    // "banked" therefore stops asking and places them: one explicit sub-array per URAM
-    // cascade chain, every bank output registered, and the mux over REGISTERED outputs
-    // given its own cycle. Read latency is unchanged (the two structural stages replace
-    // two existing pass-through stages), so this costs nothing in Core. The arithmetic
-    // it targets: URAM CLK->DOUT is 1.837 ns alone; the legacy path stacks 0.833 ns of
-    // cascade, 0.246 ns of mux and 0.653 ns of route on top for 3.569 ns against a
-    // 3.333 ns period. Banking leaves the 1.837 ns with only a local route.
-    //
-    // ── "banked" WON AND IS NOW SHIPPED (2026-08-09) ─────────────────────────
-    // At 250 the three arms closed at +0.002 (shipped legacy), +0.010 (systolic) and
-    // +0.020 (banked), so banking is the only one worth a rung of anybody's risk budget:
-    // it turns the thinnest margin this project has ever shipped into 10x that, for
-    // +240 LUT / +4 registers / no latency change. All three deployable presets carry it
-    // above, which is why the candidates below no longer name it.
-    //
-    // ⚠️ Promoting it changed OutMemUltra's module name, so the 2026-08-06 bundles are NOT
-    // bit-compatible: 2.7B and 370M were rebuilt, 1.3B re-cloned from 2.7B, and every gate
-    // must be re-run on the board before these numbers are quoted again.
-    //
-    // ── 300 MHz: WHERE IT ACTUALLY FAILS (place-and-route, not synthesis) ────
-    // mmfree_2_7b_300 (banked, broadcast dataflow, 300 MHz) reads +0.753 ns post-SYNTH with
-    // ZERO failing endpoints and -0.268 ns post-ROUTE with 94 071 of 370 050 failing. The
-    // 1.02 ns routing penalty is 3x what this design pays at 250, at congestion level 5-6,
-    // 86% LUT and 100% DSP. So 300 is a CONGESTION problem, and the failing population —
-    // not the worst path, which is 0.1% of it — is where the levers have to aim:
-    //
-    //     core/tileAccums_reg[*]                    74.2%   driven by ONE net, core/state_reg
-    //     arr/*/accumReg_reg/DSP_OUTPUT/CEP         24.0%   the array's DSP accumulate path
-    //     arr/*/nAccReg_reg[*]                       0.6%
-    //     core/wtGearbox/buf_reg[*]                  0.1%   <- the reported "worst path"
-    //
-    // The 74% is a high-fanout ENABLE, not a wide datapath: Core's `capture` term fans out
-    // to the enable pin of a yDim*outLanesPerTile*tileAccWidth = 59 392-bit register bank
-    // spread over the whole array footprint. That makes it the cheapest thing to attack.
-    private val MMFree_2_7B_SYS_300 = MMFree_2_7B_SYS.copy(plClkMhz = 300)
-
-    // ── THE MAXIMAL ARM: every lever that aims at the failing POPULATION ─────
-    // Deliberately NOT a single-lever A/B, and that is the point. 300 MHz is a congestion
-    // wall — 94 071 failing endpoints, level 5-6, 86% LUT / 100% DSP — so the question worth
-    // one more build is "is 300 reachable at all", not "what is lever X worth". This arm
-    // stacks the banked memory (inherited), captureMaxFanout (the 74.2% family) and the
-    // systolic dataflow (which DELETES the colBankSize pipeline registers driving the 24.0%
-    // family): together, 98% of everything that fails.
-    //
-    // Read it as a bound, not an attribution. If it fails P&R, 300 is settled on this design
-    // and no decomposition is needed — the remaining 2% cannot carry it. Only if it closes
-    // does splitting the levers become worth the build time.
-    //
-    // captureMaxFanout = 128 is a FIRST SHOT, not a tuned value: 59 392 bits / 128 ≈ 464
-    // replicas of the enable, ~464 extra flops against 116 469 already used (free) spread
-    // across the array footprint. Lower replicates harder and adds nets to a design already
-    // at congestion level 5-6; higher leaves long enable routes. If this arm lands CLOSE,
-    // sweep it (64 / 256) before concluding anything — and note the same attribute rides
-    // drainBusy, so the sweep moves both CE drivers together by construction.
-    private val MMFree_2_7B_MAX_300 = MMFree_2_7B_SYS_300.copy(captureMaxFanout = 128)
-
-    val candidates: Map[String, CoreConfig] = Map(
-        // The 300 MHz control: shipped dataflow + banked memory. This is the -0.268 ns
-        // post-route baseline every lever below is measured against.
-        "mmfree_2_7b_300"       -> MMFree_2_7B.copy(plClkMhz = 300),
-        // Systolic dataflow at 250, now on top of the banked memory. Its own 250 build
-        // (+0.010) put the limiter on the nAcc broadcast; banking's (+0.020) put it on the
-        // colBankSize pipeline registers that this dataflow DELETES, so the combination is
-        // the one arm never measured.
-        "mmfree_2_7b_sys"       -> MMFree_2_7B_SYS,
-        "mmfree_2_7b_sys_300"   -> MMFree_2_7B_SYS_300,
-        // The maximal arm — see above. Stacks three levers on purpose; it answers whether
-        // 300 is reachable, not what any one lever is worth.
-        "mmfree_2_7b_max300"    -> MMFree_2_7B_MAX_300
-    )
 
     /** Everything `make build PRESET=` / EmitCore can reach. */
     val presets: Map[String, CoreConfig] = deployable ++ candidates

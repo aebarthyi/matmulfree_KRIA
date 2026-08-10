@@ -38,15 +38,13 @@ import chisel3.util._
   * get distinct inline SV (BlackBoxInline keys on the file/module name).
   */
 class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, cascadeHeight: Int = 4,
-                  pipeStyle: String = "legacy", bankDepth: Int = 0)
+                  bankDepth: Int = 0)
     extends BlackBox with HasBlackBoxInline {
   require(depth > 0 && width > 0 && latency >= 1 && writeLat >= 1 && cascadeHeight >= 1)
-  require(Seq("legacy", "absorb", "banked").contains(pipeStyle),
-    s"""pipeStyle="$pipeStyle" must be "legacy", "absorb" or "banked"""")
   require(bankDepth >= 0, s"bankDepth=$bankDepth must be >= 0 (0 = auto)")
   private val aw = log2Ceil(depth)
 
-  // ── Banking geometry (pipeStyle = "banked") ───────────────────────────────
+  // ── Banking geometry ──────────────────────────────────────────────────────
   // One URAM288 is 4096 deep, so a bank of 4096*cascadeHeight rows is exactly one
   // hard cascade chain and no chain ever spans banks. bankDepth is overridable so a
   // simulation-sized memory can still be forced into several banks — otherwise every
@@ -60,8 +58,8 @@ class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, casca
   private val declBankDepth = if (nBanks <= 1) depth else effBankDepth
   private val bankAw        = log2Ceil(declBankDepth)
   private val selW         = if (nBanks <= 1) 0 else log2Ceil(nBanks)
-  require(pipeStyle != "banked" || nBanks <= 1 || latency >= 2,
-    s"banked needs latency >= 2 (one stage for the bank output, one for the mux); got $latency")
+  require(nBanks <= 1 || latency >= 2,
+    s"banking needs latency >= 2 (one stage for the bank output, one for the mux); got $latency")
 
   val io = IO(new Bundle {
     val clk   = Input(Clock())
@@ -73,69 +71,47 @@ class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, casca
     val rdata = Output(UInt(width.W))
   })
 
-  private val styleTag =
-    if (pipeStyle == "legacy") ""
-    else if (pipeStyle == "banked") s"_pbanked${nBanks}x$effBankDepth"
-    else s"_p$pipeStyle"
+  // The `_pbanked` tag is retained from when this module had several selectable read
+  // bodies. It is load-bearing, not vestigial: the shipped bitstreams were built from
+  // SV carrying this exact module name, and scripts/clone_preset_hw.sh accepts the 1.3B
+  // clone only if the emitted SV still hashes the same. Do not "tidy" it away.
+  private val styleTag = s"_pbanked${nBanks}x$effBankDepth"
   override val desiredName =
     s"OutMemUltra_${depth}x${width}_l${latency}_w${writeLat}_c${cascadeHeight}$styleTag"
 
-  // ── pipeStyle = "absorb" ──────────────────────────────────────────────────
-  // MEASURED 2026-08-08: the "legacy" body below gets `FF provided for Pipeline: 0,
-  // FF absorbed: 0` out of Vivado's URAM mapping report, alongside
-  //   WARNING [Synth 8-6057] Memory "mem_reg" ... has no pipeline registers.
-  // i.e. NONE of its `latency` read stages are offered to the URAM matrix, and the
-  // read path is a fully combinational CAS_IN_DOUT -> CAS_OUT_DOUT chain across the
-  // cascade. That chain is the design's worst 300 MHz path (-0.315 ns, 82% logic).
-  // The module comment above has always claimed those registers pack into the
-  // cascade; the report says they never did.
-  //
-  // Two differences from the Xilinx UG901 UltraRAM template are candidates, and this
-  // variant removes both at once because they are cheap to test together and the
-  // mapping report says unambiguously which way it went:
-  //   1. read and write live in SEPARATE always blocks here; the template puts them
-  //      in ONE, which is how the tool recognises the SDP-with-pipeline structure.
-  //   2. `shreg_extract = "no"` sits on the pipeline registers. It was added to stop
-  //      SRL inference (an SRL after the cascade pipelines nothing), but it also
-  //      blocks the absorption it was meant to enable.
-  // The template's own defence against SRL extraction is the explicit `mem_data`
-  // output stage plus indexed pipeline stages fed from it, so dropping the attribute
-  // is not simply reopening the SRL hole.
-  //
-  // Read semantics are IDENTICAL either way: rdata is mem[raddr] delayed by
-  // `latency` cycles, advanced only while `ren` is high. mem_data is stage 0 and the
-  // pipe holds the remaining latency-1, so Core's outReadLat accounting is unchanged
-  // — which is what lets CoreSpec run the two bodies against the same reference.
   private val nbPipe = latency - 1
 
-  private val absorbBody =
-    s"""  // Single always block, Xilinx UG901 UltraRAM template: write, the RAM output
-       |  // register (mem_data), and the cascade pipeline stages together, so synthesis
-       |  // recognises the structure and offers the stages to the URAM matrix. Check it
-       |  // took them: the synth log's "Ultra RAM: Final Mapping Report" must show a
-       |  // non-zero "FF absorbed" for this instance.
-       |  reg [${width - 1}:0] mem_data;
-       |${if (nbPipe > 0) s"  reg [${width - 1}:0] rpipe [0:${nbPipe - 1}];\n  integer i;\n" else ""}
-       |  always @(posedge clk) begin
-       |    if (wen_q[${writeLat - 1}]) mem[waddr_q[${writeLat - 1}]] <= wdata_q[${writeLat - 1}];
-       |    if (ren) begin
-       |      mem_data <= mem[raddr];
-       |${if (nbPipe > 0) s"""      for (i = 0; i < $nbPipe; i = i + 1)
-       |        rpipe[i] <= (i == 0) ? mem_data : rpipe[i - 1];
-       |""" else ""}    end
-       |  end
-       |  assign rdata = ${if (nbPipe > 0) s"rpipe[${nbPipe - 1}]" else "mem_data"};
-       |""".stripMargin
-
-  // ── pipeStyle = "banked" — the fix that does not depend on inference ──────
-  // Both "legacy" and "absorb" are mapped with `FF provided for Pipeline: 0`: Vivado
-  // takes NONE of the read stages into the URAM matrix regardless of coding style, so
-  // the read stays one combinational run from a URAM's CLK through the whole
-  // CAS_IN_DOUT -> CAS_OUT_DOUT chain and the group mux. Chasing that with
-  // cascadeHeight is treating the symptom (4 -> 2 bought +0.028 ns), and "absorb"
-  // made it worse by reopening SRL extraction on the pipeline.
+  // ── WHY THE READ IS BANKED, and why it is not just a pipelined cascade ────
+  // MEASURED 2026-08-08. The obvious implementation — one deep URAM array with
+  // `latency` read-pipeline stages after it — is what this module used to be, and
+  // Vivado mapped it with
+  //   WARNING [Synth 8-6057] Memory "mem_reg" ... has no pipeline registers.
+  //   FF provided for Pipeline: 0      FF absorbed: 0
+  // i.e. NONE of the read stages were taken into the URAM matrix, leaving the read a
+  // fully combinational CAS_IN_DOUT -> CAS_OUT_DOUT run across the cascade plus the
+  // group mux. That was the design's worst path at 300 MHz (-0.315 ns, 82% logic),
+  // and the module comment claiming those registers packed into the cascade was
+  // simply wrong for as long as it existed.
   //
-  // So place the registers by construction instead of asking for them. The address
+  // Two fixes were tried and REJECTED, both worth knowing before re-litigating this:
+  //   * Shortening the cascade (cascadeHeight 4 -> 2) bought +0.028 ns and made TNS
+  //     worse. URAM288 CLK->DOUT is ~1.837 ns before any cascade, so the chain was
+  //     never where the time went.
+  //   * Rewriting to the UG901 single-always-block template changed absorption not at
+  //     all (still `FF provided: 0`) and cost 0.3 ns, because dropping
+  //     `shreg_extract="no"` let the stages become SRL16Es. That attribute is
+  //     load-bearing exactly as its original comment said.
+  // The conclusion those two produced is the reason for the code below: VIVADO WILL
+  // NOT PUT THESE REGISTERS IN THE CASCADE, whatever you write. So stop asking, and
+  // place them structurally instead.
+  //
+  // Worth +1.068 ns post-synth / +0.018 ns post-route at 250 on the maxN=8192
+  // geometry, for +240 LUT, +4 registers, the same URAM count and NO latency change.
+  // On maxN=4096 (370M) it is worth ~nothing — that geometry's limiter is the array,
+  // not this memory — so it is carried there for uniformity only.
+
+  // ── The banked read ───────────────────────────────────────────────────────
+  // Place the registers by construction instead of asking for them. The address
   // space is split into `nBanks` explicit sub-arrays, each exactly one cascade chain
   // deep, and the read is:
   //
@@ -145,16 +121,16 @@ class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, casca
   //     cycle 3.. the remaining latency-2 stages, unchanged
   //
   // No cascade hop, no mux, and no cross-die route shares a cycle with the URAM
-  // access any more. The arithmetic from the failing path: URAM CLK->DOUT is 1.837 ns
-  // on its own — 55% of a 3.333 ns period — and the legacy path adds 0.833 ns of
-  // cascade, 0.246 ns of mux and 0.653 ns of route on top, for 3.569 ns. Banking
-  // leaves the 1.837 ns alone with its route to a local flop (~2.2 ns), and gives the
-  // mux its own cycle. That is the trade: read latency for fabric clock.
+  // access any more. The arithmetic from the path this replaced: URAM CLK->DOUT is
+  // 1.837 ns on its own — 55% of a 3.333 ns period — and the unbanked path added
+  // 0.833 ns of cascade, 0.246 ns of mux and 0.653 ns of route on top, for 3.569 ns.
+  // Banking leaves the 1.837 ns alone with its route to a local flop (~2.2 ns), and
+  // gives the mux its own cycle.
   //
   // Total read latency is UNCHANGED at `latency` — the two structural stages replace
   // two of the existing pass-through stages rather than adding to them — so Core's
   // outReadLat accounting, primeCtr and drain flush are untouched. The tail stages
-  // keep shreg_extract="no", which the "absorb" result proved is load-bearing.
+  // keep shreg_extract="no"; the UG901 experiment above proved it is load-bearing.
   private val bankedBody = {
     val wl      = writeLat - 1
     val tail    = latency - (if (nBanks <= 1) 1 else 2)
@@ -225,26 +201,11 @@ class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, casca
     banks + "\n" + mux + "\n" + tailStages
   }
 
-  // ⚠️ The legacy body must stay BYTE-IDENTICAL: scripts/clone_preset_hw.sh hashes the
-  // emitted SV, so even an added comment line here makes it refuse a legitimate clone.
-  // Its inline claim about packing registers into the cascade is wrong (see above); the
-  // correction lives here in the Scala, not in the generated file.
-  private val legacyBody =
-    s"""  always @(posedge clk) if (wen_q[${writeLat - 1}]) mem[waddr_q[${writeLat - 1}]] <= wdata_q[${writeLat - 1}];
-       |
-       |  // `latency` registered read stages. shreg_extract="no" keeps them as
-       |  // flops (not SRLs) so the tool packs them into the URAM cascade pipeline
-       |  // registers — an SRL would sit after the whole cascade and pipeline
-       |  // nothing. Gated by `ren` so the store FSM can stall without data loss.
-       |  (* shreg_extract = "no" *) reg [${width - 1}:0] rpipe [0:${latency - 1}];
-       |  integer i;
-       |  always @(posedge clk) if (ren) begin
-       |    rpipe[0] <= mem[raddr];
-       |    for (i = 1; i < $latency; i = i + 1) rpipe[i] <= rpipe[i - 1];
-       |  end
-       |  assign rdata = rpipe[${latency - 1}];
-       |""".stripMargin
-
+  // ⚠️ EVERY character emitted below is load-bearing. scripts/clone_preset_hw.sh hashes
+  // the emitted SV to decide whether the 1.3B clone may reuse the 2.7B bitstream, so even
+  // an added comment line inside these strings makes it refuse a legitimate clone — and a
+  // shipped bitstream stops matching the source it was built from. Change the Scala
+  // comments freely; change the generated text only with a rebuild.
   setInline(
     s"$desiredName.sv",
     s"""// Generated by control.OutMemUltra — URAM output memory, read latency=$latency.
@@ -260,8 +221,7 @@ class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, casca
        |  // cascade_height bounds the URAM chain length so the read-data AND
        |  // write-address cascades stay short enough for 250 MHz (a single deep
        |  // chain over all ${depth / 4096 + 1}~ URAMs is a 7-deep combinational cascade that fails).
-       |${if (pipeStyle == "banked") "  // (banked: the storage is declared per bank in the generate block below)"
-          else s"""  (* ram_style = "ultra", cascade_height = $cascadeHeight *) reg [${width - 1}:0] mem [0:${depth - 1}];"""}
+       |  // (banked: the storage is declared per bank in the generate block below)
        |
        |  // `writeLat` registered write stages. shreg_extract="no" keeps them as
        |  // flops (not SRLs) so the placer puts them adjacent to the URAM write
@@ -278,11 +238,7 @@ class OutMemUltra(depth: Int, width: Int, latency: Int, writeLat: Int = 1, casca
        |      waddr_q[j] <= waddr_q[j - 1]; wen_q[j] <= wen_q[j - 1]; wdata_q[j] <= wdata_q[j - 1];
        |    end
        |  end
-       |${pipeStyle match {
-         case "legacy" => legacyBody
-         case "banked" => bankedBody
-         case _        => absorbBody
-       }}endmodule
+       |${bankedBody}endmodule
        |""".stripMargin
   )
 }

@@ -704,141 +704,21 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   }
 
   // ──────────────────────────────────────────────────────────────────
-  // True systolic dataflow — systolic.TrueSystolicArray in place of the broadcast
-  // MAC array. Same claim as banking above and a stronger version of it: the array
-  // is only retimed, so end-to-end results must be IDENTICAL, but the drain is now
-  // (xDim-1)+(yDim-1) cycles instead of (numBanks-1), and it is Core's
-  // capture -> arrLocalReset -> next-tile sequence that has to absorb it. The array's
-  // own spec cannot see that interaction; this is where a drain that runs long, or an
-  // array that keeps accepting beats into the wavefront, corrupts a tile boundary.
+  // The BANKED output memory. batchSize=2 here, so outRamStyle="ultra" and every test
+  // in this suite already runs through OutMemUltra — but at the production bank depth
+  // the tiny config's memory lands in ONE bank, so the bank-select decode and the
+  // registered mux, which are the entire point of the design, are never built. This
+  // block forces small bank depths so they are.
   //
-  // Same five seeds as the baseline and the banked block, so any divergence is
-  // attributable to the dataflow swap and nothing else.
+  // What it protects: the banked read replaces two pass-through pipeline stages with
+  // two structural ones (bank output register, then the mux over registered outputs),
+  // and claims total read latency is UNCHANGED. That claim is one off-by-one away from
+  // being false, and a slip does not crash — it silently desynchronises the STORE
+  // stream and ships shifted output. Same seeds as the baseline, so any divergence is
+  // attributable to the memory and nothing else.
   // ──────────────────────────────────────────────────────────────────
 
-  "Core with the true systolic array (trueSystolic = true)" - {
-    def mkSystolicCore = new Core(
-      aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
-      maxN = maxN, maxM = maxM, outBeatLanes = 0,
-      axiAddrWidth = ADDR_WIDTH, axiDataWidth = DATA_WIDTH, axiIdWidth = ID_WIDTH,
-      trueSystolic = true
-    )
-
-    "numeric: random workloads match reference (5 seeds)" in {
-      Seq(1L, 7L, 42L, 99L, 256L).foreach { seed =>
-        simulate(mkSystolicCore) { dut =>
-          resetDut(dut)
-          val rng = new Random(seed)
-          val n   = 4 + rng.nextInt(maxN - 3)
-          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
-          val m = numColTiles * outLanesPerTile
-          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
-          val weights = Seq.fill(numColTiles * n) {
-            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
-          }
-          val actual   = runPipeline(dut, acts, weights, n, m)
-          val expected = referenceCompute(acts, weights, n, m)
-          withClue(s"systolic seed=$seed n=$n m=$m") { actual mustBe expected }
-        }
-      }
-    }
-
-    // The tile boundary is the whole risk: PE(0,0) stops the input drainCycles before
-    // PE(yDim-1,xDim-1) finishes, and a streaming caller that is not held off feeds the
-    // NEXT tile's first beats into the drain and loses them. Multi-tile with a
-    // per-cycle-varying activation makes a lost or duplicated beat a wrong number
-    // rather than a coincidence.
-    "edge: back-to-back COMPUTE tiles survive the wavefront drain" in {
-      simulate(mkSystolicCore) { dut =>
-        resetDut(dut)
-        val n = maxN
-        val m = 4 * outLanesPerTile   // 4 col tiles: capture -> reset -> next tile, thrice
-        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 1) & ((1 << aWidth) - 1)))
-        val weights = Seq.tabulate((m / outLanesPerTile) * n) { i =>
-          Seq.tabulate(outLanesPerTile)(j => Seq(0, 1, 3)((i + j) % 3))
-        }
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
-
-    // n = 2, not n = 1. MEASURED 2026-08-08: a COMPUTE with cmpRows=1 never raises IRQ
-    // on EITHER array — PE.scala increments accumCounter on the idle->running edge, so
-    // the `accumCounter.value === nAccReg` test is first evaluated at counter=1 against
-    // nAccReg = nAcc-1 = 0 and only matches after the counter wraps at maxAcc. That is a
-    // pre-existing PE counter limitation (the same one behind `require(maxAcc >= 2)`),
-    // identical on the shipped broadcast array, and unreachable in practice because real
-    // projections have N >= 1024. n=2 is the smallest COMPUTE the PE actually supports,
-    // and the wavefront still has to cross the whole array for it.
-    "edge: a two-beat COMPUTE still crosses the array" in {
-      simulate(mkSystolicCore) { dut =>
-        resetDut(dut)
-        val n = 2
-        val m = 2 * outLanesPerTile
-        val acts    = Seq(Seq.fill(batchSize)(3), Seq.fill(batchSize)(5))
-        val weights = Seq.fill((m / outLanesPerTile) * n)(Seq.tabulate(outLanesPerTile)(j => Seq(0, 1, 3)(j % 3)))
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
-  }
-
-  // ──────────────────────────────────────────────────────────────────
-  // outPipeStyle — the OutMemUltra read-pipeline body. batchSize=2 here, so
-  // outRamStyle="ultra" and EVERY test in this suite already runs through
-  // OutMemUltra; this block re-runs the numeric cases against the "absorb" body.
-  //
-  // Why it needs its own tests: "absorb" restructures the read path into the UG901
-  // UltraRAM template (write and read in one always block, an explicit mem_data
-  // output stage, and latency-1 pipeline stages after it instead of latency stages).
-  // Total read latency is unchanged BY CONSTRUCTION — mem_data is stage 0 — but that
-  // is exactly the kind of claim that is one off-by-one away from being false, and a
-  // one-cycle slip here does not crash: it silently desynchronises the STORE stream
-  // and ships shifted output. Same seeds as the baseline, so a divergence is
-  // attributable to the memory body and nothing else.
-  // ──────────────────────────────────────────────────────────────────
-
-  "Core with the UG901-template output memory (outPipeStyle = absorb)" - {
-    def mkAbsorbCore(systolic: Boolean = false) = new Core(
-      aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
-      maxN = maxN, maxM = maxM, outBeatLanes = 0,
-      axiAddrWidth = ADDR_WIDTH, axiDataWidth = DATA_WIDTH, axiIdWidth = ID_WIDTH,
-      outPipeStyle = "absorb", trueSystolic = systolic
-    )
-
-    "numeric: random workloads match reference (5 seeds)" in {
-      Seq(1L, 7L, 42L, 99L, 256L).foreach { seed =>
-        simulate(mkAbsorbCore()) { dut =>
-          resetDut(dut)
-          val rng = new Random(seed)
-          val n   = 4 + rng.nextInt(maxN - 3)
-          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
-          val m = numColTiles * outLanesPerTile
-          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
-          val weights = Seq.fill(numColTiles * n) {
-            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
-          }
-          val actual   = runPipeline(dut, acts, weights, n, m)
-          val expected = referenceCompute(acts, weights, n, m)
-          withClue(s"absorb seed=$seed n=$n m=$m") { actual mustBe expected }
-        }
-      }
-    }
-
-    // Multi-col-tile with a per-row-distinct value: a read pipeline that is one stage
-    // short or one stage long emits the neighbouring row, which only shows up when
-    // consecutive rows differ. A constant fill would pass at any latency.
-    "edge: every output row is distinct, so a latency slip cannot hide" in {
-      simulate(mkAbsorbCore()) { dut =>
-        resetDut(dut)
-        val n = maxN
-        val m = 4 * outLanesPerTile
-        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 1) & ((1 << aWidth) - 1)))
-        val weights = Seq.tabulate((m / outLanesPerTile) * n) { i =>
-          Seq.tabulate(outLanesPerTile)(j => Seq(0, 1, 3)((i + j) % 3))
-        }
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
-
+  "Core with the banked output memory" - {
     // ── banked ──────────────────────────────────────────────────────────────
     // outBankDepth is forced small here on purpose. The tiny config's output memory is
     // only batchSize*numColTilesMax rows deep, so at the production default
@@ -846,11 +726,11 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     // point of the style — is never built, let alone exercised. outBankDepth=2 splits
     // it across several banks so the bank-select decode, the write-side bank decode and
     // the mux all run.
-    def mkBankedCore(bankDepth: Int, systolic: Boolean = false) = new Core(
+    def mkBankedCore(bankDepth: Int) = new Core(
       aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
       maxN = maxN, maxM = maxM, outBeatLanes = 0,
       axiAddrWidth = ADDR_WIDTH, axiDataWidth = DATA_WIDTH, axiIdWidth = ID_WIDTH,
-      outPipeStyle = "banked", outBankDepth = bankDepth, trueSystolic = systolic
+      outBankDepth = bankDepth
     )
 
     "banked: random workloads match reference across bank counts" in {
@@ -893,162 +773,6 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    "banked: composes with the true systolic array" in {
-      simulate(mkBankedCore(bankDepth = 2, systolic = true)) { dut =>
-        resetDut(dut)
-        val rng = new Random(7L)
-        val n   = 4 + rng.nextInt(maxN - 3)
-        val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
-        val m = numColTiles * outLanesPerTile
-        val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
-        val weights = Seq.fill(numColTiles * n) {
-          Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
-        }
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
-
-    // The combination that would actually ship: both fixes at once.
-    "numeric: composes with the true systolic array" in {
-      Seq(1L, 42L, 256L).foreach { seed =>
-        simulate(mkAbsorbCore(systolic = true)) { dut =>
-          resetDut(dut)
-          val rng = new Random(seed)
-          val n   = 4 + rng.nextInt(maxN - 3)
-          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
-          val m = numColTiles * outLanesPerTile
-          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
-          val weights = Seq.fill(numColTiles * n) {
-            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
-          }
-          val actual   = runPipeline(dut, acts, weights, n, m)
-          val expected = referenceCompute(acts, weights, n, m)
-          withClue(s"absorb+systolic seed=$seed n=$n m=$m") { actual mustBe expected }
-        }
-      }
-    }
-  }
-
-  // ──────────────────────────────────────────────────────────────────
-  // captureMaxFanout — the pipelined tile capture. MEASURED 2026-08-08, the enable of
-  // the tileAccums bank is 74.2% of everything that fails 300 MHz, so the lever moves the
-  // parallel load out of the FSM into its own cCapture state where a plain register drives
-  // it and max_fanout can replicate that register.
-  //
-  // The attribute itself is invisible to Verilator; what these tests pin is the RETIMING,
-  // which is not invisible at all. Capture is now decided in cStream and performed one
-  // cycle later, so the array must still be holding both `valid` and its accumulators when
-  // the load happens — the whole correctness argument rests on PEs holding in done_state
-  // until `ready`. If that is wrong the failure is silent: tileAccums latches whatever the
-  // array shows next and the tile ships plausible garbage. Every test therefore uses
-  // per-row-distinct data, where a stale or early load is a wrong number rather than a
-  // coincidence.
-  //
-  // Same seeds as the baseline and the outPipeStyle block, so a divergence is attributable
-  // to the capture pipeline and nothing else.
-  // ──────────────────────────────────────────────────────────────────
-
-  "Core with the pipelined tile capture (captureMaxFanout > 0)" - {
-    def mkCaptureCore(systolic: Boolean = false, pipeStyle: String = "legacy",
-                      bankDepth: Int = 0) = new Core(
-      aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
-      maxN = maxN, maxM = maxM, outBeatLanes = 0,
-      axiAddrWidth = ADDR_WIDTH, axiDataWidth = DATA_WIDTH, axiIdWidth = ID_WIDTH,
-      outPipeStyle = pipeStyle, outBankDepth = bankDepth, trueSystolic = systolic,
-      captureMaxFanout = 32
-    )
-
-    "numeric: random workloads match reference (5 seeds)" in {
-      Seq(1L, 7L, 42L, 99L, 256L).foreach { seed =>
-        simulate(mkCaptureCore()) { dut =>
-          resetDut(dut)
-          val rng = new Random(seed)
-          val n   = 4 + rng.nextInt(maxN - 3)
-          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
-          val m = numColTiles * outLanesPerTile
-          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
-          val weights = Seq.fill(numColTiles * n) {
-            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
-          }
-          val actual   = runPipeline(dut, acts, weights, n, m)
-          val expected = referenceCompute(acts, weights, n, m)
-          withClue(s"capture seed=$seed n=$n m=$m") { actual mustBe expected }
-        }
-      }
-    }
-
-    // The tile boundary, which is where the extra state lives: cStream -> cCapture ->
-    // cReset -> cStream, once per col tile. Every col tile holds a DIFFERENT accumulator
-    // pattern, so a capture that fires a cycle early (array not yet valid) or a cycle late
-    // (array already reset by cReset) ships a neighbouring tile's numbers.
-    "edge: every col tile captures its own accumulators" in {
-      simulate(mkCaptureCore()) { dut =>
-        resetDut(dut)
-        val n = maxN
-        val m = maxM                                   // all col tiles => the longest chain
-        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 1) & ((1 << aWidth) - 1)))
-        val weights = Seq.tabulate((m / outLanesPerTile) * n) { i =>
-          Seq.tabulate(outLanesPerTile)(j => Seq(0, 1, 3)((i * 7 + j * 3) % 3))
-        }
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
-
-    // The one case where capture is NOT free to fire when the array is ready: the previous
-    // tile's drain still owns tileAccums. cmpRows = 2 against a drain of
-    // batchSize*outSubBeats = 2 rows makes the tiles arrive as fast as the drain can
-    // retire them, so the `!drainBusy` gate is live on every boundary — and it is the gate
-    // whose decision is now one cycle older than the load it guards.
-    "edge: a drain still in flight holds the capture off" in {
-      simulate(mkCaptureCore()) { dut =>
-        resetDut(dut)
-        val n = 2
-        val m = maxM
-        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i * 5 + 1) & ((1 << aWidth) - 1)))
-        val weights = Seq.tabulate((m / outLanesPerTile) * n) { i =>
-          Seq.tabulate(outLanesPerTile)(j => Seq(0, 1, 3)((i + j) % 3))
-        }
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
-
-    // Against the memory that actually ships. The banked read path has its own registered
-    // mux, so this is the combination where a one-cycle capture slip and a one-cycle read
-    // slip could cancel out in a single-tile test and only show up across tiles — hence
-    // several banks (bankDepth=1) and multiple col tiles.
-    "composes with the banked output memory (the shipped style)" in {
-      Seq(1L, 42L, 256L).foreach { seed =>
-        simulate(mkCaptureCore(pipeStyle = "banked", bankDepth = 1)) { dut =>
-          resetDut(dut)
-          val rng = new Random(seed)
-          val n   = 4 + rng.nextInt(maxN - 3)
-          val numColTiles = 1 + rng.nextInt(maxM / outLanesPerTile)
-          val m = numColTiles * outLanesPerTile
-          val acts = Seq.fill(n)(Seq.fill(batchSize)(rng.nextInt(1 << aWidth)))
-          val weights = Seq.fill(numColTiles * n) {
-            Seq.fill(outLanesPerTile)(Seq(0, 1, 3)(rng.nextInt(3)))
-          }
-          val actual   = runPipeline(dut, acts, weights, n, m)
-          val expected = referenceCompute(acts, weights, n, m)
-          withClue(s"capture+banked seed=$seed n=$n m=$m") { actual mustBe expected }
-        }
-      }
-    }
-
-    // The systolic array holds its accumulators in done_state through its OWN drain, which
-    // is the property the deferred load depends on; this is the direct test of it.
-    "composes with the true systolic array" in {
-      simulate(mkCaptureCore(systolic = true, pipeStyle = "banked", bankDepth = 1)) { dut =>
-        resetDut(dut)
-        val n = maxN
-        val m = 4 * outLanesPerTile
-        val acts = Seq.tabulate(n)(i => Seq.fill(batchSize)((i + 1) & ((1 << aWidth) - 1)))
-        val weights = Seq.tabulate((m / outLanesPerTile) * n) { i =>
-          Seq.tabulate(outLanesPerTile)(j => Seq(0, 1, 3)((i + j) % 3))
-        }
-        runPipeline(dut, acts, weights, n, m) mustBe referenceCompute(acts, weights, n, m)
-      }
-    }
   }
 
   // ──────────────────────────────────────────────────────────────────

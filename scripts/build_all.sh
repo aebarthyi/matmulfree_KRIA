@@ -116,11 +116,12 @@ stage_shared() {
     cp "$SCRIPT_DIR/split_sweep_csv.py" "$BUNDLE_ROOT/split_sweep_csv.py"
     cp "$SCRIPT_DIR/cma_reclaim.sh"      "$BUNDLE_ROOT/cma_reclaim.sh"
     cp "$SCRIPT_DIR/cma_boot_raise.sh"   "$BUNDLE_ROOT/cma_boot_raise.sh"
+    cp "$SCRIPT_DIR/gate_all.sh"         "$BUNDLE_ROOT/gate_all.sh"
     chmod +x "$BUNDLE_ROOT/deploy_kria.sh" "$BUNDLE_ROOT/power_bench.sh" \
              "$BUNDLE_ROOT/bench_batch.sh" "$BUNDLE_ROOT/sweep_all.sh" \
              "$BUNDLE_ROOT/final_sweep_board.sh" \
              "$BUNDLE_ROOT/split_sweep_csv.py" "$BUNDLE_ROOT/cma_reclaim.sh" \
-             "$BUNDLE_ROOT/cma_boot_raise.sh"
+             "$BUNDLE_ROOT/cma_boot_raise.sh" "$BUNDLE_ROOT/gate_all.sh"
     cp "$SCRIPT_DIR/board.conf.example" "$BUNDLE_ROOT/board.conf.example" 2>/dev/null || true
 
     # u-dma-buf driver source (vendored submodule), so the board needs no external module.

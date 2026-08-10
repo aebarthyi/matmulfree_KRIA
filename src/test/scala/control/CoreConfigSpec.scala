@@ -65,62 +65,16 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       CoreConfig.deployable.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
     }
 
-    // `candidates` was asserted EMPTY from the B6 retirement (2026-08-07) until the
-    // true-systolic experiment opened (2026-08-08). What the empty check was really
-    // protecting is asserted directly instead, and holds whether or not a candidate is
-    // open: a candidate may never shadow or silently join the deployable set, and every
-    // buildable name must resolve to exactly the config it is registered under. When the
-    // systolic arm closes — promoted or moved to `exploration` — restore `candidates
-    // mustBe empty` here.
-    "candidates stay disjoint from the deployable set and every buildable name resolves" in {
+    // With the 300 MHz question closed (2026-08-09) and its arms moved to `exploration`,
+    // the whole buildable registry IS the deployable set again. Both halves are asserted:
+    // that candidates is empty, and that a non-empty one would still be disjoint and
+    // reachable — so re-adding a candidate later cannot silently skip the check.
+    "the buildable registry is exactly the deployable set while no candidate is open" in {
+      CoreConfig.candidates mustBe empty
       CoreConfig.candidates.keySet.intersect(CoreConfig.deployable.keySet) mustBe empty
       CoreConfig.presets mustBe (CoreConfig.deployable ++ CoreConfig.candidates)
       (CoreConfig.deployable.keys ++ CoreConfig.candidates.keys)
         .foreach { n => CoreConfig.byName(n) mustBe CoreConfig.presets(n) }
-    }
-
-    // The open experiment, pinned so the arms stay comparable. Each candidate must differ
-    // from the shipped 2.7B in EXACTLY the lever under test and nothing else — a second
-    // difference makes the WNS delta unattributable, which is the way an A/B like this
-    // usually goes wrong. See the CoreConfig comment above `candidates`.
-    //
-    // The banked output memory is no longer a lever here: it WON at 250 (+0.020 vs the
-    // shipped +0.002) and is carried by every deployable preset, so the arms inherit it and
-    // the only differences left are the dataflow and the clock rung.
-    "the 300 MHz arms differ from shipped 2.7B only in the lever under test" in {
-      val base = CoreConfig.deployable("mmfree_2_7b")
-      CoreConfig.candidates("mmfree_2_7b_300") mustBe base.copy(plClkMhz = 300)
-      CoreConfig.candidates("mmfree_2_7b_sys") mustBe
-        base.copy(colBankSize = 0, trueSystolic = true)
-      CoreConfig.candidates("mmfree_2_7b_sys_300") mustBe
-        base.copy(colBankSize = 0, trueSystolic = true, plClkMhz = 300)
-      // The maximal arm is the deliberate exception to the one-lever rule: it stacks the
-      // capture-enable fix and the systolic dataflow to cover 98% of the failing endpoint
-      // population, because the open question is whether 300 is reachable AT ALL. Pinned
-      // exactly so "stacked on purpose" cannot quietly become "drifted".
-      CoreConfig.candidates("mmfree_2_7b_max300") mustBe
-        base.copy(colBankSize = 0, trueSystolic = true, plClkMhz = 300, captureMaxFanout = 128)
-      // Every arm rides the shipped memory, or the comparison is against a different wall.
-      CoreConfig.candidates.foreach { case (n, c) =>
-        withClue(n) {
-          c.outPipeStyle     mustBe "banked"
-          c.outCascadeHeight mustBe 1
-        }
-      }
-    }
-
-    // outPipeStyle changes OutMemUltra's module NAME, which is what keeps two variants from
-    // colliding in one emitted directory. Since 2026-08-09 the shipped style is "banked":
-    // MEASURED, Vivado absorbed ZERO of the legacy body's four read stages ("FF absorbed: 0"),
-    // so the legacy read was a combinational URAM cascade and banking is what actually placed
-    // the registers. Pin the shipped value and that the validator still rejects nonsense.
-    "outPipeStyle is validated and the shipped style is the banked memory" in {
-      CoreConfig.deployable.foreach { case (n, c) =>
-        withClue(n) { c.outPipeStyle mustBe "banked" }
-      }
-      val base = CoreConfig.deployable("mmfree_2_7b")
-      an[IllegalArgumentException] must be thrownBy base.copy(outPipeStyle = "pipelined")
-      noException must be thrownBy base.copy(outPipeStyle = "legacy")
     }
 
     // With "banked" there is no hard cascade left to bound — one URAM chain per bank,
@@ -132,31 +86,6 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       }
       CoreConfig.deployable("mmfree_1_3b").outCascadeHeight mustBe
         CoreConfig.deployable("mmfree_2_7b").outCascadeHeight
-    }
-
-    // captureMaxFanout is an OPEN lever, not a shipped one: MEASURED 2026-08-08 the tile
-    // capture enable is 74.2% of what fails 300 MHz, but the fix is a placement/fanout
-    // effect that only a full build can price, and nothing has been built with it yet. It
-    // must therefore stay 0 on every deployable preset — at 0 the extra cCapture state is
-    // not generated at all and the emitted SV is byte-identical to what the shipped
-    // bitstreams were built from, which is what scripts/clone_preset_hw.sh hashes.
-    "the capture-fanout lever is off on everything that ships" in {
-      CoreConfig.deployable.foreach { case (n, c) =>
-        withClue(n) { c.captureMaxFanout mustBe 0 }
-      }
-      val base = CoreConfig.deployable("mmfree_2_7b")
-      an[IllegalArgumentException] must be thrownBy base.copy(captureMaxFanout = -1)
-      noException must be thrownBy base.copy(captureMaxFanout = 32)
-    }
-
-    // trueSystolic and colBankSize are two solutions to the same activation-broadcast
-    // fanout; a preset carrying both is a configuration mistake. Pin that the guard FIRES,
-    // and — the half that is easy to forget — that it RELEASES on each lever alone.
-    "trueSystolic and colBankSize are mutually exclusive, and each is legal alone" in {
-      val base = CoreConfig.deployable("mmfree_2_7b")
-      an[IllegalArgumentException] must be thrownBy base.copy(trueSystolic = true)  // keeps colBankSize=4
-      noException must be thrownBy base.copy(colBankSize = 0, trueSystolic = true)
-      noException must be thrownBy base.copy(colBankSize = 4, trueSystolic = false)
     }
 
     // B8 fits only because the lane accumulators move into DSP48s (~22 pp of LUT at B6);
