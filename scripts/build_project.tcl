@@ -270,6 +270,85 @@ foreach pth [get_timing_paths -setup -max_paths 30 -nworst 1] {
 close $dh
 puts "==> path digest: $dig_file"
 
+# ─── Endpoint DISTRIBUTION, congestion, and (on failure) the routed DCP ─────
+# MEASURED TWICE that the 30 worst paths above are the wrong artefact to reason from.
+# At 300 MHz the reported worst path was core/wtGearbox — 54 of 40 000 endpoints, 0.1% —
+# while 74.2% of the failing population was one control net (core/state_reg) driving the
+# tileAccums capture enable. Fixing the headline path would have moved WNS and nothing
+# else. ALWAYS TAKE THE DISTRIBUTION, NOT THE HEADLINE PATH.
+#
+# Both times that distribution had to be reconstructed by hand from a checkpoint, and both
+# times the checkpoint was gone: build_all.sh uses ONE shared Vivado project dir, so the
+# next build clobbers impl_1/ (a 300 MHz routed DCP was lost to a 250 build two hours
+# later; the congestion numbers for mmfree_2_7b_max300 were lost the same way). Only
+# reports/<tag>.* survives a build, so the analysis has to be written HERE, while the
+# routed design is still in memory.
+#
+# Endpoints are bucketed into families: bit indices -> [*] and any _<digits> -> _* , which
+# collapses arr_1_16 -> arr_*_*, _replica_9 -> _replica_*, mem_reg_uram_4 -> mem_reg_uram_*.
+# The DRIVER is bucketed the same way, because "74% of them share one driver" is the
+# observation that picks the lever.
+set hist_file [file join $rpt_dir "$cfg_tag.endpoints.txt"]
+set _cap 5000
+set _paths [get_timing_paths -setup -max_paths $_cap -nworst 1 -sort_by slack]
+array unset _cnt; array unset _worst; array unset _drv
+foreach pth $_paths {
+    set _sl [get_property SLACK $pth]
+    set _ep [get_property ENDPOINT_PIN $pth]
+    set _sp [get_property STARTPOINT_PIN $pth]
+    set _epf [regsub -all {\[[0-9]+\]} $_ep {[*]}]
+    set _epf [regsub -all {_[0-9]+} $_epf {_*}]
+    set _spf [regsub -all {\[[0-9]+\]} $_sp {[*]}]
+    set _spf [regsub -all {_[0-9]+} $_spf {_*}]
+    if {![info exists _cnt($_epf)]} {
+        set _cnt($_epf) 0; set _worst($_epf) $_sl; set _drv($_epf) $_spf
+    }
+    incr _cnt($_epf)
+    if {$_sl < $_worst($_epf)} { set _worst($_epf) $_sl }
+}
+set _tot [llength $_paths]
+set _hh [open $hist_file w]
+puts $_hh "# Endpoint family distribution — preset $cfg_preset, WNS $wns ns"
+puts $_hh "# The $_tot worst setup endpoints (query cap $_cap), bucketed by endpoint name with"
+puts $_hh "# bit indices and numeric suffixes collapsed. THIS, not the worst path, is what says"
+puts $_hh "# where the design actually fails: a family that is 0.1% of the population is not"
+puts $_hh "# worth fixing even when it holds the single worst path."
+puts $_hh "# A capped query is a censored sample — if COUNT sums to the cap, the true"
+puts $_hh "# population is larger and only the SHAPE of the ranking is trustworthy."
+puts $_hh ""
+puts $_hh [format "%8s %7s %9s  %-52s %s" "COUNT" "SHARE" "WORST" "ENDPOINT FAMILY" "DRIVEN BY"]
+set _rows {}
+foreach _k [array names _cnt] { lappend _rows [list $_cnt($_k) $_k] }
+foreach _row [lsort -integer -decreasing -index 0 $_rows] {
+    set _k [lindex $_row 1]
+    puts $_hh [format "%8d %6.1f%% %9.3f  %-52s %s" \
+        $_cnt($_k) [expr {100.0 * $_cnt($_k) / $_tot}] $_worst($_k) $_k $_drv($_k)]
+}
+close $_hh
+puts "==> endpoint distribution: $hist_file  ($_tot endpoints)"
+
+# Congestion — the other thing that has to be captured now or not at all. A design can be
+# path-clean and still unroutable at rate; level 5-6 here has meant "no path-level fix will
+# reach the next rung".
+set cong_file [file join $rpt_dir "$cfg_tag.congestion.rpt"]
+if {[catch {report_design_analysis -congestion -complexity -file $cong_file} _cerr]} {
+    puts "WARNING: congestion report unavailable ($_cerr)"
+} else {
+    puts "==> congestion report: $cong_file"
+}
+
+# The routed checkpoint, so a FAILING build can be re-interrogated without a rebuild —
+# which is exactly the situation that has twice needed one. Gated: 104 MB a copy, and a
+# passing build is not the one anybody re-opens. ARCHIVE_DCP=1 forces it either way.
+if {$wns < 0 || ([info exists ::env(ARCHIVE_DCP)] && $::env(ARCHIVE_DCP) eq "1")} {
+    set dcp_file [file join $rpt_dir "$cfg_tag.routed.dcp"]
+    if {[catch {write_checkpoint -force $dcp_file} _derr]} {
+        puts "WARNING: could not archive routed checkpoint ($_derr)"
+    } else {
+        puts "==> routed checkpoint archived: $dcp_file"
+    }
+}
+
 if {$wns < 0} {
     if {[info exists ::env(ALLOW_TIMING_FAIL)] && $::env(ALLOW_TIMING_FAIL) eq "1"} {
         puts "WARNING: timing FAILED (WNS=$wns ns) — writing bitstream anyway (ALLOW_TIMING_FAIL=1, experimental; validate on hardware before trusting results)."

@@ -30,7 +30,12 @@ class CoreTop(
     val colBankSize:     Int = 0,
     val packedWeights:   Boolean = false,
     val actRamStyle:     String  = "",
-    val actCascadeHeight: Int    = 0
+    val actCascadeHeight: Int    = 0,
+    val trueSystolic:    Boolean = false,
+    val outCascadeHeight: Int    = 4,
+    val outPipeStyle:     String = "legacy",
+    val outBankDepth:     Int    = 0,
+    val captureMaxFanout: Int    = 0
 ) extends RawModule {
 
     // Width math (mirrors Core.scala) — required so the IO bundles can size themselves.
@@ -87,7 +92,12 @@ class CoreTop(
             colBankSize     = colBankSize,
             packedWeights   = packedWeights,
             actRamStyle     = actRamStyle,
-            actCascadeHeight = actCascadeHeight
+            actCascadeHeight = actCascadeHeight,
+            trueSystolic    = trueSystolic,
+            outCascadeHeight = outCascadeHeight,
+            outPipeStyle    = outPipeStyle,
+            outBankDepth    = outBankDepth,
+            captureMaxFanout = captureMaxFanout
         ))
 
         Core.connectAxiSlave(outer = s_axi, inner = core.s_axi)

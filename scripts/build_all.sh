@@ -168,7 +168,7 @@ stage_shared() {
 # board compiles from transfer/src/ and reads transfer/Makefile, so an un-staged edit means
 # the next sweep measures the previous code with no sign that it did. Defined here, before
 # any build step, so STAGE_ONLY can reach it without a preset or a toolchain.
-if [ "$STAGE_ONLY" = "1" ]; then
+if [ "${STAGE_ONLY:-0}" = "1" ]; then
     echo "==> STAGE_ONLY=1: re-staging the preset-independent bundle parts only"
     stage_shared
     echo
