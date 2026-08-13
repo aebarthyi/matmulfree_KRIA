@@ -1,7 +1,7 @@
 # Build natively on the KRIA (Cortex-A53, aarch64). Cross-compile by passing
 # CC=aarch64-linux-gnu-gcc from the env if building on a dev host.
 #
-# Lean `main` builds the bench + the CPU baseline. The board smoke test,
+# Lean `main` builds the bench harness. The board smoke test,
 # the libmmfree helper unit test, and the encode_sanity host check live on the
 # `validation` branch (with the rest of the test harness).
 
@@ -38,16 +38,9 @@ $(OUT_DIR)/%.o: bench/%.c | $(OUT_DIR)
 $(BIN): $(BENCH_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-# CPU NEON baseline — its own 370M shape table. -O3 + OpenMP for the multi-core
-# GEMV; NEON intrinsics are on by default for aarch64. Building on an x86 host
-# needs CC=aarch64-linux-gnu-gcc.
-CPU_BIN     = build/cpu_bench
-CPU_CFLAGS ?= -Wall -Wextra -O3 -std=c11 -D_POSIX_C_SOURCE=200809L -fopenmp -funroll-loops
-
-cpu: $(CPU_BIN)
-
-$(CPU_BIN): bench/cpu_bench.c | build
-	$(CC) $(CPU_CFLAGS) $(INCDIRS) -o $@ $<
+# (The hand-written A53 NEON baseline, bench/cpu_bench.c, was dropped: the CPU
+# reference is now the full engine in the matmulfreellmCPU submodule, which is what
+# scripts/bench_host_cpu.sh and the final sweeps actually measure.)
 
 # (The libmmfree.so target was dropped with the Python bridge that ctypes-loaded it —
 # integration/libmmfree/mmfree_lib.c is now consumed only by the C++ fpga_runner, which
@@ -56,4 +49,4 @@ $(CPU_BIN): bench/cpu_bench.c | build
 clean:
 	rm -rf build
 
-.PHONY: all cpu clean
+.PHONY: all clean

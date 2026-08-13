@@ -408,7 +408,7 @@ static void readback_rows_at(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, ui
 #ifdef _OPENMP
         /* Readback is the one phase that still scales ~linearly with batch (13.1 us/row on
          * 370M, 21.1 on 2.7B) and the only one left running on a single core while the other
-         * three idle. Measured on the board (bench_readback.c, b=6, cold source):
+         * three idle. Measured on the board (b=6, cold source, isolated microbenchmark):
          *
          *     M=1024   12.0 -> 6.4 us (1.9x)      M=8192   108.1 -> 29.9 us (3.6x)
          *     M=2816   33.0 -> 12.6 us (2.6x)     M=32000  387.4 -> 195.6 us (2.0x)
