@@ -2,6 +2,12 @@
 
 *Written 2026-07-21. Grounded in the Kria KR260 `4Port` builds (D=1024 / MMfreeLM-370M).*
 
+> **Historical — read the numbers as of that date.** The conclusion still holds (the design
+> is bandwidth-bound, so spending area on compute buys nothing), but the figures predate
+> three things that shipped afterwards: 1.6-bit weight packing (so "~77 MB of weights per
+> token" is the 2-bit figure, ~20% high), batch=8, and threaded readback. Current per-token
+> traffic and tok/s live in `CLAUDE.md` and `NEXT_STEPS.md`.
+
 The question this note answers: **if we dedicated an FPGA to the matmul only and
 beefed it up with the extra space, could a hybrid CPU+FPGA setup reach similar
 tok/s?** Short answer up front, then the architecture and the reasoning.

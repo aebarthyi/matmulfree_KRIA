@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets
   * Emit SystemVerilog for the CoreTop module (the Vivado-facing wrapper).
   *
   *   ./mill matmulfree_KRIA.runMain control.EmitCore                       # default
-  *   ./mill matmulfree_KRIA.runMain control.EmitCore k26_medium            # named preset
+  *   ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_370m           # named preset
   *   ./mill matmulfree_KRIA.runMain control.EmitCore default custom/out    # preset + dir
   *
   *   - arg 0 (optional): CoreConfig preset name from [[CoreConfig.presets]].

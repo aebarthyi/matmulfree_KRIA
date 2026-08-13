@@ -29,10 +29,11 @@
 #define PAGE_SIZE 0x1000u
 
 /* Default geometry seeded into ctx by mmfree_open — must match the loaded
- * bitstream's CoreConfig. Defaults are k26_bench; the Makefile's BENCH_PRESET
- * knob sets -DBENCH_AWIDTH / -DBENCH_XDIM (the same flags bench.c reads). The
- * bench harness overrides ctx->geom at runtime from MMFREE_* env vars, so this
- * is only the fallback when nothing else sets it. */
+ * bitstream's CoreConfig. These are only the compile-time fallback: the bench
+ * harness overrides ctx->geom at runtime from the MMFREE_* env vars that the board
+ * Makefile exports out of the preset manifest (scripts/transfer.mk, GEOM_ENV), which
+ * is how every real run gets its geometry. -DBENCH_AWIDTH / -DBENCH_XDIM still work
+ * if something passes them, but nothing in the tree does. */
 #ifdef BENCH_AWIDTH
 #define MMFREE_DEF_AWIDTH   BENCH_AWIDTH
 #else

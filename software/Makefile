@@ -17,7 +17,7 @@ INCDIRS  = -Iinclude
 #   MMFREE_SIGNED MMFREE_BATCH MMFREE_SHAPES MMFREE_CLK_MHZ
 # e.g.  sudo MMFREE_XDIM=32 MMFREE_AWIDTH=16 MMFREE_SIGNED=1 ./build/bench ...
 # (the resolved geometry MUST match the loaded bitstream, or the core wedges →
-# completion timeout + state dump). bench.c keeps a k26_bench compiled-in default
+# completion timeout + state dump). bench.c keeps a small compiled-in default geometry
 # for when nothing sets the env. The per-preset -DBENCH_* compile flags (and the
 # per-preset build dirs that isolated them) are gone.
 OUT_DIR  = build

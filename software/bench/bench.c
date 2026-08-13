@@ -1,7 +1,7 @@
 /*
  * bench.c — Ternary matmul benchmark sweep for the mmfree Core on KRIA.
  *
- * Sweep modes (MMFREE_SHAPES env, default per BENCH_PRESET):
+ * Sweep modes (MMFREE_SHAPES env, else the compiled-in default):
  *   pow2          : power-of-two N x M cross sweep within maxN / maxM (legacy)
  *   370m|1.3b|2.7b: every distinct projection of that MMfreeLM checkpoint
  *                   (i/f/g/o_proj, fused gate_up, down_proj, lm_head), plus a
@@ -28,7 +28,7 @@
  * Example (matches the bring-up guide's recommended addr map):
  *   bench  0xA0010000 0xA0000000  /dev/uio0  /dev/udmabuf0 /dev/udmabuf1 /dev/udmabuf2
  *
- * Multi-HP-port geometries (xDim*aWidth > 128, e.g. k26_bench32/64) split the
+ * Multi-HP-port geometries (xDim*aWidth > 128, i.e. xDim 32 or 64 at aWidth 16) split the
  * input stream across N DMAs/buffers. The CLI args stay base values: DMA i
  * defaults to 0xA0020000 + (i-1)*0x10000 (the bd.tcl map) and the act/wt
  * udmabuf paths get an index appended (/dev/udmabuf-wt -> /dev/udmabuf-wt0,
@@ -56,9 +56,10 @@
  * The geometry is now resolved at runtime into an mmfree_geom_t (env vars
  * MMFREE_AWIDTH / MMFREE_XDIM / MMFREE_MAXACC / MMFREE_MAXN / MMFREE_MAXM), so
  * one binary adapts to any array size without recompiling. These -D values are
- * only the defaults when the corresponding env var is unset; the Makefile's
- * BENCH_PRESET knob still sets them so `make BENCH_PRESET=...` behaves as
- * before. The resolved geometry MUST match the loaded bitstream's CoreConfig
+ * only the defaults when the corresponding env var is unset. (Nothing in the tree
+ * passes -DBENCH_* any more — the board Makefile exports the MMFREE_* vars from the
+ * preset manifest instead, which is the path every real run takes.) The resolved
+ * geometry MUST match the loaded bitstream's CoreConfig
  * (a mismatch wedges the core — caught by the completion timeout). */
 #ifndef BENCH_AWIDTH
 #define BENCH_AWIDTH        16
@@ -76,9 +77,10 @@
 #define BENCH_MAX_M         1024
 #endif
 
-/* Default sweep mode: the k26_mmfree370m preset compiles in the 370M
- * projection sweep; everything else keeps the pow2 cross sweep. MMFREE_SHAPES
- * (="pow2" | "370m") overrides at runtime. */
+/* Default sweep mode: a build for a model preset compiles in that model's projection
+ * sweep; everything else keeps the pow2 cross sweep. MMFREE_SHAPES
+ * (="pow2" | "370m" | "1.3b" | "2.7b") overrides at runtime, and the board Makefile
+ * sets it from the preset manifest's MMFREE_SHAPES. */
 #ifdef BENCH_SHAPES_370M
 #define BENCH_SHAPES_DEFAULT "370m"
 #else
@@ -94,7 +96,7 @@
 #endif
 
 /* PL clock the bitstream was built with — sets the eff%% column's bandwidth
- * ceiling. Per-preset via the Makefile (250 for k26_mmfree370m since the
+ * ceiling. Per-preset via the manifest's PL_CLK_MHZ (250 for the shipped presets since the
  * 2026-06 PL_CLK_MHZ bump); MMFREE_CLK_MHZ overrides at runtime. */
 #ifndef BENCH_CLK_MHZ
 #define BENCH_CLK_MHZ       100
@@ -570,9 +572,9 @@ int main(int argc, char **argv) {
 
     g_signed = (int)env_u32("MMFREE_SIGNED", BENCH_SIGNED_DEFAULT);
 
-    /* Resolve the runtime geometry. Env vars override the compiled defaults
-     * (which the Makefile's BENCH_PRESET still sets), so one binary targets any
-     * array size — but it MUST match the loaded bitstream's CoreConfig. */
+    /* Resolve the runtime geometry. Env vars override the compiled defaults, so one
+     * binary targets any array size — but it MUST match the loaded bitstream's
+     * CoreConfig. */
     mmfree_geom_t geom;
     if (mmfree_geom_init(&geom,
                          env_u32("MMFREE_AWIDTH", BENCH_AWIDTH),

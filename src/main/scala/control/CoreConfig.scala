@@ -59,8 +59,10 @@ case class CoreConfig(
                                   // 256-entry ROM (systolic.WeightUnpackGearbox). ~20% fewer weight
                                   // bytes on the HP-port stream that bounds decode. false → the
                                   // legacy 2-bit weight beat (byte-identical SV). See TernaryPack.
-                                  // NOTE: config plumbing only so far — Core does not yet consume
-                                  // it (the gearbox is unit-tested standalone); wiring is step 2.
+                                  // SHIPPED: all three deployable presets set it, Core instantiates
+                                  // the gearbox on the weight path, and the host packer emits the
+                                  // matching 1.6-bit blob. MEASURED on the board: +4.3% tok/s,
+                                  // COMPUTE -15.4% (2026-07-26).
     plClkMhz:     Int = 100,      // PL fabric clock the bitstream targets (deployment
                                   // policy, not Chisel hardware — emitted into the
                                   // preset manifest, consumed by build_all.sh / bench).
