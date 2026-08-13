@@ -105,15 +105,11 @@ static inline mmfree_instr_t mmfree_encode(uint8_t  opcode,
 static inline mmfree_instr_t mmfree_inst_load(uint64_t ptr, uint32_t n_activations)
 { return mmfree_encode(MMFREE_OP_LOAD_ACT, ptr, n_activations, 0, 0); }
 
-static inline mmfree_instr_t mmfree_inst_compute(uint64_t weights_ptr,
-                                                 uint32_t rows, uint32_t cols)
-{ return mmfree_encode(MMFREE_OP_COMPUTE_MM, weights_ptr, rows, cols, 0); }
-
-/* Batch-aware COMPUTE: `batch` (the active-row count b) rides the 16-bit flags
- * field. The Core decodes it as cmpBatch and drains only b of B rows, so one
- * high-B bitstream serves a low-batch (b<B) call at ~B1 cost. batch==0 clamps
- * to the full compile-time batchSize, i.e. bit-identical to mmfree_inst_compute
- * (the legacy path). Caller must ensure 1 <= batch <= bitstream batchSize. */
+/* COMPUTE: `batch` (the active-row count b) rides the 16-bit flags field. The Core
+ * decodes it as cmpBatch and drains only b of B rows, so one high-B bitstream serves
+ * a low-batch (b<B) call at ~B1 cost. batch==0 clamps to the full compile-time
+ * batchSize — the legacy unbatched encoding, which is why there is no separate
+ * wrapper for it. Caller must ensure 1 <= batch <= bitstream batchSize. */
 static inline mmfree_instr_t mmfree_inst_compute_b(uint64_t weights_ptr,
                                                    uint32_t rows, uint32_t cols,
                                                    uint16_t batch)

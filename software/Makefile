@@ -1,7 +1,7 @@
 # Build natively on the KRIA (Cortex-A53, aarch64). Cross-compile by passing
 # CC=aarch64-linux-gnu-gcc from the env if building on a dev host.
 #
-# Lean `main` builds the bench + CPU baseline + libmmfree.so. The board smoke test,
+# Lean `main` builds the bench + the CPU baseline. The board smoke test,
 # the libmmfree helper unit test, and the encode_sanity host check live on the
 # `validation` branch (with the rest of the test harness).
 
@@ -49,20 +49,11 @@ cpu: $(CPU_BIN)
 $(CPU_BIN): bench/cpu_bench.c | build
 	$(CC) $(CPU_CFLAGS) $(INCDIRS) -o $@ $<
 
-# libmmfree.so — BitLinear backend for the Python bridge. Links the proven runtime
-# (mmfree_runtime.c) with the high-level lib (mmfree_lib.c) as a shared object.
-# Geometry is set at runtime via the lib cfg. Build natively on the KRIA (aarch64)
-# for deployment; an x86 host build is a compile/type check only (won't run without the PL).
-LIB_DIR   = integration/libmmfree
-LIB       = build/libmmfree.so
-LIB_SRCS  = bench/mmfree_runtime.c $(LIB_DIR)/mmfree_lib.c
-
-lib: $(LIB)
-
-$(LIB): $(LIB_SRCS) | build
-	$(CC) $(CFLAGS) -fPIC -shared $(INCDIRS) -I$(LIB_DIR) -o $@ $(LIB_SRCS)
+# (The libmmfree.so target was dropped with the Python bridge that ctypes-loaded it —
+# integration/libmmfree/mmfree_lib.c is now consumed only by the C++ fpga_runner, which
+# compiles it directly. See software/integration/fpga_runner/Makefile.)
 
 clean:
 	rm -rf build
 
-.PHONY: all cpu lib clean
+.PHONY: all cpu clean

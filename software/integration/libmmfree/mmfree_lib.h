@@ -75,10 +75,6 @@ void mmfree_lib_close(mmfree_lib_t *h);
  * success, negative on error. Call once per port after open, before any op. */
 int mmfree_lib_load_weights_file(mmfree_lib_t *h, uint32_t port, const char *path);
 
-/* Same, from an in-memory buffer (e.g. bytes handed over from Python). */
-int mmfree_lib_load_weights(mmfree_lib_t *h, uint32_t port,
-                            const void *blob, size_t nbytes);
-
 /* Register a projection resident at per-port `byte_offset`, inner dim N
  * (activations / rows) and output dim M (cols). Returns a proj_id >= 0 to pass
  * to mmfree_bitlinear, or negative on error (table full / out of range). */

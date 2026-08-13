@@ -45,10 +45,9 @@ src/main/scala/
                      AxiInstructionHandler.scala (instruction MMIO),
                      CoreConfig.scala (parameter holder + presets + manifest emitters),
                      EmitCore.scala (SystemVerilog + preset-manifest emission)
-  vector/            Vector.scala — vector-of-PEs building block
 
 src/test/scala/
-  systolic/PESpec.scala, vector/VectorSpec.scala — unit tests for the compute primitives
+  systolic/{PESpec, SystolicArraySpec, WeightUnpackSpec}.scala — compute primitives
   control/{CoreSpec, AxiInstructionHandlerSpec, BenchMirror*Spec, CoreConfigSpec}.scala
 
 software/            PS-side userspace stack
@@ -56,12 +55,10 @@ software/            PS-side userspace stack
   bench/             bench.c (sweep harness), mmfree_runtime.c (driver glue)
   tests/             encode_sanity.c (host-side encoder check)
   Makefile           Native build on the KRIA (or cross-compile via CC=)
-  integration/       MMfreeLM model integration (Phase B–E)
+  integration/       MMfreeLM model integration (packer + engine API + runner)
     mmfree_pack/     offline weight packer → per-port blobs (geometry from the manifest)
-    mmfree_bridge/   Python bridge: ctypes binding to libmmfree.so + HF model glue
-    libmmfree/       libmmfree.so — resident-weights BitLinear backend
-    fpga_runner/     C++ CPU-vs-FPGA decode runner (gate / serve)
-    phase_e_*.py     HW-vs-CPU validation harnesses
+    libmmfree/       mmfree_lib.c — resident-weights BitLinear engine API (built into the runner)
+    fpga_runner/     C++ CPU-vs-FPGA decode runner (gate / serve) — the offload path
 
 scripts/
   BOARD_BRINGUP.md   End-to-end Vivado → KRIA bring-up walkthrough

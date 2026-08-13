@@ -327,18 +327,6 @@ void mmfree_lib_close(mmfree_lib_t *h) {
     free(h);
 }
 
-int mmfree_lib_load_weights(mmfree_lib_t *h, uint32_t port,
-                            const void *blob, size_t nbytes) {
-    if (!h || port >= h->ctx.geom.numPorts) return -EINVAL;
-    if (nbytes > h->wt[port].size) {
-        fprintf(stderr, "load_weights: port %u blob %zu > buf %zu\n",
-                port, nbytes, h->wt[port].size);
-        return -ENOSPC;
-    }
-    dev_copy((volatile uint8_t *)h->wt[port].vaddr, (const uint8_t *)blob, nbytes);
-    return 0;
-}
-
 int mmfree_lib_load_weights_file(mmfree_lib_t *h, uint32_t port, const char *path) {
     if (!h || port >= h->ctx.geom.numPorts) return -EINVAL;
     FILE *f = fopen(path, "rb");

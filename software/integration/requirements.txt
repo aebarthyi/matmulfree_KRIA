@@ -1,39 +1,24 @@
-# Phase E runtime requirements — MMfreeLM-370M on the KRIA + the mmfree bridge.
-#
-# Install ON THE KRIA (aarch64). If you already ran the CPU baseline, most of
-# this is present; numpy is the only dependency the bridge itself adds.
+# Host-side requirements for `mmfree_pack` — the weight packer that turns a model blob
+# (or an HF checkpoint) into the engine's per-port resident weight slices + manifest.
+# This is the ONLY Python left in the integration layer; the board runs C/C++ only.
 #
 #   python3 -m pip install -r requirements.txt
+#   python3 -m mmfree_pack.cli --blob <model.mmfree> --out-dir packed/ --manifest <preset.env>
 #
-# ── triton (IMPORTANT, NOT pip) ──────────────────────────────────────────────
-# The model imports `triton` at module load (mmfreelm/ops/fusedbitnet.py), so it
-# must be importable — but on aarch64 that is TRITON-CPU, built from the
-# runtime's submodule, NOT a PyPI wheel. Do NOT `pip install triton` (it targets
-# CUDA / has no aarch64 CPU wheel and will shadow your build). Build it once:
-#       cd runtime && git submodule update --init triton-cpu
-#       pip install -e triton-cpu/python      # (or per triton-cpu's README)
-# Our bridge monkeypatches FusedBitLinear.forward, so triton's kernels are never
-# actually executed — it only needs to import cleanly.
-#
-# ── torch ────────────────────────────────────────────────────────────────────
-# Needs an aarch64 CPU build. Pin to whatever you already run the baseline with.
-# If unset, recent CPU wheels exist on PyPI for aarch64:
-torch>=2.1,<2.4
+# numpy is all the packer needs for the common path (--blob), because the ternary
+# quantization already happened upstream in matmulfreellmCPU/tools/provision.py.
+numpy
 
-# ── HuggingFace model loading / generation ───────────────────────────────────
-# MMfreeLM-370M ships custom modeling code (HGRNBit) loaded via trust_remote_code;
-# transformers 4.44.x is a known-good range for that era of custom models. Bump
-# only if you hit an API break — newer majors have removed APIs the model uses.
-transformers>=4.40,<4.45
-accelerate>=0.30          # device_map='cpu' in generate.py
-tokenizers>=0.19
-huggingface_hub>=0.23
-safetensors>=0.4          # checkpoint format (also used by the packer's loader)
-sentencepiece>=0.2        # 32000-vocab LLaMA-style tokenizer
-protobuf>=3.20            # sentencepiece tokenizer conversion needs it
+# Only for `--checkpoint <hf-id>`, i.e. packing straight from a checkpoint instead of a
+# blob. Both are imported lazily (mmfree_pack/model.py), so the --blob path never loads
+# them and does not need them installed. A CPU-only torch is enough:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch          # optional
+safetensors    # optional (checkpoint format)
 
-# ── model + bridge math ──────────────────────────────────────────────────────
-einops>=0.7               # runtime layers (rearrange in hgrn_bit)
-# numpy 2.x requires torch>=2.1; with an older torch use numpy<2. The bridge
-# code itself works on either.
-numpy>=1.23,<2.0
+# NOTE: this file used to carry the Phase D/E stack — transformers, accelerate, einops,
+# sentencepiece, protobuf, a triton-cpu build, and torch/numpy upper pins — for the
+# `mmfree_bridge` Python offload path and the phase_e_* validators. Both are gone: the
+# bridge was replaced by the C++ fpga_runner, and the CPU engine lives in the
+# matmulfreellmCPU submodule (which has its own tools/requirements.txt). Nothing on this
+# branch imports torch except the packer's optional checkpoint loader.
