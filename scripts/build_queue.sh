@@ -7,8 +7,12 @@
 # NOT stop the queue — the point is to leave a long unattended run alone and read
 # the summary afterwards.
 #
-#   ./scripts/build_queue.sh k26_a k26_b ...      # explicit list
-#   JOBS=16 ./scripts/build_queue.sh k26_a        # pass through to build_all.sh
+#   ./scripts/build_queue.sh mmfree_370m mmfree_2_7b     # explicit list
+#   JOBS=16 ./scripts/build_queue.sh mmfree_2_7b          # pass through to build_all.sh
+#
+# NOTE on `main`: there are only three deployable presets and 1.3B is a clone of the
+# 2.7B bitstream (scripts/clone_preset_hw.sh), so the real queue here is two builds.
+# This is mainly a tool for `exploration`, where the ablation presets live.
 #
 # REPACKAGE defaults to 1 here (not build_all.sh's 0): a queue is normally run after
 # an RTL change, and a changed SV file set synth-fails as "module not found" against

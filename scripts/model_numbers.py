@@ -2,15 +2,20 @@
 """Analytical per-token cost + throughput ceiling for MMfreeLM models on the
 mmfree engine — the board-free companion to bench.c's per-token rollup.
 
-The engine streams each ternary weight matrix once per token (2 bits/weight),
-so decode is bandwidth-bound: the weight traffic per token divided by the HP-port
-stream peak is the throughput ceiling. This reproduces bench.c's byte/floor math
-exactly (tile-aware), so the numbers here are the upper bound the board run
-approaches (real tok/s sits below it: LOAD/STORE phases and DDR < peak).
+The engine streams each ternary weight matrix once per token, so decode is
+bandwidth-bound: the weight traffic per token divided by the HP-port stream peak is
+the throughput ceiling. Byte counts come from mmfree_pack.geometry — the same
+function the packer and the runtime's COMPUTE DMA use — so they are tile-aware and
+follow the weight format instead of assuming one.
+
+Weight format defaults to the SHIPPED one: 1.6 bits/weight (5 trits/byte), which every
+deployable preset uses. `--no-packed` gives the legacy 2-bit numbers, which are ~25%
+higher traffic and therefore a ~20% lower ceiling.
 
 Usage:
-    scripts/model_numbers.py                      # 370m/1.3b/2.7b at a16, 250 MHz
-    scripts/model_numbers.py --clk 250 --batch 1 6
+    scripts/model_numbers.py                      # 370m/1.3b/2.7b at a16, 250 MHz, packed
+    scripts/model_numbers.py --no-packed          # legacy 2-bit weight stream
+    scripts/model_numbers.py --clk 250 --batch 1 8
     scripts/model_numbers.py --hidden 4096 --inter 11008 --vocab 32000 --layers 32
     scripts/model_numbers.py --awidth 16 --xdim 32   # geometry override
 """
@@ -44,12 +49,15 @@ def projections(hidden, inter, vocab, layers):
 
 
 def per_token(geom: Geometry, projs):
-    """Weight bytes and MAC count for one forward pass (one token, batch=1)."""
+    """Weight bytes and MAC count for one forward pass (one token, batch=1).
+
+    port_blob_bytes is per port and honours geom.packed, so the total across the
+    HP ports is what the engine actually streams in either weight format.
+    """
     wbytes = 0
     macs = 0
     for _name, N, M, count in projs:
-        tiles = geom.num_col_tiles(M)            # ceil(M / outLanesPerTile)
-        wbytes += count * N * tiles * geom.sAxisBytes
+        wbytes += count * geom.numPorts * geom.port_blob_bytes(N, M)
         macs += count * N * M
     return wbytes, macs
 
@@ -60,15 +68,18 @@ def main():
     ap.add_argument("--awidth", type=int, default=16)
     ap.add_argument("--xdim", type=int, default=32)
     ap.add_argument("--clk", type=float, default=250.0, help="PL clock MHz (stream peak)")
-    ap.add_argument("--batch", type=int, nargs="+", default=[1, 6],
+    ap.add_argument("--batch", type=int, nargs="+", default=[1, 8],
                     help="batch sizes to report (decode amortizes weights x B)")
+    ap.add_argument("--no-packed", dest="packed", action="store_false",
+                    help="legacy 2-bit weight stream instead of the shipped 1.6-bit packing")
+    ap.set_defaults(packed=True)
     ap.add_argument("--hidden", type=int)
     ap.add_argument("--inter", type=int)
     ap.add_argument("--vocab", type=int, default=32000)
     ap.add_argument("--layers", type=int)
     args = ap.parse_args()
 
-    geom = Geometry.derive(aWidth=args.awidth, xDim=args.xdim)
+    geom = Geometry.derive(aWidth=args.awidth, xDim=args.xdim, packed=args.packed)
     peak_gbps = geom.numPorts * geom.portBytes * args.clk / 1000.0   # bytes/ns = GB/s
     macs_per_cycle = geom.outLanesPerTile                            # xDim * nLanes
 
@@ -81,7 +92,8 @@ def main():
 
     print(f"# engine: aWidth={geom.aWidth} xDim={geom.xDim}  "
           f"{geom.numPorts} HP ports x {geom.portBytes} B/cycle  "
-          f"outLanesPerTile={geom.outLanesPerTile}")
+          f"outLanesPerTile={geom.outLanesPerTile}  "
+          f"weights={'1.6-bit packed' if geom.packed else '2-bit'}")
     print(f"# stream peak = {peak_gbps:.1f} GB/s @ {args.clk:.0f} MHz   "
           f"compute peak = {2 * macs_per_cycle * args.clk / 1000:.0f} GOPS "
           f"(x batch)")
