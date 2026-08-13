@@ -28,21 +28,6 @@ case class CoreConfig(
     axiDataWidth: Int = 128,
     axiIdWidth:   Int = 6,
     signedAct:    Boolean = false,// sign-extend activations (real BitLinear / HGRN int16)
-    accHeadroomBits: Int = -1,    // accumulator overflow headroom (bits above aWidth).
-                                  // -1 → auto = log2Ceil(maxAcc) (legacy worst-case growth,
-                                  // bit-identical to before). A smaller value trims every
-                                  // accumulator flop (PE accumReg), the drain shift register
-                                  // (tileAccums) and outBram width — the cheap lever for the
-                                  // wide-accumulator synthesis cost. As long as the resulting
-                                  // outAccWidth stays in (16,32] the m_axis lane stays 32-bit,
-                                  // so the external DMA format is UNCHANGED. Overflow-correctness
-                                  // is the model's responsibility: only lower it once the real
-                                  // activation dynamic range is known (host does mod-2^accWidth).
-    actMaxFanout: Int = 0,        // max_fanout attribute on the batched array-feed register.
-                                  // 0 → off (exact legacy Queue, byte-identical SV). >0 forces
-                                  // synth to replicate the activation-broadcast register per
-                                  // column — the route-bound 250 MHz path at B>=6. Tune per
-                                  // preset; a full impl build is the only real timing test.
     dspAccum:     Boolean = false,// map the per-lane PE accumulators onto DSP48E2 slices
                                   // (use_dsp="yes") instead of LUT/CARRY8 fabric. Costs one
                                   // DSP per lane per PE (xDim*batchSize*nLanes total); worth
@@ -163,13 +148,11 @@ case class CoreConfig(
         "(the attribute needs the ActMem BlackBox) — set actRamStyle to \"block\" or \"ultra\"")
     require(maxN <= maxAcc,
         s"Core requires maxN ($maxN) <= maxAcc ($maxAcc) — no inner-dim tiling yet")
-    require(accHeadroomBits == -1 || accHeadroomBits >= 0,
-        s"accHeadroomBits=$accHeadroomBits must be -1 (auto) or >= 0")
     val yDim:            Int = batchSize
     val nLanes:          Int = aWidth / 2
     val outLanesPerTile: Int = xDim * nLanes
     // Accumulator data width = aWidth + headroom. Auto (-1) = legacy log2Ceil(maxAcc).
-    val accHeadroom:     Int = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+    val accHeadroom:     Int = log2Ceil(maxAcc)
     val tileAccWidth:    Int = aWidth + accHeadroom
     val numColTilesMax:  Int = (maxM + outLanesPerTile - 1) / outLanesPerTile
     val outAccWidth:     Int = tileAccWidth
@@ -244,7 +227,7 @@ case class CoreConfig(
         aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
         maxN = maxN, maxM = maxM, outBeatLanes = outBeatLanes,
         axiAddrWidth = axiAddrWidth, axiDataWidth = axiDataWidth, axiIdWidth = axiIdWidth,
-        signedAct = signedAct, accHeadroomBits = accHeadroomBits, actMaxFanout = actMaxFanout,
+        signedAct = signedAct,
         dspAccum = dspAccum, colBankSize = colBankSize, packedWeights = packedWeights,
         actRamStyle = actRamStyle, actCascadeHeight = actCascadeHeight,
         outCascadeHeight = outCascadeHeight, outBankDepth = outBankDepth
@@ -254,7 +237,7 @@ case class CoreConfig(
         aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
         maxN = maxN, maxM = maxM, outBeatLanes = outBeatLanes,
         axiAddrWidth = axiAddrWidth, axiDataWidth = axiDataWidth, axiIdWidth = axiIdWidth,
-        signedAct = signedAct, accHeadroomBits = accHeadroomBits, actMaxFanout = actMaxFanout,
+        signedAct = signedAct,
         dspAccum = dspAccum, colBankSize = colBankSize, packedWeights = packedWeights,
         actRamStyle = actRamStyle, actCascadeHeight = actCascadeHeight,
         outCascadeHeight = outCascadeHeight, outBankDepth = outBankDepth
@@ -323,7 +306,6 @@ case class CoreConfig(
            |MMFREE_OUT_LANES_PER_TILE=$outLanesPerTile
            |MMFREE_ACC_WIDTH=$outAccWidth
            |MMFREE_ACC_HEADROOM=$accHeadroom
-           |MMFREE_ACT_MAX_FANOUT=$actMaxFanout
            |MMFREE_DSP_ACCUM=${if (dspAccum) 1 else 0}
            |MMFREE_COL_BANK_SIZE=$colBankSize
            |# activation-BRAM mapping: "" = inferred SyncReadMem, else the control.ActMem

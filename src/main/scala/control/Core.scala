@@ -72,11 +72,6 @@ class Core(
     val axiDataWidth: Int = 128,
     val axiIdWidth:   Int = 6,
     val signedAct:    Boolean = false, // sign-extend activations (real BitLinear / HGRN int16)
-    val accHeadroomBits: Int = -1,     // accumulator overflow headroom; -1 = auto (log2Ceil(maxAcc))
-    val actMaxFanout:    Int = 0,      // max_fanout attr on the batched array-feed register
-                                       // (0 = off, exact legacy Queue). Forces synth to
-                                       // replicate the activation-broadcast reg near each
-                                       // column — the route-bound 250 MHz path at B>=6.
     val dspAccum:        Boolean = false, // map the per-lane PE accumulators onto DSP48E2
                                          // slices (use_dsp attr) instead of LUT/CARRY8.
     val colBankSize:     Int = 0,        // systolic column banking: broadcast within a bank
@@ -115,16 +110,12 @@ class Core(
     require(maxN <= maxAcc,                        s"maxN=$maxN must be <= maxAcc=$maxAcc (no inner-dim tiling yet)")
     require(maxN >= 1,                             "maxN must be >= 1")
     require(maxM >= 1,                             "maxM must be >= 1")
-    require(accHeadroomBits == -1 || accHeadroomBits >= 0,
-        s"accHeadroomBits=$accHeadroomBits must be -1 (auto) or >= 0")
 
     val yDim            = batchSize
     val nLanes          = aWidth / 2
     val outLanesPerTile = xDim * nLanes
-    // Accumulator data width = aWidth + headroom. Auto (-1) = legacy log2Ceil(maxAcc)
-    // headroom (worst-case growth); a smaller headroom trims every accumulator flop,
-    // the drain shift register (tileAccums) and outBram — see accHeadroomBits.
-    val accHeadroom     = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+    // Accumulator data width = aWidth + worst-case growth headroom.
+    val accHeadroom     = log2Ceil(maxAcc)
     val tileAccWidth    = aWidth + accHeadroom
     val numColTilesMax  = (maxM + outLanesPerTile - 1) / outLanesPerTile
     val outAccWidth     = tileAccWidth
@@ -159,7 +150,7 @@ class Core(
     // ─── Systolic array with Core-local reset (PE counter quirk workaround) ──
     val arrLocalReset = WireDefault(false.B)
     val arr = withReset(this.reset.asBool || arrLocalReset) {
-        Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, accHeadroomBits, dspAccum, colBankSize))
+        Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, dspAccum, colBankSize))
     }
     val arrInput  = arr.input
     val arrOutput = arr.output
@@ -244,19 +235,10 @@ class Core(
     // keeps the direct path (validated, closes timing) untouched. The uniform
     // 1-cycle delay on every beat is functionally transparent (nAcc unchanged).
     // Flushed with inQ (below) so stray streamed beats can't cross into the next op.
-    // actMaxFanout>0 swaps the Queue for a functionally-identical ReplicatedPipeSkid
-    // whose data register carries max_fanout, so synth replicates the activation
-    // broadcast per column (the route-bound 250 MHz path at B>=6). actMaxFanout==0
-    // keeps the exact legacy Queue → existing presets emit byte-identical SV. The
-    // Option holds (deq port, flush-setter) so the two module types share the wiring.
+    // The Option holds (deq port, flush-setter) so the B=1 and B>1 paths share the wiring.
     val armSlice: Option[(DecoupledIO[StreamBeat], Bool => Unit)] =
       if (batchSize <= 1) None
-      else if (actMaxFanout > 0) {
-        val s = Module(new ReplicatedPipeSkid(new StreamBeat, actMaxFanout))
-        s.io.enq <> inQ.io.deq
-        s.io.deq.ready := false.B
-        Some((s.io.deq, (b: Bool) => s.io.flush := b))
-      } else {
+      else {
         val s = Module(new Queue(new StreamBeat, entries = 1, pipe = true, flow = false, hasFlush = true))
         s.io.enq <> inQ.io.deq
         s.io.deq.ready := false.B
@@ -702,33 +684,4 @@ object Core {
     }
 }
 
-/**
-  * 1-deep pipelined skid buffer — functionally identical to
-  * `Queue(entries=1, pipe=true, flow=false, hasFlush=true)` — whose single data
-  * register carries a `max_fanout` synthesis attribute.
-  *
-  * Used for the batched array-feed register, which broadcasts the activation to
-  * every column's PEs (fanout ≈ xDim·nLanes). At B>=6 that broadcast is the
-  * route-bound path that keeps the design off 250 MHz; forcing synth to physically
-  * replicate the register places a copy near each column and shortens the routes.
-  * (With SYNTH_FLATTEN=full — already set for the batched presets — the replication
-  * crosses into the array where the fanout expands.)
-  */
-class ReplicatedPipeSkid[T <: Data](gen: T, maxFanout: Int) extends Module {
-  val io = IO(new Bundle {
-    val enq   = Flipped(Decoupled(gen))
-    val deq   = Decoupled(gen)
-    val flush = Input(Bool())
-  })
-  val full = RegInit(false.B)
-  val data = Reg(gen)
-  if (maxFanout > 0)
-    annotate(Seq(data))(Seq(AttributeAnnotation(data.toNamed, s"max_fanout = $maxFanout")))
-  io.enq.ready := !full || io.deq.ready   // pipe=true: accept when empty, or while draining
-  io.deq.valid := full
-  io.deq.bits  := data
-  when(io.enq.fire) { data := io.enq.bits }
-  when(io.flush)         { full := false.B }   // flush wins (== hasFlush)
-    .elsewhen(io.enq.fire) { full := true.B }
-    .elsewhen(io.deq.fire) { full := false.B }
-}
+

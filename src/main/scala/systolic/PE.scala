@@ -28,15 +28,13 @@ class PEOutputBundle(val aWidth: Int, val accWidth: Int) extends Bundle {
   * paths are identical, so this only matters once negative values are streamed.
 */
 class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false,
-         val accHeadroomBits: Int = -1, val useDspAccum: Boolean = false) extends Module {
+         val useDspAccum: Boolean = false) extends Module {
   require(maxAcc >= 2, "PE requires maxAcc >= 2 (hardware counter limitation)")
-  require(accHeadroomBits == -1 || accHeadroomBits >= 0,
-          s"accHeadroomBits=$accHeadroomBits must be -1 (auto = log2Ceil(maxAcc)) or >= 0")
   // Accumulator = aWidth data + headroom overflow bits. Default (-1) keeps the
   // legacy log2Ceil(maxAcc) headroom (worst-case growth over maxAcc accumulations);
   // a smaller value trims the accumulator once the model's real dynamic range is
   // known (the counter still counts to maxAcc — only the data width shrinks).
-  val accHeadroom = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+  val accHeadroom = log2Ceil(maxAcc)
   val accWidth = aWidth + accHeadroom
   val input = IO(Flipped(Decoupled(new PEInputBundle(aWidth, maxAcc))))
   val output = IO(Decoupled(new PEOutputBundle(aWidth, accWidth)))

@@ -37,8 +37,8 @@ class SystolicArrayOutputBundle(val aWidth: Int, val xDim: Int, val yDim: Int, v
   * ── Column banking (`colBankSize`) ──────────────────────────────────────────
   * The activation broadcasts to every column each cycle: act[row] drives xDim
   * columns × nLanes PE inputs (≈256 loads at xDim=32, nLanes=8) — the route-bound,
-  * fanout-heavy net that dominates the 250 MHz critical path (see Core.scala's
-  * actMaxFanout note). `colBankSize` splits the columns into banks of that many
+  * fanout-heavy net that dominates the 250 MHz critical path. `colBankSize` splits
+  * the columns into banks of that many
   * columns and inserts ONE pipeline register between banks: bank `b` sees the
   * whole input beat (weights + activation + valid + nAcc) delayed by `b` cycles.
   *   - Within a bank the beat is still broadcast, so the activation fanout drops
@@ -59,7 +59,7 @@ class SystolicArrayOutputBundle(val aWidth: Int, val xDim: Int, val yDim: Int, v
   *     so callers must hard-reset between successive operations.
   */
 class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int,
-                    val signedAct: Boolean = false, val accHeadroomBits: Int = -1,
+                    val signedAct: Boolean = false,
                     val useDspAccum: Boolean = false, val colBankSize: Int = 0) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0, "aWidth must be even and >= 2")
     require(maxAcc >= 2, "maxAcc must be >= 2")
@@ -68,7 +68,7 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
     require(colBankSize >= 0, s"colBankSize=$colBankSize must be >= 0 (0 = no banking)")
 
     // Accumulator width = aWidth + headroom (see PE.scala). Auto (-1) = legacy log2Ceil(maxAcc).
-    val accWidth = aWidth + (if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits)
+    val accWidth = aWidth + log2Ceil(maxAcc)
 
     val input  = IO(new SystolicArrayInputBundle(aWidth, maxAcc, xDim, yDim))
     val output = IO(Decoupled(new SystolicArrayOutputBundle(aWidth, xDim, yDim, accWidth)))
@@ -85,7 +85,7 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
     // emitted SV (and thus existing bitstreams) is unchanged.
     private val doneCol = if (numBanks == 1) 0 else xDim - 1
 
-    val arr = Seq.tabulate(yDim, xDim) { (_, _) => Module(new PE(aWidth, maxAcc, signedAct, accHeadroomBits, useDspAccum)) }
+    val arr = Seq.tabulate(yDim, xDim) { (_, _) => Module(new PE(aWidth, maxAcc, signedAct, useDspAccum)) }
 
     val nAccReg = Reg(UInt(log2Ceil(maxAcc).W))
 

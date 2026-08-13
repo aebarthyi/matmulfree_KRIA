@@ -24,8 +24,6 @@ class CoreTop(
     val axiDataWidth: Int = 128,
     val axiIdWidth:   Int = 6,
     val signedAct:    Boolean = false,
-    val accHeadroomBits: Int = -1,
-    val actMaxFanout:    Int = 0,
     val dspAccum:        Boolean = false,
     val colBankSize:     Int = 0,
     val packedWeights:   Boolean = false,
@@ -39,7 +37,7 @@ class CoreTop(
     private val nLanes          = aWidth / 2
     private val outLanesPerTile = xDim * nLanes
     private val effOutBeatLanes = if (outBeatLanes == 0) outLanesPerTile else outBeatLanes
-    private val accHeadroom      = if (accHeadroomBits < 0) log2Ceil(maxAcc) else accHeadroomBits
+    private val accHeadroom      = log2Ceil(maxAcc)
     private val tileAccWidth    = aWidth + accHeadroom
     private val outAccWidth     = tileAccWidth
     private val outLaneWidth    = 1 << log2Ceil(outAccWidth)
@@ -83,8 +81,6 @@ class CoreTop(
             axiDataWidth = axiDataWidth,
             axiIdWidth   = axiIdWidth,
             signedAct    = signedAct,
-            accHeadroomBits = accHeadroomBits,
-            actMaxFanout    = actMaxFanout,
             dspAccum        = dspAccum,
             colBankSize     = colBankSize,
             packedWeights   = packedWeights,
