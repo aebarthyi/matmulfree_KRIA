@@ -91,7 +91,7 @@ for spec in "${SPECS[@]}"; do
     # A global TAG suffixes EVERY arm's per-spec tag. Without this, `TAG=pwr ./sweep_all.sh`
     # was silently a no-op — tag is only the spec's 3rd field — so a POWER=1 re-run wrote to
     # the same <preset>_batch_sweep.csv as the POWER=0 run and destroyed it. That is exactly
-    # how the 250 MHz rows were lost on 2026-08-04 (NEXT_STEPS §A). Suffix, not replace, so a
+    # how the 250 MHz rows were lost on 2026-08-04. Suffix, not replace, so a
     # spec that already carries a tag (e.g. ":ctl") keeps its identity: ctl_pwr.
     if [ -n "${TAG:-}" ]; then tag="${tag:+${tag}_}${TAG}"; fi
     # A bad 5th field is almost always an `extra` that contained a colon and leaked into

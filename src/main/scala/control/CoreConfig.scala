@@ -510,7 +510,7 @@ object CoreConfig {
     //
     //   * 1.3B runs the 2.7B bitstream, so the 2.7B WNS is its timing record.
     //   † 1.3B's host `pack` cost is bimodal at some shapes, so those two cells carry a
-    //     wider spread than the other two models. See NEXT_STEPS.md.
+    //     wider spread than the other two models.
     //   Against a Xeon W-2155 at the same weight format the KRIA is slower in raw throughput
     //   and ~an order of magnitude better in tok/J, the energy advantage growing with model
     //   size. The authoritative ratios are reports/final/dataset.csv, not this comment.

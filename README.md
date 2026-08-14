@@ -61,7 +61,6 @@ software/            PS-side userspace stack
     tests/           Host-side checks: split-chunk plan, threaded readback, packed round-trip
 
 scripts/
-  BOARD_BRINGUP.md   End-to-end Vivado → KRIA bring-up walkthrough
   build_all.sh       Chisel → SV+manifest → IP → bitstream → overlay → transfer/<preset>/
   build_project.tcl / bd.tcl / package_ip.tcl   Vivado project + block design + IP packaging
   gen_overlay.tcl    xsct script: .xsa → .dtbo + .bit + shell.json (udmabufs from the manifest)
@@ -266,7 +265,7 @@ vivado -mode batch -source scripts/ooc_synth.tcl -tclargs mmfree_370m
 
 ## KRIA board bring-up
 
-The whole flow is scripted. Full walkthrough + troubleshooting in `scripts/BOARD_BRINGUP.md`.
+The whole flow is scripted.
 
 **The whole build-and-deploy, end to end** (2.7B here; 370M is identical with `PRESET=mmfree_370m`):
 
@@ -416,7 +415,6 @@ beside it, and `--packed-dir` is `models/<hf-id>/packed`.
 ## Where to read next
 
 - **`make help`** — the task-runner verbs at a glance.
-- **`scripts/BOARD_BRINGUP.md`** — full Vivado IP-packaging + block-design + KRIA deployment recipe, including troubleshooting for the failure modes seen during initial bring-up.
 - **`software/README.md`** — driver / register-map orientation.
 - **`matmulfreellmCPU/README.md`** — the standalone CPU engine (build, provision, `--weights` packing modes).
 - **`software/integration/README.md`** — MMfreeLM weight packer, the C engine API, and the C++ decode runner.
