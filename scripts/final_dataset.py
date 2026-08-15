@@ -4,23 +4,48 @@
     ./scripts/final_dataset.py \
         --board ~/results/final --xeon reports/host_cpu/final --out reports/final
 
-Emits reports/final/dataset.csv, one row per (platform, arm, model, weight_fmt, batch):
+Emits TWO kinds of file, both under --out:
 
-    platform     kria | xeon
-    arm          fpga (engine + A53 host) | cpu (A53 only) | cpu (Xeon)
-    model        370M | 1.3B | 2.7B
-    weight_fmt   1p6 | 2bit | int8
-    batch        1..hw_batch, the bitstream's compile-time batchSize (8 on the shipped set)
-    threads      Xeon OpenMP threads (blank on the board)
-    passes       independent runs behind the mean
-    decode_tok_s MEDIAN across passes — robust to the one-perturbed-pass failure mode
-    mean_tok_s   arithmetic mean, for comparison
-    spread_pct   (max-min)/median across passes, 0 when passes==1
-    median_shift_pct  how far the median moves if any single pass is dropped (jackknife)
-    watts        mean board SOM rail power / Xeon RAPL package+DRAM, SAME run as the tok/s
-    tok_per_joule decode_tok_s / watts
-    streams_ok   1 = every stream matched a single-stream decode (FPGA arms)
-    flag         OUTLIER if the passes disagree by more than --spread-limit
+  dataset.csv          one row per (platform, arm, model, weight_fmt, batch) — the headline
+                       table, identical in shape for kria/fpga, kria/cpu and xeon/cpu so a
+                       row from any platform is directly comparable to a row from another.
+  ops_<model>.csv      per-model profiling breakdown, LONG format (one row per op), one file
+                       per model size: ops_370m.csv, ops_1_3b.csv, ops_2_7b.csv.
+
+dataset.csv columns (DATASET_COLS below is the authority):
+
+  identity   date, platform (kria|xeon), arm (fpga|cpu), model, weight_fmt (1p6|2bit|int8),
+             batch, threads (Xeon OpenMP; blank on the board), preset,
+             clk_mhz (the STA target) and fclk_hz (what the fabric ACTUALLY ran at — those
+             disagreed once and a 295 MHz build quietly ran at 250), passes
+  workload   prompt_tokens, gen_tokens. TTFT and prefill are uninterpretable without the
+             prompt length, and decode tok/s drifts with the generation length.
+  latency    ttft_ms            first stream's first token
+             prefill_ms         the whole prefill phase == the LAST stream's TTFT; equal to
+                                ttft_ms at b=1 and ~B-fold larger above it
+             prefill_tok_s      prompt tokens / prefill time
+             token_latency_ms   steady-state per-token decode latency
+  throughput decode_tok_s              MEDIAN across passes, AGGREGATE over streams
+             decode_tok_s_per_stream   the same divided by batch — what one user sees
+  power      watts_total   mean draw over the run's window
+             watts_idle    the same instrument, same session, nothing running
+             watts_net     total - idle
+             power_domain  board_rails (xlnx_platformstats SOM) | rapl_pkg+dram
+             tok_per_joule decode_tok_s / watts_NET
+  quality    mean_tok_s (arithmetic, for comparison), spread_pct ((max-min)/median across
+             passes), median_shift_pct (jackknife: how far the median moves if any single
+             pass is dropped), streams_ok (1 = every stream matched a single-stream decode),
+             flag
+
+WHY tok/J IS NET OF IDLE. The two platforms are not the same kind of machine: the SOM idles
+near 2 W and the workstation package near 14 W, so dividing by total draw credits the board
+for having less overhead to switch off rather than for doing the work more cheaply. Net is
+the like-for-like figure. It is only meaningful if BOTH sides measured their own idle with
+their own instrument, which is why the board sweep now samples one per session and a row
+with no idle figure falls back to total AND carries a NO_IDLE flag — a table must never mix
+denominators silently. power_domain is carried on every row so the boundary each number was
+measured across is never in doubt; watts_total is kept so any reader who prefers total draw
+can recompute without re-running anything.
 
 WHAT THIS CHECKS SO THE REPORT DOES NOT HAVE TO. It refuses to emit a clean data set if
 any of these hold, because each one silently invalidates a comparison drawn across rows:
@@ -35,8 +60,31 @@ The expected ladder is per model, read from the sweep's own hw_batch column rath
 hardcoded, so one aggregator validates a B8 set and a B6 set without either being wrong by
 definition. See ladders().
 """
-import argparse, csv, glob, os, re, sys
+import argparse, csv, datetime, glob, os, re, sys
 from collections import defaultdict
+
+# ── the schema, in one place ────────────────────────────────────────────────────────────
+# Identity first, then the workload it was measured under, then the metrics, then the
+# quality columns that say whether the metrics can be trusted. Every consumer (report
+# tables, plots, the README) reads THIS order, so adding a column is an append here.
+DATASET_COLS = [
+    # identity / provenance
+    'date', 'platform', 'arm', 'model', 'weight_fmt', 'batch', 'threads', 'preset',
+    'clk_mhz', 'fclk_hz', 'passes',
+    # workload shape -- throughput and TTFT are meaningless without it
+    'prompt_tokens', 'gen_tokens',
+    # latency
+    'ttft_ms', 'prefill_ms', 'prefill_tok_s', 'token_latency_ms',
+    # throughput
+    'decode_tok_s', 'decode_tok_s_per_stream',
+    # power / efficiency
+    'watts_total', 'watts_idle', 'watts_net', 'power_domain', 'tok_per_joule',
+    # quality
+    'mean_tok_s', 'spread_pct', 'median_shift_pct', 'streams_ok', 'flag',
+]
+
+OPS_COLS = ['date', 'platform', 'arm', 'model', 'weight_fmt', 'batch', 'threads',
+            'kind', 'op', 'ms_per_run', 'pct', 'us_per_call']
 
 MODEL_OF = {'370m': '370M', '1_3b': '1.3B', '2_7b': '2.7B',
             'mmfreelm-370m': '370M', 'mmfreelm-1.3b': '1.3B', 'mmfreelm-2.7b': '2.7B'}
@@ -51,26 +99,110 @@ def model_from_preset(p):
 
 
 def board_power(power_root):
-    """(power_dir, batch) -> mean SOM watts, from power_bench.sh's own summary line."""
-    out = {}
+    """Board rail power from power_bench.sh's own summary lines.
+
+    Returns (workload, idle):
+      workload  (power_dir, batch) -> mean SOM watts over the run's window
+      idle      mean SOM watts with nothing running, or None if never sampled
+
+    The idle logs are the `_idle` mode final_sweep_board.sh records once per sweep (a sleep
+    used as the workload, so the same sampler and parser produce it). They are matched on the
+    mode suffix, NOT on the directory: they live in power/idle/ but still carry a _b<N>_ in
+    the tag from the manifest, so keying them like a workload run would file idle draw under
+    some real batch and quietly halve that cell's power.
+    """
+    out, idle = {}, []
     pat = re.compile(r'SOM total power\s+avg\s+([\d.]+)\s*mW')
     for log in glob.glob(os.path.join(power_root, '*', '*.log')):
-        m = re.search(r'_b(\d+)_n', os.path.basename(log))
-        if not m:
-            continue
+        base = os.path.basename(log)
         txt = open(log, errors='ignore').read()
         w = pat.search(txt)
-        if w:
-            out[(os.path.basename(os.path.dirname(log)), int(m.group(1)))] = float(w.group(1)) / 1000.0
-    return out
+        if not w:
+            continue
+        watts = float(w.group(1)) / 1000.0
+        if base.endswith('_idle.log'):
+            idle.append(watts)
+            continue
+        m = re.search(r'_b(\d+)_n', base)
+        if m:
+            out[(os.path.basename(os.path.dirname(log)), int(m.group(1)))] = watts
+    return out, (sum(idle) / len(idle) if idle else None)
+
+
+def fnum(r, key):
+    """Float from a CSV field, or None when absent/blank/unparseable.
+
+    Every metric below is optional on purpose: a CSV written by an older bundle simply has
+    no ttft_ms column, and that must produce an empty cell rather than crash the aggregate
+    or, worse, a zero that averages in as if it were measured.
+    """
+    try:
+        v = r.get(key, '')
+        return float(v) if v not in ('', None, '-') else None
+    except (TypeError, ValueError):
+        return None
+
+
+def num(v, nd):
+    """Round for output, or an empty cell when the quantity was never measured."""
+    return round(v, nd) if v is not None else ''
+
+
+# Per-op / per-phase profiling columns, carried into the per-model breakdown CSVs.
+# `op_*` exist on both platforms; `bl_*` are the FPGA BitLinear phases and are absent on CPU
+# arms, which is why the breakdown records a `kind` rather than assuming one namespace.
+OPS = ['elementwise', 'gate', 'lm_head', 'matmul', 'rmsnorm', 'scan', 'swiglu', 'swishgate']
+PHASES = ['pack', 'load', 'compute', 'store', 'readback']
+
+
+def read_profile(r):
+    """Pull the op/phase breakdown out of one sweep row -> list of dicts (long format)."""
+    prof = []
+    for op in OPS:
+        ms = fnum(r, f'op_{op}_ms')
+        if ms is None:
+            continue
+        prof.append(dict(kind='op', op=op, ms_per_run=ms,
+                         pct=fnum(r, f'op_{op}_pct'), us_per_call=fnum(r, f'op_{op}_us_call')))
+    for ph in PHASES:
+        ms = fnum(r, f'bl_{ph}_ms')
+        if ms is None:
+            continue
+        prof.append(dict(kind='phase', op=ph, ms_per_run=ms,
+                         pct=fnum(r, f'bl_{ph}_pct'), us_per_call=fnum(r, f'bl_{ph}_us_call')))
+    return prof
+
+
+def metrics(r):
+    """The measured quantities every platform reports, under one set of names."""
+    return dict(
+        decode=float(r['decode_tok_s']),
+        decode_per_stream=fnum(r, 'decode_tok_s_per_stream'),
+        # ttft_ms is the FIRST stream's first token; prefill_ms is the whole prefill phase,
+        # i.e. the LAST stream's time to first token. They coincide at b=1 and diverge by
+        # roughly B-fold above it, so both are kept: one is what a single user waits, the
+        # other is what a serving SLO has to cover.
+        ttft_ms=fnum(r, 'ttft_ms'),
+        prefill_ms=fnum(r, 'prefill_ms'),
+        prefill_tok_s=fnum(r, 'prefill_tok_s'),
+        token_latency_ms=fnum(r, 'token_latency_ms'),
+        prompt_tokens=fnum(r, 'prompt_tokens'),
+        gen_tokens=fnum(r, 'gen_tokens'),
+        profile=read_profile(r),
+    )
 
 
 def read_board(board_root):
     """Board CSVs -> list of raw per-pass records."""
     recs = []
-    pw = board_power(os.path.join(board_root, 'power'))
+    pw, idle_w = board_power(os.path.join(board_root, 'power'))
     if not pw:
         print(f"WARN: no board power logs under {board_root}/power — did you pull them?", file=sys.stderr)
+    if idle_w is None:
+        print(f"WARN: no idle baseline under {board_root}/power/idle — tok/J will fall back "
+              "to TOTAL draw for the kria rows, which is not comparable to the Xeon's "
+              "net-of-idle. Re-run final_sweep_board.sh (it samples one per sweep).",
+              file=sys.stderr)
     for f in sorted(glob.glob(os.path.join(board_root, '*_final*_batch_sweep.csv'))):
         base = os.path.basename(f)[:-len('_batch_sweep.csv')]
         # <preset>[_<backend>]_final[_p<n>]  -> the power dir is exactly this string
@@ -86,7 +218,9 @@ def read_board(board_root):
             recs.append(dict(
                 platform='kria', arm=arm, model=model_from_preset(preset), weight_fmt=fmt,
                 batch=b, threads='', pass_id=pas or '1',
-                decode=float(r['decode_tok_s']),
+                power_domain='board_rails', watts_idle=idle_w,
+                clk_mhz=r.get('clk_mhz', ''), fclk_hz=r.get('fclk_hz', ''),
+                **metrics(r),
                 watts=pw.get((base, b)),
                 # hw_batch_max is the bitstream's compile-time batchSize: the batch ceiling
                 # for this model, and hence the expected ladder for EVERY arm measuring it.
@@ -123,11 +257,12 @@ def read_xeon(xeon_root):
     raw file directly is deliberate: it is what the sweep actually writes, so the final
     data set does not depend on an undocumented hand transformation.
 
-    watts = timed_pkg_w + timed_dram_w — package plus DRAM over the TIMED window, which is
-    what the runner's own tok_per_joule uses and the closest analogue to the KRIA's SOM rail
-    figure (both include the platform's idle draw). idle_*_w is in the raw file if a
-    net-of-idle variant is ever wanted, but subtracting idle on one side only is not a
-    like-for-like comparison.
+    watts_total = timed_pkg_w + timed_dram_w — package plus DRAM over the TIMED window, the
+    closest analogue to the KRIA's SOM rail figure (both include the platform's idle draw).
+    watts_idle = idle_pkg_w + idle_dram_w, the baseline bench_host_cpu.sh samples before the
+    workload; the board now samples its own equivalent (final_sweep_board.sh, once per
+    sweep), so tok/J is net-of-idle on BOTH sides or on neither -- subtracting on one side
+    only was never like-for-like and is what the earlier version of this file refused to do.
     """
     recs = []
     # Recursive: the sweep nests one level per model (<root>/<slug>/t<th>_p<n>/) because GEN
@@ -153,7 +288,11 @@ def read_xeon(xeon_root):
                 # is the authority and this survives a re-run with a different THREAD_SET
                 threads=r.get('omp_threads') or mt.group(1),
                 pass_id=pas,
-                decode=float(r['decode_tok_s']),
+                power_domain='rapl_pkg+dram',
+                watts_idle=((float(r['idle_pkg_w']) + float(r.get('idle_dram_w') or 0))
+                            if r.get('idle_pkg_w') not in ('', None, 'None') else None),
+                clk_mhz=r.get('clk_mhz', ''), fclk_hz=r.get('fclk_hz', ''),
+                **metrics(r),
                 # No hardware ceiling on the Xeon — its expected ladder is imposed by the
                 # board's, since the point of this arm is to be the FPGA's denominator.
                 hw_batch=None,
@@ -200,6 +339,27 @@ def ladders(recs, override=None):
     return {m: set(range(1, c + 1)) for m, c in out.items()}, problems
 
 
+def profile_median(rs, med):
+    """Median each op/phase across the passes of one cell -> long-format rows.
+
+    Medianed across the SAME passes as the throughput, for the same reason: a breakdown
+    averaged over a different set of runs than the tok/s it is supposed to explain will not
+    add up to it.
+    """
+    by = defaultdict(list)
+    for r in rs:
+        for e in r.get('profile') or []:
+            by[(e['kind'], e['op'])].append(e)
+    out = []
+    for (kind, op), es in sorted(by.items()):
+        def m(field):
+            xs = [e[field] for e in es if e.get(field) is not None]
+            return round(med(xs), 3) if xs else ''
+        out.append(dict(kind=kind, op=op, ms_per_run=m('ms_per_run'),
+                        pct=m('pct'), us_per_call=m('us_per_call')))
+    return out
+
+
 def collapse(recs, spread_limit):
     """Average passes. For the Xeon, first pick the winning thread count per cell."""
     by = defaultdict(list)
@@ -228,10 +388,26 @@ def collapse(recs, spread_limit):
         jack = max(abs(med([d for j, d in enumerate(ds) if j != i]) - m) / m * 100
                    for i in range(len(ds))) if len(ds) > 2 else (
                    (max(ds) - min(ds)) / m * 100 if len(ds) > 1 else 0.0)
+        # Every other metric is medianed the same way and over the same passes, so a row's
+        # latency and its throughput describe one population -- not a median tok/s spliced
+        # onto a mean TTFT.
+        def med_of(field):
+            xs = [r[field] for r in rs if r.get(field) is not None]
+            return med(xs) if xs else None
+        idles = [r['watts_idle'] for r in rs if r.get('watts_idle') is not None]
         means[k] = dict(mean=m, mean_arith=sum(ds) / len(ds),
                         spread=(max(ds) - min(ds)) / m * 100 if len(ds) > 1 else 0.0,
                         jack=jack,
                         n=len(ds), watts=(med(ws) if ws else None),
+                        watts_idle=(med(idles) if idles else None),
+                        power_domain=rs[0].get('power_domain', ''),
+                        clk_mhz=rs[0].get('clk_mhz', ''), fclk_hz=rs[0].get('fclk_hz', ''),
+                        decode_per_stream=med_of('decode_per_stream'),
+                        ttft_ms=med_of('ttft_ms'), prefill_ms=med_of('prefill_ms'),
+                        prefill_tok_s=med_of('prefill_tok_s'),
+                        token_latency_ms=med_of('token_latency_ms'),
+                        prompt_tokens=med_of('prompt_tokens'), gen_tokens=med_of('gen_tokens'),
+                        profile=profile_median(rs, med),
                         streams_ok=min((r['streams_ok'] for r in rs if r['streams_ok'] != ''), default=''),
                         preset=rs[0]['preset'])
 
@@ -259,7 +435,7 @@ def collapse(recs, spread_limit):
         if th == win[(plat, arm, model, fmt)][0]:
             best[(plat, arm, model, fmt, batch)] = k
 
-    rows = []
+    rows, prof_rows = [], []
     for ck, k in sorted(best.items(), key=lambda kv: (kv[0][0], kv[0][2], kv[0][3], kv[0][4])):
         v = means[k]
         plat, arm, model, fmt, batch = ck
@@ -268,17 +444,41 @@ def collapse(recs, spread_limit):
             flag = (flag + ' NO_POWER').strip()
         if arm == 'fpga' and v['streams_ok'] not in ('1', ''):
             flag = (flag + ' STREAMS_BAD').strip()
+        # Power, stated in full rather than as one ambiguous number. tok/J is derived from
+        # watts_net (total minus this platform's own idle draw) because that is the only
+        # figure comparable across a board whose SoC idles near 2 W and a workstation whose
+        # package idles near 14 W. When idle was never sampled we fall back to total and SAY
+        # SO in the flag -- silently switching denominators mid-table is how a perf/W claim
+        # becomes unreproducible.
+        tot = v['watts']
+        idle = v['watts_idle']
+        net = (tot - idle) if (tot is not None and idle is not None) else tot
+        if tot is not None and idle is None:
+            flag = (flag + ' NO_IDLE').strip()
         rows.append(dict(
-            platform=plat, arm=arm, model=model, weight_fmt=fmt, batch=batch,
-            threads=k[5], passes=v['n'],
+            date=v.get('date', ''), platform=plat, arm=arm, model=model, weight_fmt=fmt,
+            batch=batch, threads=k[5], preset=v['preset'],
+            clk_mhz=v['clk_mhz'], fclk_hz=v['fclk_hz'],
+            passes=v['n'],
+            # token counts are counts: emit them as integers, not 64.0
+            prompt_tokens=int(v['prompt_tokens']) if v['prompt_tokens'] is not None else '',
+            gen_tokens=int(v['gen_tokens']) if v['gen_tokens'] is not None else '',
+            ttft_ms=num(v['ttft_ms'], 3),
             decode_tok_s=round(v['mean'], 3),
+            decode_tok_s_per_stream=num(v['decode_per_stream'], 3),
+            prefill_ms=num(v['prefill_ms'], 3),
+            prefill_tok_s=num(v['prefill_tok_s'], 3),
+            token_latency_ms=num(v['token_latency_ms'], 4),
+            watts_total=num(tot, 3), watts_idle=num(idle, 3), watts_net=num(net, 3),
+            power_domain=v['power_domain'],
+            tok_per_joule=round(v['mean'] / net, 4) if net else '',
             mean_tok_s=round(v['mean_arith'], 3),
             spread_pct=round(v['spread'], 2),
             median_shift_pct=round(v['jack'], 2),
-            watts=round(v['watts'], 3) if v['watts'] is not None else '',
-            tok_per_joule=round(v['mean'] / v['watts'], 4) if v['watts'] else '',
-            streams_ok=v['streams_ok'], preset=v['preset'], flag=flag))
-    return rows
+            streams_ok=v['streams_ok'], flag=flag))
+        prof_rows.extend(dict(platform=plat, arm=arm, model=model, weight_fmt=fmt,
+                              batch=batch, threads=k[5], **e) for e in v['profile'])
+    return rows, prof_rows
 
 
 def main():
@@ -286,6 +486,9 @@ def main():
     ap.add_argument('--board', default=os.path.expanduser('~/results/final'))
     ap.add_argument('--xeon', default='reports/host_cpu/final')
     ap.add_argument('--out', default='reports/final')
+    ap.add_argument('--date', default=datetime.date.today().isoformat(),
+                    help='stamped on every row so a merged table can be traced back to the '
+                         'sweep that produced it (default: today)')
     ap.add_argument('--spread-limit', type=float, default=3.0,
                     help='flag a cell whose passes disagree by more than this %% (default 3)')
     ap.add_argument('--max-batch', type=int, default=None,
@@ -307,27 +510,50 @@ def main():
     if not recs:
         sys.exit("no input found — nothing to aggregate")
 
-    rows = collapse(recs, a.spread_limit)
+    rows, prof_rows = collapse(recs, a.spread_limit)
+    for r in rows:
+        r['date'] = a.date
     os.makedirs(a.out, exist_ok=True)
     dest = os.path.join(a.out, 'dataset.csv')
-    cols = ['platform', 'arm', 'model', 'weight_fmt', 'batch', 'threads', 'passes',
-            'decode_tok_s', 'mean_tok_s', 'spread_pct', 'median_shift_pct',
-            'watts', 'tok_per_joule', 'streams_ok', 'preset', 'flag']
     with open(dest, 'w', newline='') as fh:
-        w = csv.DictWriter(fh, fieldnames=cols)
+        w = csv.DictWriter(fh, fieldnames=DATASET_COLS)
         w.writeheader()
         w.writerows(rows)
 
+    # ── per-model profiling breakdown, one file per model size ───────────────
+    # Long format (one row per op), not the 60-column wide shape the raw sweep writes: ops
+    # come and go between platforms -- the bl_* BitLinear phases exist only on the FPGA arm
+    # -- and a wide table has to carry a blank column for every op no platform in that file
+    # ran. Long also means adding an op later is rows, not a schema change.
+    written = []
+    by_model = defaultdict(list)
+    for r in prof_rows:
+        by_model[r['model']].append(r)
+    for model, prs in sorted(by_model.items()):
+        slug = model.lower().replace('.', '_')
+        pdest = os.path.join(a.out, f'ops_{slug}.csv')
+        with open(pdest, 'w', newline='') as fh:
+            w = csv.DictWriter(fh, fieldnames=OPS_COLS)
+            w.writeheader()
+            for r in sorted(prs, key=lambda r: (r['platform'], r['arm'], r['weight_fmt'],
+                                                r['batch'], r['kind'], r['op'])):
+                w.writerow({**r, 'date': a.date})
+        written.append((pdest, len(prs)))
+
     # ── headline view ────────────────────────────────────────────────────────
-    print(f"\nwrote {dest}  ({len(rows)} rows)\n")
+    print(f"\nwrote {dest}  ({len(rows)} rows)")
+    for pdest, n in written:
+        print(f"wrote {pdest}  ({n} op rows)")
+    print()
     order = {'370M': 0, '1.3B': 1, '2.7B': 2}
     print(f"{'platform':8s} {'arm':4s} {'model':6s} {'fmt':5s} {'thr':>3s} {'b':>2s} "
-          f"{'tok/s':>8s} {'spread':>7s} {'W':>6s} {'tok/J':>7s}  flag")
+          f"{'ttft ms':>8s} {'tok/s':>8s} {'ms/tok':>7s} {'W net':>6s} {'tok/J':>7s}  flag")
     for r in sorted(rows, key=lambda r: (r['platform'], order.get(r['model'], 9),
                                          r['weight_fmt'], r['batch'])):
         print(f"{r['platform']:8s} {r['arm']:4s} {r['model']:6s} {r['weight_fmt']:5s} "
-              f"{str(r['threads']):>3s} {r['batch']:>2d} {r['decode_tok_s']:8.2f} "
-              f"{r['spread_pct']:6.2f}% {str(r['watts']):>6s} {str(r['tok_per_joule']):>7s}  {r['flag']}")
+              f"{str(r['threads']):>3s} {r['batch']:>2d} {str(r['ttft_ms']):>8s} "
+              f"{r['decode_tok_s']:8.2f} {str(r['token_latency_ms']):>7s} "
+              f"{str(r['watts_net']):>6s} {str(r['tok_per_joule']):>7s}  {r['flag']}")
 
     # ── completeness / integrity ─────────────────────────────────────────────
     problems = [r for r in rows if r['flag']]

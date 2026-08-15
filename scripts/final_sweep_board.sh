@@ -119,10 +119,34 @@ if [ "$PASS_START" = "1" ] && [ "${ARCHIVE:-1}" = "1" ]; then
         mv results/*_final* "$arc"/ 2>/dev/null || true
         # Power dirs are named the same way and are just as ambiguous.
         for d in power/*_final*; do [ -e "$d" ] && mv "$d" "$arc"/ 2>/dev/null; done
+        # power/idle is NOT named *_final*, so it would otherwise survive into this run and
+        # silently supply last session's idle draw as this session's net-of-idle denominator.
+        [ -e power/idle ] && mv power/idle "$arc"/ 2>/dev/null
         echo "#"
         echo "#   archived $prev previous *_final* CSV(s) + their power dirs -> $arc/"
         echo "#   (they were written by whatever bitstream was loaded then; this run's are new)"
     fi
+fi
+
+# ── Idle rail baseline, ONCE per sweep ───────────────────────────────────────
+# tok/J in the final data set is computed against power NET of idle, which needs an idle
+# figure from this board, in this session, sampled by the same instrument as the workload —
+# the Xeon side has measured one since bench_host_cpu.sh existed, and comparing a net-of-idle
+# Xeon number against a total-draw KRIA number is not like-for-like.
+#
+# power_bench.sh takes an arbitrary workload command, so the idle "workload" is just a sleep:
+# same sampler, same parser, same summary line, no special case in the tool.
+#
+# ONCE, not per arm: the rails do not care which preset is loaded when nothing is running,
+# and 10 s x every (preset, backend, batch) cell would add minutes to the sweep for a number
+# that does not vary. It is taken BEFORE any overlay load, so it is the resting draw of the
+# board as the sweep found it.
+IDLE_S="${IDLE_S:-10}"
+if [ "${POWER:-1}" = "1" ] && [ "${DO_IDLE:-1}" = "1" ]; then
+    say "idle rail baseline (${IDLE_S}s, no workload)"
+    MANIFEST_ANY="$(ls presets/*/preset.env 2>/dev/null | head -n1)"
+    POWER_DIR="power/idle" ./power_bench.sh "${MANIFEST_ANY:--}" idle - sleep "$IDLE_S" \
+        || echo "#   WARN: idle baseline failed — rows will fall back to total draw" >&2
 fi
 
 # ── A53 CPU-only arms ────────────────────────────────────────────────────────
