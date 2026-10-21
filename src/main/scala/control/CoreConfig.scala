@@ -28,91 +28,35 @@ case class CoreConfig(
     axiDataWidth: Int = 128,
     axiIdWidth:   Int = 6,
     signedAct:    Boolean = false,// sign-extend activations (real BitLinear / HGRN int16)
-    dspAccum:     Boolean = false,// map the per-lane PE accumulators onto DSP48E2 slices
-                                  // (use_dsp="yes") instead of LUT/CARRY8 fabric. Costs one
-                                  // DSP per lane per PE (xDim*batchSize*nLanes total); worth
-                                  // it only when DSPs are the slack resource. Synthesis-only
-                                  // attribute → simulation/tests are byte-identical.
-    colBankSize:  Int = 0,        // systolic column banking: broadcast the activation within a
-                                  // bank of this many columns, pipeline one register between
-                                  // banks to cut the activation-broadcast fanout (xDim→colBankSize)
-                                  // that route-bounds the 250 MHz path. Numerically identical to
-                                  // the broadcast array (only retimed); adds +(ceil(xDim/colBankSize)
-                                  // -1) cycles latency/op. 0 → no banking (broadcast, unchanged).
-    packedWeights: Boolean = false,// stream ternary weights DDR-side at 1.6 bits/trit (5 trits
-                                  // per byte, base-3) instead of 2, and unpack on-chip through a
-                                  // 256-entry ROM (systolic.WeightUnpackGearbox). ~20% fewer weight
-                                  // bytes on the HP-port stream that bounds decode. false → the
-                                  // legacy 2-bit weight beat (byte-identical SV). See TernaryPack.
-                                  // SHIPPED: all three deployable presets set it, Core instantiates
-                                  // the gearbox on the weight path, and the host packer emits the
-                                  // matching 1.6-bit blob. MEASURED on the board: +4.3% tok/s,
-                                  // COMPUTE -15.4% (2026-07-26).
-    plClkMhz:     Int = 100,      // PL fabric clock the bitstream targets (deployment
-                                  // policy, not Chisel hardware — emitted into the
-                                  // preset manifest, consumed by build_all.sh / bench).
-                                  // MUST be one of CoreConfig.plClkRungs: PL0_REF only
-                                  // exists on discrete rungs and the PS IP snaps anything
-                                  // else DOWN, so an off-rung value is a MISLABEL, not a
-                                  // slower clock. See the require below.
-    actRamStyle:  String = "",    // activation-BRAM implementation. "" → the legacy
-                                  // SyncReadMem (Vivado picks the mapping; at maxN=8192 it
-                                  // picks 1024x36 blocks and chains EIGHT of them through
-                                  // the hard CASDOUTB cascade = 3.2 ns of pure logic, the
-                                  // worst 250 MHz path on the 2.7B B6 build). "block" or
-                                  // "ultra" swap in control.ActMem, a BlackBox carrying
-                                  // `ram_style` + `cascade_height` so the chain can be
-                                  // bounded. Read semantics and latency are IDENTICAL to
-                                  // SyncReadMem (1-cycle sync read), so this is numerically
-                                  // transparent — an implementation attribute, not a design
-                                  // change. Only worth setting where the cascade binds
-                                  // (maxN=8192); maxN=4096 is a 4-deep chain and closes 250.
-    outBankDepth: Int = 0,        // rows per explicit output-memory bank. 0 = auto =
-                                  // 4096*outCascadeHeight, i.e. exactly one URAM cascade chain
-                                  // per bank. Exposed mainly so a simulation-sized memory can be
-                                  // forced into several banks; at the default a test config is a
-                                  // single bank and never exercises the registered mux.
-    outCascadeHeight: Int = 4,    // cascade_height on each bank of the OutMemUltra URAM output
-                                  // memory. THE SHIPPED VALUE IS 1: the read is banked one URAM
-                                  // chain per bank, so there is no cascade left to bound. (The
-                                  // default stays 4 because it is also the pre-banking default for
-                                  // any caller that constructs a CoreConfig directly.) MEASURED
-                                  // 2026-08-08, shortening the chain was the WRONG lever anyway —
-                                  // 4 -> 2 bought +0.028 ns and made TNS worse, because URAM288
-                                  // CLK->DOUT is 1.837 ns before any cascade. It changes
-                                  // OutMemUltra's module name, so both maxN=8192 presets must carry
-                                  // the SAME value (scripts/clone_preset_hw.sh hashes the SV).
-    actCascadeHeight: Int = 0,    // cascade_height for actRamStyle != "". 0 → omit the
-                                  // attribute (let Vivado choose). 1 → no cascade at all
-                                  // (every depth block reads out in parallel into a fabric
-                                  // mux); 2 → pairs, one hop plus a 4:1 mux at maxN=8192.
-                                  // Lower = less logic delay, more LUT + route.
-    modelName:    String = "",    // HF checkpoint id this preset targets, e.g.
-                                  // "ridger/MMfreeLM-2.7B". Emitted as MMFREE_MODEL —
-                                  // the single source of truth for `make model` (which
-                                  // provisions/packs into transfer/models/<modelName>/) and
-                                  // for the board's gate/run/gen model lookup. "" → a
-                                  // bench-only preset that targets no checkpoint. forModel
-                                  // sets it; .copy'd batch siblings inherit it.
-    shapesHint:   String = "",    // default bench sweep for this preset (MMFREE_SHAPES);
-                                  // "" → auto (pow2, or "370m" once maxM spans the LM head).
-                                  // Model presets set this so `make bench` defaults to the
-                                  // right projection sweep without an explicit env.
-    residentWtBytes: Long = 0L,   // total packed ternary weight bytes the resident
-                                  // full-model runner (fpga_runner gate/run) holds across
-                                  // ALL ports. 0 → bench-only preset (no resident set), so
-                                  // UDMABUF_WT_SZ stays the single-slice default. forModel
-                                  // sets this from the model shapes so the emitted udmabuf
-                                  // fits the runner's working set, not just one weight slice.
+    dspAccum:     Boolean = false,// map the per-lane PE accumulators onto DSP48E2 (use_dsp) instead
+                                  // of LUT/CARRY8; one DSP per lane per PE. Synthesis-only.
+    colBankSize:  Int = 0,        // broadcast the activation within banks of this many columns, one
+                                  // pipeline register between banks (cuts fanout). Numerically
+                                  // identical; +(ceil(xDim/colBankSize)-1) cycles/op. 0 = no banking.
+    packedWeights: Boolean = false,// stream weights at 1.6 bits/trit (5 trits/byte, base-3) and unpack
+                                  // on-chip (systolic.WeightUnpackGearbox); the DDR blob must match.
+                                  // false = 2-bit weight beat.
+    plClkMhz:     Int = 100,      // PL fabric clock target; manifest-only (deployment policy).
+                                  // Must be one of CoreConfig.plClkRungs (see the require below).
+    actRamStyle:  String = "",    // activation memory: "" = inferred SyncReadMem; "block"/"ultra" =
+                                  // control.ActMem BlackBox carrying ram_style + cascade_height.
+                                  // Identical read semantics and latency either way.
+    outBankDepth: Int = 0,        // rows per output-memory bank; 0 = auto = 4096*outCascadeHeight
+                                  // (one URAM chain per bank). Lets tests force several banks.
+    outCascadeHeight: Int = 4,    // cascade_height on each OutMemUltra bank (shipped presets use 1).
+                                  // Part of OutMemUltra's module name, so 1.3B and 2.7B must match
+                                  // (scripts/clone_preset_hw.sh hashes the SV).
+    actCascadeHeight: Int = 0,    // cascade_height for ActMem: 0 = omit (Vivado chooses), 1 = no
+                                  // cascade, 2 = pairs. Lower = less logic delay, more LUT + route.
+    modelName:    String = "",    // HF checkpoint id (MMFREE_MODEL), e.g. "ridger/MMfreeLM-2.7B";
+                                  // "" = bench-only preset.
+    shapesHint:   String = "",    // default bench sweep (MMFREE_SHAPES); "" = auto, see defaultShapes.
+    residentWtBytes: Long = 0L,   // total weight bytes (all ports) the resident full-model runner
+                                  // maps; sizes udmabuf-wt. 0 = bench-only. Derived by forModel.
     implDirectives: Map[String, String] = Map.empty
-                                  // Vivado impl directives for THIS preset, emitted verbatim
-                                  // into preset.env so build_all.sh's load_manifest exports
-                                  // them and build_project.tcl applies them (a hand-passed
-                                  // env still overrides — load_manifest only sets unset keys).
-                                  // Razor-thin timing closures (e.g. the maxN=8192 B4 @ 250 MHz)
-                                  // carry the levers that close them, so `make build` needs no
-                                  // remembered env. Keys are the env names build_project.tcl
-                                  // reads: SYNTH_FLATTEN, PLACE_DIRECTIVE, PHYS_OPT_DIRECTIVE,
+                                  // Vivado impl directives emitted verbatim into preset.env (a
+                                  // hand-passed env overrides). Keys are build_project.tcl's env
+                                  // names: SYNTH_FLATTEN, PLACE_DIRECTIVE, PHYS_OPT_DIRECTIVE,
                                   // ROUTE_DIRECTIVE, POST_ROUTE_PHYS_OPT_DIRECTIVE, OPT_DIRECTIVE.
 ) {
     require(aWidth >= 2 && aWidth % 2 == 0, s"aWidth=$aWidth must be even and >= 2")
@@ -120,17 +64,9 @@ case class CoreConfig(
     require(xDim >= 1 && batchSize >= 1,    s"xDim=$xDim, batchSize=$batchSize must be >= 1")
     require(maxN >= 1 && maxM >= 1,         s"maxN=$maxN, maxM=$maxM must be >= 1")
     require(plClkMhz >= 1,                  s"plClkMhz=$plClkMhz must be >= 1")
-    // PL0_REF is a divided PLL output: only the rungs in plClkRungs exist, and the PS IP
-    // silently snaps an unreachable request DOWN to the rung below. An off-rung plClkMhz
-    // therefore does NOT constrain the design at that rate — it constrains it at the rung
-    // and mislabels the build. MEASURED 2026-08-04 (scripts/probe_pl_clk.tcl reads
-    // PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ back out of the IP): 215/220/225/230/240 all
-    // land on 199.998 MHz, and 275/285/290/295 all land on 249.997. That is why every
-    // "_230" preset here was really a 200 MHz build (its WNS was a number against 5.000 ns,
-    // not 4.348), and why the 225 and 230 bitstreams came out byte-identical. It also means
-    // you CANNOT over-constrain through this field to buy margin — the 275..295 "ceiling
-    // sweep" was four runs of the same 250 MHz constraint. For real extra margin use
-    // set_clock_uncertainty in build_project.tcl, not a fictional clock.
+    // The PS IP silently snaps an off-rung request DOWN to the rung below, so the build would
+    // be constrained at the rung while labelled otherwise. This field cannot buy margin by
+    // over-constraining; use set_clock_uncertainty in build_project.tcl for that.
     require(CoreConfig.plClkRungs.contains(plClkMhz),
         s"plClkMhz=$plClkMhz is not a reachable PL0_REF rung. Valid: " +
         s"${CoreConfig.plClkRungs.toSeq.sorted.mkString(", ")} (labels for the measured rungs " +
@@ -151,7 +87,7 @@ case class CoreConfig(
     val yDim:            Int = batchSize
     val nLanes:          Int = aWidth / 2
     val outLanesPerTile: Int = xDim * nLanes
-    // Accumulator data width = aWidth + headroom. Auto (-1) = legacy log2Ceil(maxAcc).
+    // Accumulator width = aWidth + log2Ceil(maxAcc) bits of growth headroom.
     val accHeadroom:     Int = log2Ceil(maxAcc)
     val tileAccWidth:    Int = aWidth + accHeadroom
     val numColTilesMax:  Int = (maxM + outLanesPerTile - 1) / outLanesPerTile
@@ -194,17 +130,13 @@ case class CoreConfig(
         }
     }
 
-    // u-dma-buf node sizes (bytes), derived from geometry to match the worst-case
-    // transfer the runtime issues, page-rounded.
-    //   act = maxN beats x portBytes/port            (LOAD streams maxN activations)
-    //   wt  = max(single COMPUTE slice, resident full-model set/port) — see below
-    //   out = batch x numColTilesMax x outLanesPerTile x outLaneBytes (STORE drain)
+    // u-dma-buf node sizes (bytes, page-rounded) for the worst-case transfer; act/wt per port:
+    //   act = maxN beats x portBytes (LOAD)
+    //   wt  = max(one COMPUTE slice, resident full-model set / numInPorts), so one overlay
+    //         serves both the bench and the resident runner
+    //   out = batch x numColTilesMax x outLanesPerTile x outLaneBytes (STORE)
     private def pageUp(b: Long): Long = ((b + 4095L) / 4096L) * 4096L
     val udmabufActBytes: Long = pageUp(maxN.toLong * portBytes)
-    // wt: the bench streams one COMPUTE weight slice at a time (maxN x numColTilesMax),
-    // but the resident full-model runner keeps the whole per-port working set mapped at
-    // once. Size to whichever is larger so ONE overlay serves both — a model preset
-    // (residentWtBytes>0) gets the resident size; a bench preset keeps the slice size.
     val udmabufWtSliceBytes:    Long = pageUp(wtPortBytes(maxN.toLong, maxM))
     val udmabufWtResidentBytes: Long = if (residentWtBytes > 0) pageUp(residentWtBytes / numInPorts) else 0L
     val udmabufWtBytes:  Long = math.max(udmabufWtSliceBytes, udmabufWtResidentBytes)
@@ -220,9 +152,7 @@ case class CoreConfig(
 
     def maxMatmulShape: (Int, Int) = (maxN, maxM)
 
-    // Named, not positional: Core and CoreTop each grew their own parameter tail as levers
-    // were added, so the two orders no longer match and a positional list silently binds the
-    // wrong field the moment one of them gains a parameter.
+    // Named, not positional: Core and CoreTop parameter orders differ.
     def buildCore: Core = new Core(
         aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
         maxN = maxN, maxM = maxM, outBeatLanes = outBeatLanes,
@@ -270,10 +200,8 @@ case class CoreConfig(
         else "pow2"
 
     /**
-      * Flat KEY=VALUE preset manifest. `source`-able in bash (build_all.sh,
-      * gen_overlay.tcl, the root Makefile) and trivially parsed in C. This is the
-      * single source of truth for every geometry/deployment field that used to be
-      * hand-duplicated across the build/run scripts.
+      * Flat KEY=VALUE preset manifest (bash-sourceable, parsed in C): the single source of
+      * truth for geometry/deployment fields across the build and run scripts.
       *
       * @param name the CoreConfig preset name (CoreConfig does not store its own).
       */
@@ -384,19 +312,10 @@ case class CoreConfig(
 
 object CoreConfig {
     /**
-      * The only PL fabric clocks this part can actually produce.
-      *
-      * pl_clk0 comes from PL0_REF, a divided PLL output, so it exists on discrete rungs
-      * only. MEASURED 2026-08-04 by reading PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ back
-      * out of the configured PS IP (`scripts/probe_pl_clk.tcl`, part xck26-sfvc784-2LV-c,
-      * SRCSEL=IOPLL) — the achieved rates are
-      *
-      *   299.997009  249.997498  199.998001  166.664993  142.855713  99.999001 MHz
-      *   (3.3334      4.0000      5.0000      6.0001      7.0001      10.0001  ns)
-      *
-      * A request between two rungs snaps DOWN, so each label below is the smallest integer
-      * that lands on its own rung. The board's fclk0 was measured independently and offers
-      * the same set, so one table serves both the STA and the runtime side.
+      * The only PL fabric clocks this part can produce. pl_clk0 comes from PL0_REF, a
+      * divided PLL output, so it exists on discrete rungs only and a request between rungs
+      * snaps DOWN. Each label is the smallest integer that lands on its own rung
+      * (`scripts/probe_pl_clk.tcl` reads the achieved rate back out of the PS IP).
       */
     val plClkRungs: Set[Int] = Set(100, 143, 167, 200, 250, 300)
 
@@ -409,9 +328,7 @@ object CoreConfig {
     )
 
     // ─── Dev / simulation fixtures ─────────────────────────────────────────
-    // NOT deployable and deliberately NOT in `presets` below: they exist so the test
-    // suite has small, fast-to-elaborate geometries. `make build PRESET=` only offers
-    // what is in the registry.
+    // Small, fast-to-elaborate geometries for the tests; deliberately not in `presets`.
 
     /** Compact default — single batch, 8x8 array. Also pins the case-class defaults. */
     val Default: CoreConfig = CoreConfig()
@@ -423,105 +340,22 @@ object CoreConfig {
     )
 
     // ─── Deployable presets ────────────────────────────────────────────────
+    // Exactly three, one per released MMfreeLM checkpoint (CoreConfigSpec pins the set).
     //
-    // Exactly three, one per released MMfreeLM checkpoint. Each is the arm that WON the
-    // 2026-08-04/05 board sweep for its size, flattened into a single definition so the
-    // configuration is readable without chasing a .copy() chain through a dozen ancestors.
+    // Shared by all three: batchSize=8 (the weight stream is amortized over the batch; the
+    // runtime batch count, COMPUTE flags -> cmpBatch, lets one B8 bitstream serve b=1..8),
+    // outBeatLanes=4 (128-bit m_axis = the HP port width), packedWeights, 250 MHz with
+    // b4TimingLevers250, colBankSize=4, and dspAccum, which moves the lane accumulators into
+    // DSP48E2s and is the condition that makes B8 fit in LUT at all.
     //
-    // The ~50 ablation presets these were selected from — batch ladders, accumulator
-    // headroom, broadcast fanout, DSP-accum on/off, banking width, clock rungs, and the
-    // matched 2-bit controls for every packed arm — live on the `exploration` branch
-    // together with the sweep harness that produced the numbers below:
-    //
-    //     git checkout exploration
-    //     make build PRESET=k26_mmfree2_7b_a16_b6_dsp_s8_200
-    //
-    // ── WHAT ALL THREE SHARE ──────────────────────────────────────────────────
-    //
-    // batchSize = 8, outBeatLanes = 4
-    //   Decode is weight-bandwidth-bound, so the lever that matters is tokens amortized
-    //   per weight stream. B6 measured +11.8% over B4; B8 then measured +11.5% (370M) and
-    //   +15.4% (2.7B) over B6 at its own best point, and — the result that justified the
-    //   promotion — costs NOTHING below b=8 (b=6 lands within 0.7% of the B6 bitstream on
-    //   the same software). The "~95% LUT capacity wall" that once capped this at 6 was
-    //   measured before dspAccum existed; with the accumulators in DSP48s all three close
-    //   250 MHz at 81-83% LUT. See dspAccum below — it is the enabling condition, not a
-    //   separate optimization.
-    //   outBeatLanes=4 puts m_axis at 128 bits to match the HP port width; at 32 bits the
-    //   STORE was the batch bottleneck at ~1 GB/s and did not amortize.
-    //   The runtime batch count (COMPUTE flags field -> cmpBatch) makes ONE B8 bitstream
-    //   also serve b=1..7 at ~B1 cost, so there is no reason to ship a low-B build.
-    //
-    // packedWeights = true — 1.6-bit weights, 5 trits/byte
-    //   Cuts the binding weight traffic ~20%; measured +4.3% tok/s at 2.7B b=6, growing
-    //   with model size and shrinking with batch. Independent of the B6 gain, so the two
-    //   compound. This is an RTL parameter (the unpack gearbox only exists when it is
-    //   set), so a packed bitstream needs a packed blob — the runner hard-errors on a
-    //   mismatch rather than streaming garbage.
-    //
-    // plClkMhz = 250 — the top reachable PL0_REF rung (see plClkRungs).
-    //   Worth only ~5% at b=6, because a bandwidth-bound decode barely notices the fabric
-    //   clock. Kept because it is free once the build closes, and all three close.
-    //
-    // implDirectives = b4TimingLevers250 — SYNTH_FLATTEN=full plus Aggressive
-    //   place/phys/route. Every one of these three needs it to make 250.
-    //
-    // ── WHAT DIFFERS, AND WHY ─────────────────────────────────────────────────
-    //
-    // 370M is maxN=4096. 1.3B and 2.7B are both maxN=8192 (nextPow2 of the largest inner
-    // dim), so they emit BYTE-IDENTICAL RTL and differ only in manifest fields — model,
-    // bench shapes, udmabuf-wt sizing. Three presets, TWO bitstreams: build the 2.7B one
-    // and assemble 1.3B from it with scripts/clone_preset_hw.sh (seconds, not 50 minutes).
-    //
-    // The maxN=8192 pair carries three levers that 370M does not need:
-    //
-    //   dspAccum = true      Maps the lane accumulators onto DSP48E2 instead of LUT/CARRY8,
-    //                        worth ~22 pp LUT and ~34 pp CARRY8. Full coverage would want
-    //                        xDim*batch*nLanes = 32*8*8 = 2048 DSPs against the K26's 1248,
-    //                        so ~800 lanes spill back to fabric; it is still what makes B8
-    //                        fit. 370M carries it for the same reason, despite closing 250
-    //                        without it at B6.
-    //
-    //   colBankSize = 4      Halves the activation-broadcast fanout. Targets the route-bound
-    //                        path (74% route over 3 levels) that the DSP spill creates by
-    //                        smearing the array across the die.
-    //
-    //   actRamStyle="block"  Caps the 8192x96 activation BRAM's 8-deep RAMB36E2 hard cascade
-    //   actCascadeHeight=2   at one hop, resolving the rest in a fabric mux. That cascade was
-    //                        3.206 ns of pure logic before a single net routed. The attributes
-    //                        ride on the ActMem BlackBox because CIRCT cannot attach them to a
-    //                        SyncReadMem — same reason OutMemUltra exists.
-    //
-    // The last two are a PAIR. The two paths they fix failed 0.005 ns apart, so fixing
-    // either one alone moves WNS by 0.005 ns and wastes a 50-minute build; CoreConfigSpec
-    // pins that they always travel together.
-    //
-    // 370M needs only the first two: maxN=4096 is a 4-deep cascade, so it closes 250 without
-    // the ActMem cap. It carries dspAccum because that is what lets B8 fit, not for timing —
-    // at B6 it closed 250 on banking alone.
-    //
-    // ── MEASURED — KRIA KV260, decode tok/s, POWER=1, all gates PASS, streams_ok=1 ─
-    // Five passes, median, threaded readback, on these B8 bitstreams (2026-08-06).
-    //
-    //   preset        b=1     b=4     b=6     b=7     b=8   WNS@250  SOM W @b8  tok/J
-    //   mmfree_370m  41.31  107.51  123.46  132.03  137.67  +0.011      5.52    24.96
-    //   mmfree_1_3b  20.38   54.05   57.89†  68.51   71.53† +0.002*     6.17    11.60
-    //   mmfree_2_7b  11.73   33.12   38.63   42.66   44.58  +0.002      6.39     6.97
-    //
-    //   * 1.3B runs the 2.7B bitstream, so the 2.7B WNS is its timing record.
-    //   † 1.3B's host `pack` cost is bimodal at some shapes, so those two cells carry a
-    //     wider spread than the other two models.
-    //   Against a Xeon W-2155 at the same weight format the KRIA is slower in raw throughput
-    //   and ~an order of magnitude better in tok/J, the energy advantage growing with model
-    //   size. The authoritative ratios are reports/final/dataset.csv, not this comment.
-    //
-    // b=8 is the best point, and b=1..7 come free from the same bitstream (cmpBatch). Prefer
-    // b=4 or b=8 over b=5..7: the host's vector ops are omp static over the batch on 4 A53
-    // cores, so they cost ceil(b/4) waves and only b=4 and b=8 fill the waves they pay for.
+    // 1.3B and 2.7B are both maxN=8192 and emit byte-identical RTL; they differ only in
+    // manifest fields (model, bench shapes, udmabuf-wt size). Build 2.7B and assemble 1.3B
+    // with scripts/clone_preset_hw.sh. maxN=8192 additionally needs actRamStyle="block" +
+    // actCascadeHeight=2 to bound the 8-deep RAMB36E2 cascade (see ActMem); that path and the
+    // broadcast path colBankSize fixes fail by nearly the same margin, so the two levers only
+    // help together (CoreConfigSpec pins the pairing).
 
-    /** MMfreeLM-370M — hidden 1024, intermediate 2816, vocab 32000, 24 layers.
-      * maxN=4096, ~85 MB of weight traffic per token. 137.67 tok/s at b=8.
-      */
+    /** MMfreeLM-370M — hidden 1024, intermediate 2816, vocab 32000, 24 layers. maxN=4096. */
     val MMFree_370M: CoreConfig =
         forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
                  aWidth = 16, xDim = 32, outBeatLanes = 1, signedAct = true,
@@ -531,8 +365,7 @@ object CoreConfig {
                   outCascadeHeight = 1,
                   implDirectives = b4TimingLevers250)
 
-    /** MMfreeLM-1.3B — hidden 2048, intermediate 5632, vocab 32000, 24 layers.
-      * maxN=8192, ~325 MB of weight traffic per token. 71.53 tok/s at b=8.
+    /** MMfreeLM-1.3B — hidden 2048, intermediate 5632, vocab 32000, 24 layers. maxN=8192.
       * Same RTL as MMFree_2_7B; assemble its bundle with scripts/clone_preset_hw.sh.
       */
     val MMFree_1_3B: CoreConfig =
@@ -543,9 +376,8 @@ object CoreConfig {
                   outCascadeHeight = 1,
                   implDirectives = b4TimingLevers250)
 
-    /** MMfreeLM-2.7B — hidden 2560, intermediate 6912, vocab 32000, 32 layers.
-      * maxN=8192, ~655 MB of weight traffic per token. 44.58 tok/s at b=8.
-      * The largest checkpoint the K26 runs, and the one to build from.
+    /** MMfreeLM-2.7B — hidden 2560, intermediate 6912, vocab 32000, 32 layers. maxN=8192.
+      * The one to build from for the maxN=8192 bitstream.
       */
     val MMFree_2_7B: CoreConfig =
         forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
@@ -555,9 +387,7 @@ object CoreConfig {
                   outCascadeHeight = 1,
                   implDirectives = b4TimingLevers250)
 
-    /** The deployable set — what the board bundle ships and what the report quotes.
-      * Dev fixtures above are deliberately absent; closed ablations live on `exploration`.
-      */
+    /** The deployable set — what the board bundle ships. */
     val deployable: Map[String, CoreConfig] = Map(
         "mmfree_370m" -> MMFree_370M,
         "mmfree_1_3b" -> MMFree_1_3B,
@@ -565,78 +395,51 @@ object CoreConfig {
     )
 
     // ─── Candidates ────────────────────────────────────────────────────────
-    // Buildable and benchable, but NOT shipped: configurations being evaluated against the
-    // deployable set. Kept separate so `deployable` stays exactly the three the report
-    // quotes, while `make build PRESET=` can still reach these. A candidate either wins and
-    // is promoted, or loses and moves to `exploration` with its result recorded.
+    // Buildable via `make build PRESET=` but not shipped; kept separate so `deployable`
+    // stays exactly the shipped three.
     //
-    // ── B8: the one batch that is optimal on BOTH sides ───────────────────────
-    // batchSize=8 was written off as a ~95% LUT capacity wall — but that was MEASURED on
-    // 370M B8 with fabric accumulators, before dspAccum existed, and moving the lane
-    // accumulators into DSP48s is worth ~22 pp of LUT. Extrapolating the two measured
-    // 2.7B DSP+packed points (B4 49839 LUT, B6 70338) linearly and correcting for the extra
-    // DSP spill puts B8 at ~81% LUT, 47% registers, 20% CARRY8, 49% BRAM, 50% URAM. That
-    // fits. dspAccum is not an optimization here, it is the enabling condition — which is
-    // why 370M gains it below despite closing 250 without it at B6.
+    // 2-bit controls: each is its deployable twin with packedWeights=false and nothing else
+    // changed (CoreConfigSpec asserts this), isolating the weight format. udmabuf-wt grows
+    // 1.25x without packing; the overlay carries the size, so a cloned or reused packed
+    // overlay is too small, and 2.7B exceeds the older cma=1000M boot arg.
     //
-    // WHY B8 IS WORTH A BUILD: it is the only point that helps engine and host at once. The
-    // engine amortizes the weight stream over 8 tokens instead of 6 (B4->B6 measured
-    // +11.8%). The host's vector ops are omp-static over the batch on 4 A53 cores, so they
-    // cost ceil(b/4) waves — b=8 runs two full waves at 100% efficiency where b=6 wastes a
-    // quarter of the second wave. b=5..8 all pay two waves and only b=8 amortizes them.
-    //
-    // THE RISK WAS TIMING, NOT CAPACITY. Full DSP coverage wants xDim*batch*nLanes =
-    // 32*8*8 = 2048 against the K26's 1248, so 800 lanes spill to fabric versus 288 at B6 —
-    // and that spill is exactly what created the route-bound broadcast path colBankSize=4
-    // was added to fix. B6 closed 250 at +0.025 ns with all 30 worst paths clustered in
-    // 0.042-0.063 ns on one congestion family, so there was no margin to give away.
-    //
-    // ── B8 was PROMOTED to deployable 2026-08-06, and the comparison is CLOSED ─
-    // The three configs above carry batchSize = 8; the reasoning above is preserved because
-    // it is what the promotion rests on. What the builds measured:
-    //
-    //     preset            WNS@250    LUT      Reg     CARRY8   BRAM     URAM     DSP
-    //     mmfree_2_7b       +0.002   83.18%   49.76%   25.92%   49.65%   50.00%   100%
-    //     mmfree_370m       +0.011   81.42%   48.30%   25.92%   29.51%   53.13%   100%
-    //
-    // and what the board measured, five passes on one software build: B8 costs nothing below
-    // b=8 (its b=6 lands within 0.7% of the B6 bitstream) and gains +11.5% (370M) / +15.4%
-    // (2.7B) at b=8. Best-point to best-point, +10.7% and +15.6%.
-    //
-    // ⚠️ 2.7B's +0.002 ns is the thinnest margin anything shipped has ever had, and a
-    // different placement seed could miss. That risk was accepted on promotion rather than
-    // retired: it has NOT been seed-swept, and the 200 MHz rung (~5% slower, far more
-    // margin) remains the fallback if the board shows intermittent trouble. The gate is the
-    // check that matters here — bit-exactness at temperature, per bitstream, per session.
-    //
-    // The B6 configurations were retained here as the control while that comparison was open.
-    // It is now settled, B8 is the final shipped configuration, and they were removed
-    // 2026-08-07 rather than left as a second way to build a bitstream nobody should deploy.
-    // `git show d63d9f9:src/main/scala/control/CoreConfig.scala` has them if a B6 build is
-    // ever needed again, and reports/final/ retains the B6 measurements themselves.
-    //
-    // ── CLOSED 2026-08-09: the 300 MHz question, and why nothing here is open ──
-    //
-    // Three levers were built and measured against the 300 rung: a real nearest-neighbour
-    // systolic array (systolic.TrueSystolicArray — the shipped SystolicArray is a BROADCAST
-    // MAC array, not a systolic one), a pipelined + replicated tile-capture enable, and the
-    // banked output memory. Only the last one shipped, and only for margin at 250.
-    //
-    //     banked, broadcast dataflow   @300   WNS -0.268   TNS -13241.762   94 071 failing
-    //     banked + capture + systolic  @300   WNS -0.310   TNS   -798.596    9 113 failing
-    //
-    // Failing endpoints fell 90% and TNS 94% while WNS did not move: each fix works on its
-    // own endpoint family and uncovers the next control net of the same shape (gearbox
-    // flush, then arrLocalReset into 1 248 DSP RSTP pins at 90% route). Post-route Fmax is
-    // ~274.5 MHz, and PL0_REF has no rung between 250 and 300, so all of it buys a
-    // deployable clock of exactly ZERO. The prize at 300 was ~5% on a decode that is
-    // weight-bandwidth-bound.
-    //
-    // The array and capture levers, their tests and the 300 MHz arms live on `exploration`
-    // (and in `git show 6c4abb6` on this branch). Do not re-derive them from scratch — the
-    // measurements are there. `candidates` is empty again, as it should be whenever nothing
-    // is under evaluation.
-    val candidates: Map[String, CoreConfig] = Map.empty
+    // Build these through forModel, never `MMFree_*.copy(packedWeights = false)`:
+    // residentWtBytes is a constructor field forModel derives from the packing, and .copy
+    // leaves it at the PACKED value, emitting an overlay that under-allocates udmabuf-wt.
+
+    /** MMFree_370M with 2-bit weights — the matched control for the packed 370M. */
+    val MMFree_370M_2bit: CoreConfig =
+        forModel(hidden = 1024, intermediate = 2816, vocab = 32000, layers = 24,
+                 aWidth = 16, xDim = 32, outBeatLanes = 1, signedAct = true,
+                 plClkMhz = 250, shapes = "370m", model = "ridger/MMfreeLM-370M",
+                 packedWeights = false)
+            .copy(batchSize = 8, outBeatLanes = 4, colBankSize = 4, dspAccum = true,
+                  outCascadeHeight = 1,
+                  implDirectives = b4TimingLevers250)
+
+    /** MMFree_1_3B with 2-bit weights — same RTL as MMFree_2_7B_2bit; clone, do not build. */
+    val MMFree_1_3B_2bit: CoreConfig =
+        forModel(hidden = 2048, intermediate = 5632, vocab = 32000, layers = 24,
+                 shapes = "1.3b", model = "ridger/MMfreeLM-1.3B", packedWeights = false)
+            .copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
+                  colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
+                  outCascadeHeight = 1,
+                  implDirectives = b4TimingLevers250)
+
+    /** MMFree_2_7B with 2-bit weights — the matched control, and 1.3B's bitstream too. */
+    val MMFree_2_7B_2bit: CoreConfig =
+        forModel(hidden = 2560, intermediate = 6912, vocab = 32000, layers = 32,
+                 shapes = "2.7b", model = "ridger/MMfreeLM-2.7B", packedWeights = false)
+            .copy(batchSize = 8, outBeatLanes = 4, plClkMhz = 250, dspAccum = true,
+                  colBankSize = 4, actRamStyle = "block", actCascadeHeight = 2,
+                  outCascadeHeight = 1,
+                  implDirectives = b4TimingLevers250)
+
+    val candidates: Map[String, CoreConfig] = Map(
+        "mmfree_370m_2bit" -> MMFree_370M_2bit,
+        "mmfree_1_3b_2bit" -> MMFree_1_3B_2bit,
+        "mmfree_2_7b_2bit" -> MMFree_2_7B_2bit
+    )
 
 
     /** Everything `make build PRESET=` / EmitCore can reach. */
@@ -704,10 +507,8 @@ object CoreConfig {
       *   maxM  = ceilTo(max(2*intermediate, vocab), outLanesPerTile)
       *   maxAcc = max(maxAccHint, maxN)
       *
-      * Only maxN/maxAcc grow with model size; geometry (xDim, aWidth, ports) and
-      * the 32-bit m_axis lane format are unchanged. One maxN=8192 bitstream thus
-      * covers 370M, 1.3B and 2.7B — the bench just streams a smaller N for the
-      * smaller models. `shapes` names the default bench sweep for the preset.
+      * Only maxN/maxAcc grow with model size, so one maxN=8192 bitstream covers 370M,
+      * 1.3B and 2.7B. `shapes` names the default bench sweep for the preset.
       */
     def forModel(
         hidden:       Int,
@@ -732,18 +533,13 @@ object CoreConfig {
         val maxN            = nextPow2(math.max(hidden, intermediate))
         val maxM            = ceilTo(math.max(2 * intermediate, vocab), outLanesPerTile)
         val maxAcc          = math.max(maxAccHint, maxN)
-        // Total ternary weight elements the runner streams per token, summed over every
-        // projection (matches the "weight traffic/token" table above): per layer the 4
-        // i/f/g/o_proj (hidden^2), the fused gate_up (hidden x 2*intermediate) and
-        // down_proj (intermediate x hidden); plus the one lm_head (hidden x vocab).
-        // Ternary weights pack at 2 bits each, so bytes = elements * 2 / 8 = elements/4.
+        // Weight elements streamed per token: per layer 4x i/f/g/o_proj (hidden^2), gate_up
+        // and down_proj; plus lm_head.
         val perLayerElems   = 4L * hidden * hidden + hidden.toLong * (2 * intermediate) + intermediate.toLong * hidden
         val totalWtElems    = perLayerElems * layers + hidden.toLong * vocab
-        // Resident weight bytes (across ports). 2-bit keeps the verified element-count
-        // sizing byte-for-byte (deployed overlays depend on it). Packed sums the EXACT
-        // per-projection 1.6-bit blob (5 trits/byte, each padded to a whole wire beat),
-        // so udmabuf-wt is sized ~0.8x without under-counting the pad — the same formula
-        // the packer/runtime use per projection.
+        // Resident weight bytes across ports. 2-bit: elements/4 (deployed overlays depend on
+        // this exact sizing). Packed: the exact per-projection 1.6-bit blob, each padded to a
+        // whole wire beat — the same formula the packer/runtime use.
         val totalWtBytes =
             if (!packedWeights) totalWtElems * 2L / 8L
             else {

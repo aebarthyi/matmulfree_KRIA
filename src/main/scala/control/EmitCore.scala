@@ -7,19 +7,19 @@ import java.nio.charset.StandardCharsets
 /**
   * Emit SystemVerilog for the CoreTop module (the Vivado-facing wrapper).
   *
-  *   ./mill matmulfree_KRIA.runMain control.EmitCore                       # default
-  *   ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_370m           # named preset
-  *   ./mill matmulfree_KRIA.runMain control.EmitCore default custom/out    # preset + dir
+  *   ./mill matmulfree_KRIA.runMain control.EmitCore                         # mmfree_2_7b
+  *   ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_370m             # named preset
+  *   ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_370m custom/out  # preset + dir
   *
   *   - arg 0 (optional): CoreConfig preset name from [[CoreConfig.presets]].
-  *                       Defaults to "default".
+  *                       Defaults to "mmfree_2_7b", as the Makefiles do.
   *   - arg 1 (optional): target directory. Defaults to `generated/<configName>`.
   *
   * The emitted top exposes `aclk`, `aresetn`, `s_axi_*`, `s_axis_*`, `m_axis_*`,
   * and `irq` — Vivado's IP packager auto-recognizes those as AXI4 / AXI-Stream.
   */
 object EmitCore extends App {
-    val configName = args.lift(0).getOrElse("default")
+    val configName = args.lift(0).getOrElse("mmfree_2_7b")
     val targetDir  = args.lift(1).getOrElse(s"generated/$configName")
     val config     = CoreConfig.byName(configName)
 

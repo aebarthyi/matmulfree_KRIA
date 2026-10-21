@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# compare_backends.sh — the Phase-E deliverable: one CPU-vs-CPU+FPGA table.
-#
-# Runs the exact-match gate first (parity must hold before any timing is meaningful),
-# then times decode on both backends with the SAME binary/model/harness — only the
-# TernaryBackend differs — and renders a side-by-side table led by decode tok/s.
+# compare_backends.sh — CPU vs CPU+FPGA decode table. Runs the exact-match gate first
+# (no timing without parity), then benches both backends with the same binary and model.
 #
 # Usage (run under sudo; the engine driver needs /dev/mem + udmabuf):
 #   sudo ./compare_backends.sh <core_phys> <dma_phys> <uio> <act> <wt> <out> \

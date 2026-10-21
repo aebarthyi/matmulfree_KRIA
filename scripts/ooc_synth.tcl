@@ -1,25 +1,16 @@
-# scripts/ooc_synth.tcl
+# scripts/ooc_synth.tcl — out-of-context synthesis check for CoreTop.
 #
-# Out-of-context synthesis check for CoreTop.
+#   vivado -mode batch -source scripts/ooc_synth.tcl [-tclargs <config_name> [<part>]]
 #
-# Usage:
-#   vivado -mode batch -source scripts/ooc_synth.tcl
-#   vivado -mode batch -source scripts/ooc_synth.tcl -tclargs <config_name>
-#   vivado -mode batch -source scripts/ooc_synth.tcl -tclargs <config_name> <part>
-#
-# Defaults assume a KRIA K26 SoM (used by KV260 / KR260).
-# Reads the emitted SV from generated/<config_name>/ (run EmitCore for that preset
-# first — `make emit PRESET=<name>` or the runMain below).
-# Reports land in build/vivado-ooc/<config_name>/.
+# Reads the emitted SV from generated/<config_name>/ (run control.EmitCore for that preset
+# first); the default part is the KRIA K26 SoM. Reports land in build/vivado-ooc/<config_name>/.
 
 set script_dir [file dirname [info script]]
 set proj_root  [file normalize "$script_dir/.."]
 
-# Defaults
-set config_name "default"
+set config_name "mmfree_2_7b"
 set part        "xck26-sfvc784-2LV-c"
 
-# Override from -tclargs
 if {[llength $argv] >= 1} { set config_name [lindex $argv 0] }
 if {[llength $argv] >= 2} { set part        [lindex $argv 1] }
 
@@ -42,7 +33,6 @@ puts "  build_dir : $build_dir"
 
 create_project -in_memory -part $part
 
-# Add all generated SV files.
 foreach f [glob $gen_dir/*.sv] {
     read_verilog -sv $f
     puts "  + $f"
@@ -50,18 +40,14 @@ foreach f [glob $gen_dir/*.sv] {
 
 set_property top CoreTop [current_fileset]
 
-# Synthesize out of context.
 synth_design -mode out_of_context -top CoreTop -part $part
 
-# Constrain aclk so the timing summary is meaningful (it was previously
-# unconstrained — WNS=NA). Default matches bd.tcl's PL0_REF (100 MHz);
-# override with CLK_MHZ in the environment to probe faster targets.
+# Constrain aclk so the timing summary is meaningful (default 100 MHz; CLK_MHZ= overrides).
 set clk_mhz 100
 if {[info exists ::env(CLK_MHZ)]} { set clk_mhz $::env(CLK_MHZ) }
 create_clock -period [expr {1000.0 / $clk_mhz}] -name aclk [get_ports aclk]
 puts "  aclk constrained to $clk_mhz MHz"
 
-# Quick reports.
 report_utilization      -file "$build_dir/coretop_utilization.rpt"
 report_timing_summary   -file "$build_dir/coretop_timing_summary.rpt" -warn_on_violation
 report_clocks           -file "$build_dir/coretop_clocks.rpt"

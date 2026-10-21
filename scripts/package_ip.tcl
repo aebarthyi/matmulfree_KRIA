@@ -1,10 +1,8 @@
-# scripts/package_ip.tcl — (re)package the emitted CoreTop SystemVerilog as a
-# Vivado IP (VLNV user.org:user:CoreTop:1.0), the VLNV that vivado/bd.tcl expects.
+# scripts/package_ip.tcl — (re)package the emitted CoreTop SystemVerilog as a Vivado IP
+# (VLNV user.org:user:CoreTop:1.0, which vivado/bd.tcl expects).
 #
-# You normally do NOT need this: generated/mmfree_2_7b is already a packaged IP and
-# build_all.sh reuses it. Run this only when the Chisel *interface* changes
-# (port widths / new ports), e.g. after switching CoreConfig preset, so the
-# component.xml tracks the new SV. Re-emit the SV first (mill EmitCore).
+# build_all.sh runs this when generated/<preset> has no component.xml, or with REPACKAGE=1.
+# Re-package whenever the Chisel interface or the SV file set changes (re-emit the SV first).
 #
 #   vivado -mode batch -source scripts/package_ip.tcl -tclargs <sv_dir> <top>
 #     sv_dir   directory of emitted *.sv      (default: generated/mmfree_2_7b)

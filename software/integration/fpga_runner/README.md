@@ -1,10 +1,10 @@
-# mmfree-cli-fpga — CPU vs CPU+FPGA comparison runner (Phase D)
+# mmfree-cli-fpga — CPU vs CPU+FPGA decode runner
 
 Runs **matmulfreellmCPU** (the C++ HGRN-Bit / MMfreeLM forward) with the ternary
 BitLinear projections executed on the KRIA systolic engine, and compares it head-to-head
 against the pure-CPU path. Same model, same `FixedQ510` numerics, same `run_bench` timing —
 only the `TernaryBackend` differs — so the measurement isolates exactly *ternary matmul on
-the A53 vs on the engine*.
+the CPU vs on the engine*.
 
 ## Pieces
 
@@ -12,133 +12,113 @@ the A53 vs on the engine*.
 |---|---|
 | `fpga_backend.{hpp,cpp}` | `FpgaBackend` (drives the engine via libmmfree) + `CompareBackend` (the `both` gate) |
 | `manifest.{hpp,cpp}` | parse the packer's `<prefix>.manifest.tsv` → `tag → (byte_offset, N, M)` |
-| `main_fpga.cpp` | the runner: open engine, load resident weights, register, `set_backend`, bench / gate |
+| `main_fpga.cpp` | the runner: open engine, load resident weights, register, `set_backend`, bench / serve / gate |
+| `compare_backends.sh` | gate → CPU bench → FPGA bench, rendered as one table |
 | `Makefile` | builds `libmmfreecpu.a` (submodule CMake) + the C engine driver + the runner |
 
 The submodule stays FPGA-agnostic (dependency injection): it exposes only the abstract
 `TernaryBackend` + `Model::set_backend`; all engine code lives here.
 
-## 1. Pack the weights (offline, build host — no torch, no board)
+## Build
 
-Pack directly from the C++ runtime's `model.mmfree` so the engine's ternary codes are
-**identical** to the CPU path's `wq` (the exact-match invariant):
-
-```bash
-cd software/integration
-python -m mmfree_pack.cli --blob ../../matmulfreellmCPU/cpp/model.mmfree --out-dir packed
-# -> packed/weights.port{0..3}.bin  +  packed/weights.manifest.{json,tsv}
-```
-
-Copy `packed/` and `model.mmfree` (+ `tokenizer.mmtok`) to the board.
-
-### udmabuf sizing (one-time, on the board)
-
-Unlike the bench (which streams one projection at a time), this runner holds **all**
-projections **resident** — the weight udmabuf per port must be ≥ the manifest's
-`total_bytes_per_port` (the full a16 370M model is **~21.3 MiB/port**, vs the bench overlay's
-default 8 MiB). The runner prints the exact requirement on startup (`resident=… B/port`) and
-on an open failure. Regenerate + redeploy the DT overlay with a bigger `wt` buffer:
+On the board, `make build` in `~/transfer` compiles this from the bundled `src/`. By hand:
 
 ```bash
-# on the build host — reuse the packaged IP + bitstream, only the overlay changes:
-UDMABUF_WT_SZ=0x01800000 REPACKAGE=0 PRESET=k26_mmfree370m_a16 ./scripts/build_all.sh
-# -> transfer/<preset>/{...dtbo}; redeploy that folder and reload it on the board.
+make -C software/integration/fpga_runner     # -> build/mmfree-cli-fpga
 ```
 
-`act` (64 KiB) and `out` (128 KiB) from the a16 preset already suffice. Check CMA headroom
-first — 4 ports × 24 MiB ≈ 96 MiB: `grep -i cma /proc/meminfo` (add a `cma=256M` bootarg if
-`CmaTotal` is short).
+SIMD is auto-selected from the host (`MMFREE_SIMD=ARM|X86|X86_512|SCALAR` overrides). Requires
+the `matmulfreellmCPU` submodule and CMake. On x86 only the CPU backends can run — that is how
+the Xeon baseline is measured (`scripts/bench_host_cpu.sh`).
 
-## 2. Build (natively on the KRIA, aarch64)
+## Run
+
+Use the board Makefile: it exports the preset's geometry from the manifest, passes the device
+paths and the model/packed-blob paths, and appends `ARGS="…"` last (the runner keeps the last
+occurrence of a repeated flag). From `~/transfer`:
 
 ```bash
-cd software/integration/fpga_runner
-make                      # -> build/mmfree-cli-fpga   (SIMD auto-selected: ARM on aarch64)
+make gate    PRESET=mmfree_2_7b                       # --backend both: every projection's int32 acc, CPU vs engine
+make run     PRESET=mmfree_2_7b                       # --backend fpga --bench --profile
+make run     PRESET=mmfree_2_7b ARGS="--backend cpu"  # CPU baseline, same harness
+make streams PRESET=mmfree_2_7b                       # --serve B --distinct-prompts (row-order check)
+make sweep   PRESET=mmfree_2_7b [BACKEND=cpu]         # --serve b for b = 1..B, one CSV row each
 ```
 
-Requires the `matmulfreellmCPU` submodule checked out (`git submodule update --init`) and
-CMake. An x86 host build is a compile-check only — the engine driver needs the PL.
+Run the **gate first** — it must print `GATE PASS (CPU == FPGA)` before any timing means
+anything.
 
-## 3. Run
+### Backends
 
-Board config args mirror `bench.c` / `smoke_test.c`; geometry defaults to the a16 engine
-(override with `MMFREE_AWIDTH/XDIM/MAXACC/MAXN/MAXM`). Use the real board device nodes.
+| `--backend` | ternary matmul runs on |
+|---|---|
+| `fpga` (default) | the engine |
+| `both` | CPU and engine per projection, asserting bit-identical int32 accumulators (the gate) |
+| `cpu` | the CPU, one int8 per ternary weight |
+| `cpu-2bit` / `cpu-1p6` | the CPU with weights held at the FPGA's encodings (2.0 / 1.625 bits/weight); bit-identical to `cpu`, only speed differs (`cpu-tq1` is an alias of `cpu-1p6`) |
+
+The engine runs only the integer path (`--mode fixed`, the default); `--mode float` is CPU-only.
+
+### Batched decode (`--serve N`)
+
+`--serve N` decodes N concurrent streams with batched projections and reports aggregate
+tok/s. On the engine the N rows share one weight stream (N ≤ the bitstream's batchSize). The
+CPU backends are constructed with width N, so their `matmul_batch` also sweeps each weight
+matrix once per N streams; `MMFREE_CPU_BATCH=n` overrides that width (`1` decodes the streams
+one after another, for an A/B). Results are bit-identical at any width.
+
+Every `--serve` run checks each stream against a single-stream decode (`streams_ok`). With the
+default shared prompt and greedy sampling the streams are identical by construction, so that
+check cannot see a permutation — a drain that wrote row 2 into stream 5 passes it.
+`--distinct-prompts` gives stream *b* its own prompt (a left-rotation of the ids, so all
+prompts have the same length) and compares it against its OWN reference; a swap is reported
+as `ROW PERMUTATION`. It costs N single-stream generations up front, so it is a per-bitstream
+check (`make streams`), not a per-sweep one. The prompt must tokenize to at least N tokens.
+The `--csv` row carries `distinct_prompts` and `distinct_refs` so a saved row says which check
+it was.
+
+### Options and knobs
+
+- Input: `--ids a,b,c` (raw token ids, deterministic) or `--prompt TEXT` (needs a tokenizer:
+  `--tokenizer`, default `tokenizer.mmtok` beside `--blob`); with neither, a fixed
+  pseudo-prompt is used.
+- Timing: `--bench`, `--gen N`, `--warmup N`, `--reps N`, `--profile`, `--csv` (one
+  `#CSVH`/`#CSVR` line pair for `bench_batch.sh`).
+- Sampling: `--temp F`, `--top-k K`, `--seed N`, `--no-eos`.
+- Environment (via `ENV="K=V …"` on the board): `MMFREE_SPLIT_CHUNKS` (column-tile split
+  count; `0` disables, `n` forces n), `MMFREE_RB_THREADS` (readback threads; `1` = serial),
+  `MMFREE_NO_PIPELINE=1` (serial projection sequencing), `MMFREE_CPU_BATCH`, plus the runtime
+  knobs in `software/README.md`.
+
+### Direct invocation
+
+Without the board Makefile, export the manifest geometry yourself — the built-in defaults
+(aWidth 16, xDim 32, maxN 4096, batch 1, 2-bit) match none of the shipped bitstreams:
 
 ```bash
-ARGS="0xA0010000 0xA0000000 /dev/uio4 /dev/udmabuf-act /dev/udmabuf-wt /dev/udmabuf-out \
-      --blob model.mmfree --packed-dir packed"
-
-# (a) exact-match gate — every projection's int32 acc, CPU vs engine, must be identical
-sudo ./build/mmfree-cli-fpga $ARGS --backend both --ids 1,415,310,29871,13
-
-# (b) CPU baseline                          (headline: decode tok/s)
-sudo ./build/mmfree-cli-fpga $ARGS --backend cpu  --bench --gen 128 --reps 5 --profile
-
-# (c) CPU + FPGA                            (same harness, projections on the engine)
-sudo ./build/mmfree-cli-fpga $ARGS --backend fpga --bench --gen 128 --reps 5 --profile
+cd ~/transfer
+GEOM=$(grep -E '^(MMFREE_|NUM_DMA)' presets/mmfree_2_7b/preset.env | tr '\n' ' ')
+M=models/ridger/MMfreeLM-2.7B
+sudo env $GEOM ./src/software/integration/fpga_runner/build/mmfree-cli-fpga \
+     0xA0010000 0xA0000000 /dev/uio4 /dev/udmabuf-act /dev/udmabuf-wt /dev/udmabuf-out \
+     --blob $M/model.mmfree --packed-dir $M/packed-1p6 --backend both
 ```
 
-Run **(a) first** — it must print `GATE PASS (CPU == FPGA)` before the timing numbers in
-(b)/(c) mean anything.
+The six positionals are the Core and DMA0 register bases, the UIO node and the udmabuf base
+paths; on multi-port presets the port index is appended to the act/wt paths
+(`/dev/udmabuf-wt0..3`). `compare_backends.sh` takes the same common args (it adds
+`--backend` and `--bench --profile` itself), refuses to report timing unless the gate passes,
+and writes logs to `./compare_out/` (`OUT_DIR=`; `PARSE_ONLY=1` re-renders from saved logs).
+Run it under the same `sudo env $GEOM`.
 
-### (d) batched decode: does row b land in stream b?
+### Weights and udmabuf sizing
 
-```bash
-sudo ./build/mmfree-cli-fpga $ARGS --backend fpga --serve 8 --distinct-prompts --gen 32 \
-     --prompt "The quick brown fox jumps over the lazy dog while a tired old bear watches"
-```
-
-`--serve N` alone gives every stream the same prompt, and sampling is greedy, so the N
-streams are identical by construction: the `streams_ok` it prints proves batched decode
-equals single-stream decode and that no stream was dropped, but identical streams are
-invariant under permutation — a drain that wrote row 2 into stream 5 passes it.
-
-`--distinct-prompts` gives stream *b* its own prompt (a left-rotation of the ids, so every
-prompt has the same length and the timings stay comparable) and compares it against its
-OWN single-stream reference. A swap then shows up as one stream reproducing another's
-reference verbatim, which is reported as `ROW PERMUTATION` rather than a bare mismatch.
-It costs N single-stream generations up front, so it is a per-bitstream check, not a
-per-sweep one. The prompt must tokenize to at least N tokens; the runner refuses a config
-where two rotations coincide instead of reporting a weaker check as a pass. The `--csv`
-row carries `distinct_prompts` and `distinct_refs` (how many references actually differed
-— streams sharing a reference stay interchangeable) so a saved row says which check it was.
-On the board: `sudo make streams PRESET=<preset>`.
-
-### One-shot comparison
-
-`compare_backends.sh` does all three in order (gate → CPU bench → FPGA bench), refuses to
-report timing unless the gate passes, and prints one decode-tok/s + profile table:
-
-```bash
-sudo ./compare_backends.sh $ARGS --gen 128 --reps 5 --ids 1,415,310,29871,13
-```
-
-Pass the runner's COMMON args (board config + `--blob`/`--packed-dir` + `--gen`/`--reps`/
-`--ids`); the script adds `--backend {both,cpu,fpga}` and `--bench --profile` itself. Logs
-land in `./compare_out/` (override `OUT_DIR=`); `PARSE_ONLY=1` re-renders the table from
-saved logs without re-running. Example output:
-
-```
-================ CPU vs CPU+FPGA  (decode steady-state) ================
-metric                                      CPU       CPU+FPGA
-decode tok/s  [headline]                  15.40          58.90   (3.82x)
-prefill ms                                120.0           44.2
-overall tok/s                             14.80          52.30
-matmul+lm_head % of profile               78.5%          31.2%
-========================================================================
-parity gate: PASS
-```
-
-(numbers above are illustrative.)
-
-## Notes
-
-- The engine only runs the integer path — use `--mode fixed` (the default). `--mode float`
-  is CPU-only (the triton golden reference).
-- `--prompt TEXT` needs `--tokenizer`; `--ids a,b,c` bypasses the tokenizer (deterministic,
-  preferred for the gate). With no input a fixed pseudo-prompt is used.
-- Per-op engine round-trip (~145 ops/token) is the expected post-offload bottleneck.
-  Phase-F levers: `MMFREE_POLL=1` (default for dedicated
-  decode, +24%) and b-aware pack (+8%) are landed; the i/f/g cluster pipeline (overlap
-  pack/readback under the engine) is next. NOTE: i/f/g *weight* fusion is a dead end —
-  each BitLinear has its own inner RMSNorm so the three quantized activations differ.
+The packed blobs come from `make model` / `make pack` on the build server (root README); the
+blob's encoding must match the bitstream (`MMFREE_PACKED_WEIGHTS`) or the runner exits. The
+runner holds **every** projection resident, so the weight udmabuf per port must be at least
+the manifest's `total_bytes_per_port` — printed at startup as `resident=… B/port`. The overlay
+sizes udmabuf-wt for the preset's own model and `deploy-hw` verifies it, so a short buffer
+usually means a stale or borrowed overlay (or a larger `MODEL=` than the preset's); redeploy
+the preset's own bundle, or rebuild with `UDMABUF_WT_SZ=<bytes>` (`PACKAGE_ONLY=1` re-runs only
+the overlay steps). Large buffers need CMA headroom: check `grep -i cma /proc/meminfo`, and see
+`cma_reclaim.sh` for the 2-bit 2.7B preset.

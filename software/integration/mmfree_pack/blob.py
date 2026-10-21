@@ -1,13 +1,10 @@
-"""Reader for the C++ runtime's `model.mmfree` weight blob (Phase B).
+"""Reader for the C++ runtime's `model.mmfree` weight blob.
 
-The blob is produced by matmulfreellmCPU/tools/pack_weights.py and consumed by
-cpp/src/io/weights.cpp. We read it here to pack the *already-ternary* projection
-weights for the engine — using the blob's own `wq`/`scale_w` rather than
-re-quantizing from float — so the engine's ternary codes are byte-for-byte the
-codes the C++ FixedQ510 path uses. That identity is what makes the C++↔FPGA
-accumulator exactly equal (the P-D exact-match gate).
+Produced by matmulfreellmCPU/tools/provision.py, consumed by cpp/src/io/weights.cpp.
+Packing the blob's own already-ternary `wq` (no re-quantization) keeps the engine's
+codes identical to the CPU path, which the exact-match gate depends on.
 
-Blob layout (mirror weights.cpp / pack_weights.py):
+Blob layout (mirror weights.cpp / provision.py):
     [8]   magic "MMFREE1\n"
     [8]   u64 header_len (little-endian)
     [hl]  header JSON {"config":{...},"tensors":{name:{dtype,shape,offset,nbytes}}}

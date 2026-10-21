@@ -4,11 +4,8 @@ package build
 import mill._
 import mill.scalalib._
 
-// Note: This project requires .mill-jvm-opts file containing:
-//   -Dchisel.project.root=${PWD}
-// This is needed because Chisel needs to know the project root directory
-// to properly generate and handle test directories and output files.
-// See: https://github.com/com-lihaoyi/mill/issues/3840
+// Requires a .mill-jvm-opts file containing `-Dchisel.project.root=${PWD}`, so Chisel can find
+// the project root for its test/output directories (https://github.com/com-lihaoyi/mill/issues/3840).
 
 object `matmulfree_KRIA` extends SbtModule {
   def scalaVersion = "2.13.18"

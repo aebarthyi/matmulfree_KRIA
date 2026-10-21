@@ -1,5 +1,3 @@
-// See README.md for license details.
-
 package systolic
 
 import chisel3._
@@ -18,34 +16,23 @@ class PEOutputBundle(val aWidth: Int, val accWidth: Int) extends Bundle {
 }
 
 /**
-  * PE accumulates activations based on ternary weights.
+  * Ternary-MAC PE: each of aWidth/2 lanes adds (code 1), subtracts (code 3) or holds
+  * (code 0) the activation into its accumulator for nAcc handshaked beats.
   *
-  * `signedAct` selects how the aWidth-bit activation is extended into the wider
-  * accumulator: false (default) zero-extends — the legacy/bring-up behavior, so
-  * deployed presets and their tests are unchanged; true sign-extends, treating
-  * the activation as two's-complement (real BitLinear activations, and the
-  * 16-bit fixed-point the HGRN carries). For non-negative activations the two
-  * paths are identical, so this only matters once negative values are streamed.
+  * `signedAct` sign-extends the activation into the accumulator (two's complement);
+  * false zero-extends. The two agree for non-negative activations.
 */
 class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false,
          val useDspAccum: Boolean = false) extends Module {
   require(maxAcc >= 2, "PE requires maxAcc >= 2 (hardware counter limitation)")
-  // Accumulator = aWidth data + headroom overflow bits. Default (-1) keeps the
-  // legacy log2Ceil(maxAcc) headroom (worst-case growth over maxAcc accumulations);
-  // a smaller value trims the accumulator once the model's real dynamic range is
-  // known (the counter still counts to maxAcc — only the data width shrinks).
+  // Accumulator = aWidth + log2Ceil(maxAcc) headroom (worst-case growth over maxAcc beats).
   val accHeadroom = log2Ceil(maxAcc)
   val accWidth = aWidth + accHeadroom
   val input = IO(Flipped(Decoupled(new PEInputBundle(aWidth, maxAcc))))
   val output = IO(Decoupled(new PEOutputBundle(aWidth, accWidth)))
   val accumReg = RegInit(VecInit(Seq.fill(aWidth/2)(0.U(accWidth.W))))
-  // Map each lane's ±activation accumulator onto a DSP48E2 slice instead of
-  // LUT/CARRY8 fabric. The `use_dsp = "yes"` attribute forces Vivado to
-  // implement the add/sub feeding accumReg in the DSP ALU (P-register feedback
-  // = accumulate, dynamic ALUMODE = the ternary sign, CE = the weight==0 hold).
-  // Synthesis-only metadata: Verilator ignores it, so every PESpec/array test is
-  // byte-for-byte unchanged. Costs one DSP per lane per PE, so it only makes
-  // sense where DSP slices are the slack resource (fabric/route-bound builds).
+  // use_dsp="yes" maps each lane's add/sub accumulator onto a DSP48E2 (P-register feedback,
+  // ALUMODE = sign, CE = hold). Synthesis-only; costs one DSP per lane per PE.
   if (useDspAccum) {
     accumReg.foreach { lane =>
       annotate(Seq(lane))(Seq(AttributeAnnotation(lane.toNamed, "use_dsp = \"yes\"")))
@@ -63,10 +50,8 @@ class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false,
   (input.bits.weights_i zip accumReg zip accumulation).map {
     case ((weight, accReg), accWire) =>
     if (signedAct) {
-      // Sign-extend the activation and accumulate in two's complement. accReg
-      // holds a signed sum reinterpreted as UInt; the := to the accWidth-wide
-      // accWire truncates the grown sum back to accWidth (modular wrap — same
-      // as the unsigned path below, matching the host's mod-2^accWidth ref).
+      // Two's-complement accumulate; the := to accWire truncates to accWidth (mod
+      // 2^accWidth wrap, same as the unsigned path and the host reference).
       val a = input.bits.activation_i.asSInt
       when(weight === 1.U){
           accWire := (accReg.asSInt + a).asUInt
@@ -86,11 +71,8 @@ class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false,
     }
   }
 
-  // Ready through idle+running so every beat (including the final one) is a clean
-  // valid&&ready handshake. The old `!(counter === nAccReg)` form deasserted ready
-  // on the final accumulation cycle and grabbed that beat's data WITHOUT a
-  // handshake — if tvalid gapped on exactly that cycle the PE accumulated garbage
-  // and finished one beat early, desyncing the upstream DMA stream.
+  // Ready through idle+running so every beat, including the final one, is a real
+  // valid&&ready handshake (sampling the final beat without one desyncs the stream).
   input.ready := (stateReg =/= done_state)
   output.valid := (stateReg === done_state)
   output.bits := DontCare

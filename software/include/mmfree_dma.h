@@ -1,15 +1,7 @@
 /*
- * mmfree_dma.h — Minimal direct-register driver for Xilinx AXI DMA (PG021) in
- * SIMPLE (non-scatter-gather) mode. Supports both MM2S (memory → stream) and
- * S2MM (stream → memory) channels.
- *
- * Used by mmfree_runtime.c to push activations / weights into Core's s_axis
- * and pull outputs out of Core's m_axis. The IP is assumed configured at 32-bit
- * data width (matches K26_Bench preset) with 40-bit address support enabled.
- *
- * This is intentionally bare: no SG, no IRQ wiring (we poll DMASR.Idle). The
- * Core IRQ is used for matmul completion; DMA completion is implied by the
- * single-tlast packet boundary.
+ * mmfree_dma.h — minimal direct-register driver for Xilinx AXI DMA (PG021) in simple
+ * (non-SG) mode, MM2S and S2MM. Data width is set per preset by vivado/bd.tcl; 40-bit
+ * addressing. Completion is polled via DMASR.Idle (the Core IRQ signals op completion).
  */
 
 #ifndef MMFREE_DMA_H_
@@ -52,9 +44,7 @@ extern "C" {
 #define DMASR_ANY_ERR \
     (DMASR_DMA_INT_ERR | DMASR_DMA_SLV_ERR | DMASR_DMA_DEC_ERR | DMASR_ERR_IRQ)
 
-/* ---------------------------------------------------------------- */
-/* Inline helpers. `regs` is the mmap'd base of the AXI DMA IP.     */
-/* ---------------------------------------------------------------- */
+/* Inline helpers. `regs` is the mmap'd base of the AXI DMA IP. */
 
 static inline uint32_t mmfree_dma_rd(volatile void *regs, uint32_t off) {
     return *(volatile uint32_t *)((char *)regs + off);
@@ -63,15 +53,12 @@ static inline void mmfree_dma_wr(volatile void *regs, uint32_t off, uint32_t v) 
     *(volatile uint32_t *)((char *)regs + off) = v;
 }
 
-/* All register spins are bounded so a wedged engine (or unprogrammed PL)
- * turns into an error return instead of a silent hang. Each /dev/mem read is
- * roughly a microsecond, so ~10M iterations ≈ 10 s — far beyond any legal
- * completion time for the bench shapes. */
+/* Bound on every register spin (~1 us per /dev/mem read, so ~10 s), so a wedged
+ * engine or unprogrammed PL returns an error instead of hanging. */
 #define MMFREE_DMA_SPIN_LIMIT   10000000u
 
-/* Soft-reset the MM2S channel only. For MM2S-only DMA instances (DMAs 1..N-1
- * in the multi-HP-port topology, built with c_include_s2mm=0) whose S2MM
- * register block does not exist. Returns 0 on ok, -1 on timeout. */
+/* Soft-reset the MM2S channel only — for the MM2S-only DMAs 1..N-1 (no S2MM
+ * register block). Returns 0 on ok, -1 on timeout. */
 static inline int mmfree_dma_mm2s_reset(volatile void *regs) {
     uint32_t spins;
     mmfree_dma_wr(regs, AXI_DMA_MM2S_DMACR, DMACR_RESET);
@@ -80,8 +67,7 @@ static inline int mmfree_dma_mm2s_reset(volatile void *regs) {
     return 0;
 }
 
-/* Soft-reset both channels. Spin until RESET bit self-clears.
- * Returns 0 on ok, -1 if a channel never came out of reset. */
+/* Soft-reset both channels. Returns 0 on ok, -1 if a channel never left reset. */
 static inline int mmfree_dma_reset(volatile void *regs) {
     uint32_t spins;
     if (mmfree_dma_mm2s_reset(regs) < 0) return -1;
@@ -91,15 +77,11 @@ static inline int mmfree_dma_reset(volatile void *regs) {
     return 0;
 }
 
-/* Start an MM2S transfer of `bytes` from physical address `pa`. Returns 0 on ok.
- * After this returns, the engine pulls beats into the stream until LENGTH
- * bytes are drained or upstream tready falls. Poll mmfree_dma_mm2s_wait() for
- * idle. */
+/* Start an MM2S transfer of `bytes` from physical address `pa`; poll
+ * mmfree_dma_mm2s_wait() for idle. Returns 0 on ok, -1 if the channel stays halted. */
 static inline int mmfree_dma_mm2s_start(volatile void *regs, uint64_t pa, uint32_t bytes) {
     uint32_t spins;
-    /* Bring channel out of halt by setting RS. */
     mmfree_dma_wr(regs, AXI_DMA_MM2S_DMACR, DMACR_RS);
-    /* Wait for !halted. */
     for (spins = 0; mmfree_dma_rd(regs, AXI_DMA_MM2S_DMASR) & DMASR_HALTED; spins++)
         if (spins >= MMFREE_DMA_SPIN_LIMIT) return -1;
 
@@ -122,7 +104,7 @@ static inline int mmfree_dma_mm2s_wait(volatile void *regs) {
     return 0;
 }
 
-/* Same pair for S2MM. */
+/* S2MM equivalents. */
 static inline int mmfree_dma_s2mm_start(volatile void *regs, uint64_t pa, uint32_t bytes) {
     uint32_t spins;
     mmfree_dma_wr(regs, AXI_DMA_S2MM_DMACR, DMACR_RS);

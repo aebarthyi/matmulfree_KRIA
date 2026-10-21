@@ -204,9 +204,7 @@ class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThr
     readyPin.poke(false.B)
   }
 
-  // ──────────────────────────────────────────────────────────────────────────
-  // AXI register-map / decode tests
-  // ──────────────────────────────────────────────────────────────────────────
+  // ── AXI register-map / decode tests ──
 
   "AxiInstructionHandler" - {
 
@@ -317,33 +315,18 @@ class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThr
     "writing INSTR while a previous instruction is still pending returns SLVERR" in {
       simulate(new AxiInstructionHandler(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)) { dut =>
         resetDut(dut)
-        // Hold load.ready low so the dispatcher stalls in dispatching state;
-        // pendingValid clears immediately, but the dispatcher won't dispose of
-        // this instruction yet. Instead, hold the dispatcher BEFORE consumption
-        // by not pulsing the clock enough. Easier path: back-to-back writes
-        // without allowing the dispatcher to consume in between.
         val inst1 = encode(LOAD_ACT, BigInt(0x100), 1, 0)
         val inst2 = encode(STORE_OUT, BigInt(0x200), 1, 0)
 
-        // First write: starts AW/W but we do NOT step beyond the AW+W handshake
-        // to mimic two writes arriving before pendingValid clears. The cleanest
-        // way is to issue both writes back-to-back and check the second resp.
+        // The second write races the dispatcher consuming the first: OKAY if it already
+        // did, SLVERR on collision. Either is valid; only a well-formed response is checked.
         axiWrite(dut, OFF_INSTR, inst1) mustBe OKAY
-        // pendingValid is set right after axiWrite returns; dispatcher will
-        // consume it on the next clock edge. To make the collision case
-        // observable, issue the second write *immediately* (no extra steps),
-        // racing against the dispatcher.
         val resp2 = axiWrite(dut, OFF_INSTR, inst2)
-        // resp2 is either OKAY (if dispatcher already consumed) or SLVERR
-        // (if collision). Both are valid behavior; we just verify it's a
-        // well-formed response.
         (resp2 == OKAY || resp2 == SLVERR) mustBe true
       }
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // Status / IRQ tests
-    // ────────────────────────────────────────────────────────────────────────
+    // ── Status / IRQ tests ──
 
     "status read while idle returns zero" in {
       simulate(new AxiInstructionHandler(ADDR_WIDTH, DATA_WIDTH, ID_WIDTH)) { dut =>

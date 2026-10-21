@@ -1,9 +1,6 @@
-// fpga_backend.hpp — TernaryBackend implementations that drive the KRIA engine.
-//
-// The C++ model (matmulfreellmCPU) calls TernaryBackend::matmul for each BitLinear
-// integer accumulate. FpgaBackend routes that to libmmfree (mmfree_bitlinear) against
-// resident per-projection weights; CompareBackend runs BOTH the CPU reduction and the
-// engine and asserts they are bit-identical (the P-D exact-match gate).
+// fpga_backend.hpp — TernaryBackend implementations that drive the KRIA engine via
+// libmmfree. FpgaBackend runs projections on the engine; CompareBackend runs both CPU and
+// engine and counts mismatches (the exact-match gate).
 #pragma once
 
 #include "mmfree/ternary_backend.hpp"
@@ -16,14 +13,11 @@ struct mmfree_lib;  // opaque handle (mmfree_lib.h)
 
 namespace mmfree_fpga {
 
-// Engine backend. `proj_id` (from mmfree_register) addresses the resident weights, so
-// `wq` is ignored. Activations are narrowed int32 -> int16 (already saturated to int16
-// range by the FixedQ510 quant; clamped defensively). NOT thread-safe: one op per call,
-// reusing a single narrow buffer — matches libmmfree's one-in-flight-op contract.
+// Engine backend. `proj_id` (from mmfree_register) addresses the resident weights, so `wq`
+// is ignored. Activations are narrowed int32 -> int16 (clamped). NOT thread-safe.
 class FpgaBackend final : public mmfree::TernaryBackend {
  public:
-  // `batch` = the loaded bitstream's CoreConfig.batchSize (B PE rows). matmul_batch
-  // streams the resident weights once and applies them to up to `batch` activation rows.
+  // `batch` = the bitstream's CoreConfig.batchSize (max rows per weight stream).
   FpgaBackend(mmfree_lib* h, std::size_t maxN, std::size_t batch = 1)
       : h_(h), batch_(batch ? batch : 1), x16_(maxN * (batch ? batch : 1)) {}
   std::size_t batch_size() const override { return batch_; }
@@ -32,16 +26,14 @@ class FpgaBackend final : public mmfree::TernaryBackend {
   void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
                     const std::int8_t* wq, std::size_t N, std::size_t M,
                     std::size_t b) override;
-  // Column-tile split with a per-range callback: the caller's per-column work (dequant)
-  // runs inside the next tile-chunk's COMPUTE window. This is the overload the model
-  // should prefer — matmul_batch above is just this one with a null callback.
+  // Column-tile split with a per-range callback, so the caller's per-column work
+  // (dequant) runs inside the next chunk's COMPUTE.
   void matmul_batch_chunked(int proj_id, const std::int32_t* x, std::int32_t* acc,
                             const std::int8_t* wq, std::size_t N, std::size_t M,
                             std::size_t b,
                             const std::function<void(std::size_t, std::size_t)>& on_cols) override;
-  // Pipelined cluster: quant+pack of projection n+1 and sign-expand+dequant of n-1
-  // run inside the COMPUTE(n) wait window (engine ordering stays one-op-at-a-time).
-  // MMFREE_NO_PIPELINE=1 forces the serial default (for token-equivalence A/B).
+  // Pipelined cluster: produce(n+1) and readback+consume(n-1) run under COMPUTE(n).
+  // MMFREE_NO_PIPELINE=1 falls back to the serial base implementation.
   void matmul_seq(const int* proj_ids, const std::int8_t* const* wqs, int k,
                   const std::function<void(int, std::int32_t*)>& produce,
                   const std::function<void(int, const std::int32_t*)>& consume,
@@ -55,9 +47,8 @@ class FpgaBackend final : public mmfree::TernaryBackend {
   std::vector<std::int32_t> acc_;    // b*M readback scratch
 };
 
-// Verification backend for `--backend both`: computes the CPU reduction into `acc` (so
-// generation stays valid), runs the engine into a scratch buffer, and compares element
-// by element. Accumulates mismatch stats across every projection invocation.
+// `--backend both`: CPU result goes to `acc` (drives generation), the engine's to a
+// scratch buffer; mismatch stats accumulate across every invocation.
 class CompareBackend final : public mmfree::TernaryBackend {
  public:
   CompareBackend(mmfree_lib* h, std::size_t maxN, std::size_t maxM, std::size_t batch = 1)

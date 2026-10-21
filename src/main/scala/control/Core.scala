@@ -2,8 +2,6 @@ package control
 
 import chisel3._
 import chisel3.util._
-import chisel3.experimental.annotate
-import firrtl.AttributeAnnotation
 import systolic.SystolicArray
 import systolic.WeightUnpackGearbox
 
@@ -28,37 +26,24 @@ class AxisMasterIO(val dataWidth: Int) extends Bundle {
   *
   *   - `s_axi`   : AXI4 slave for instruction MMIO (→ [[AxiInstructionHandler]])
   *   - `s_axis`  : AXI4-S slave; carries activations (LOAD_ACT) or weights (COMPUTE_MM)
-  *   - `m_axis`  : AXI4-S master; carries outputs (STORE_OUT). Chunked into beats
-  *                 of `outBeatLanes` lanes each so the data width can be sized to a
-  *                 standard AXI-S value (64/128/256/512/1024) independent of the
-  *                 systolic array's natural per-tile output width.
+  *   - `m_axis`  : AXI4-S master; carries outputs (STORE_OUT) in beats of
+  *                 `outBeatLanes` lanes, independent of the per-tile output width.
   *   - `irq`     : level-high interrupt on instruction completion.
   *
-  * **Compute model.** The SystolicArray streams both weights (broadcast across all
-  * yDim batch rows, no delay chain) and activations (one per cycle, one per batch
-  * row) through PEs that accumulate `sum_n W[n][col] * A[batch][n]`. yDim is the
-  * batch dimension; xDim is the output-cols-per-pass dimension. Per COMPUTE_MM:
-  *
-  *   - rows = N = inner dim (≤ maxN ≤ maxAcc — no inner-dim tiling yet).
-  *   - cols = M, tiled in chunks of `outLanesPerTile = xDim * nLanes`.
-  *   - Per col tile: stream activations from BRAM + weights from s_axis for N
-  *     cycles, then drain the captured tile into outBram one beat-wide row per
-  *     cycle, overlapped with the next tile's stream (see drain engine below).
+  * **Compute model.** Weights are broadcast to all yDim (= batch) rows; each row
+  * streams its own activation, and PEs accumulate `sum_n W[n][col] * A[batch][n]`.
+  * Per COMPUTE_MM: rows = N = inner dim (≤ maxN ≤ maxAcc, no inner-dim tiling);
+  * cols = M, tiled by `outLanesPerTile = xDim * nLanes`. Each col tile streams N
+  * cycles, then drains into outBram overlapped with the next tile's stream.
   *
   * **Storage.**
-  *   - `actBram`: depth = maxN, width = batchSize · aWidth. Each entry holds the
-  *      n-th inner-dim slice across all batch items.
-  *   - `outBram`: depth = batchSize · numColTilesMax · outSubBeats, width =
-  *      effOutBeatLanes · outAccWidth — exactly one m_axis beat per row, so the
-  *      store path reads a row and ships it with no lane mux (the 256:1 dynamic
-  *      lane mux on the old wide-row layout was the critical path at 250 MHz).
-  *      Row address = (batchIdx · numColTiles + colTileIdx) · outSubBeats +
-  *      subBeatIdx.
+  *   - `actBram`: maxN entries x (batchSize · aWidth); entry n = inner-dim slice n
+  *      across all batch items.
+  *   - `outBram`: batchSize · numColTilesMax · outSubBeats rows, each exactly one
+  *      m_axis beat (no lane mux on the store path). Row address =
+  *      (batchIdx · numColTiles + colTileIdx) · outSubBeats + subBeatIdx.
   *
-  * **PE counter quirk.** PE.scala leaves accumCounter/accumReg dirty on done→idle;
-  * Core pulses a local reset to the array between col-tile passes (see [[CoreTop]]).
-  *
-  * Requires `maxN <= maxAcc` (one array pass covers the full inner dim).
+  * The array is hard-reset (arrLocalReset) between col-tile passes.
   */
 class Core(
     val aWidth:       Int = 8,
@@ -72,37 +57,14 @@ class Core(
     val axiDataWidth: Int = 128,
     val axiIdWidth:   Int = 6,
     val signedAct:    Boolean = false, // sign-extend activations (real BitLinear / HGRN int16)
-    val dspAccum:        Boolean = false, // map the per-lane PE accumulators onto DSP48E2
-                                         // slices (use_dsp attr) instead of LUT/CARRY8.
-    val colBankSize:     Int = 0,        // systolic column banking: broadcast within a bank
-                                         // of this many columns, pipeline between banks to
-                                         // cut activation fanout. 0 = no banking (broadcast).
-    val packedWeights:   Boolean = false, // stream ternary weights at 1.6 bits/trit (5 trits/
-                                         // byte) and unpack them on-chip through a regroup
-                                         // gearbox (WeightUnpackGearbox) into the native 2-bit
-                                         // weight beat. ~20% fewer weight bytes on the HP-port
-                                         // stream — fewer, still-full wire beats, so no port/
-                                         // geometry change. false = legacy 2-bit slice (SV
-                                         // byte-identical). The DDR blob must be packed to
-                                         // match (base-3, LSB-first lanes); see TernaryPack.
-    val actRamStyle:     String = "",    // "" = inferred SyncReadMem for actBram; "block"/
-                                         // "ultra" = the control.ActMem BlackBox carrying
-                                         // ram_style + cascade_height. Identical read
-                                         // semantics and latency — a mapping choice, not a
-                                         // design change. See ActMem for why maxN=8192 needs it.
-    val actCascadeHeight: Int = 0,       // cascade_height for ActMem; 0 = omit the attribute.
-    val outCascadeHeight: Int = 4,       // cascade_height on each bank of the OutMemUltra URAM
-                                         // output memory. The shipped value is 1: with the banked
-                                         // read there is exactly one URAM chain per bank, so there
-                                         // is no cascade left to bound. It is baked into
-                                         // OutMemUltra's module NAME, so both maxN=8192 presets
-                                         // must carry the same value or clone_preset_hw.sh (which
-                                         // hashes the SV) refuses the 1.3B clone.
-    val outBankDepth:     Int = 0        // rows per explicit output-memory bank. 0 = auto =
-                                         // 4096*outCascadeHeight, i.e. one URAM chain per bank.
-                                         // Exposed so a simulation-sized memory can be forced
-                                         // into several banks — at the default a test config is
-                                         // a single bank and never exercises the registered mux.
+    // The remaining parameters are documented on CoreConfig.
+    val dspAccum:        Boolean = false,
+    val colBankSize:     Int = 0,
+    val packedWeights:   Boolean = false,
+    val actRamStyle:     String = "",
+    val actCascadeHeight: Int = 0,
+    val outCascadeHeight: Int = 4,
+    val outBankDepth:     Int = 0
 ) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0,        "aWidth must be even and >= 2")
     require(maxAcc >= 2,                           "maxAcc must be >= 2")
@@ -147,7 +109,7 @@ class Core(
     Core.connectAxiSlave(outer = s_axi, inner = handler.s_axi)
     irq := handler.irq
 
-    // ─── Systolic array with Core-local reset (PE counter quirk workaround) ──
+    // ─── Systolic array, with a Core-local reset pulsed between col tiles ────
     val arrLocalReset = WireDefault(false.B)
     val arr = withReset(this.reset.asBool || arrLocalReset) {
         Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, dspAccum, colBankSize))
@@ -157,12 +119,8 @@ class Core(
 
     // ─── On-chip storage ──────────────────────────────────────────────────────
     // actBram: maxN entries x (batchSize * aWidth) bits, 1-cycle synchronous read.
-    // Two interchangeable implementations, selected by actRamStyle:
-    //   ""              → SyncReadMem, letting Vivado infer the mapping (the legacy path;
-    //                     every preset before 2026-08-04 uses this).
-    //   "block"/"ultra" → control.ActMem, a BlackBox carrying ram_style + cascade_height.
-    // Same cycle behaviour either way; the BlackBox exists only to bound the RAMB36E2 depth
-    // cascade, which at maxN=8192 is 3.2 ns of logic and the worst 250 MHz path (see ActMem).
+    // actRamStyle "" = inferred SyncReadMem; "block"/"ultra" = the ActMem BlackBox, which
+    // has identical cycle behaviour and only adds the cascade-bounding attributes.
     val actRdAddr = Wire(UInt(log2Ceil(maxN).W))
     actRdAddr := 0.U
     val actBram =
@@ -182,10 +140,9 @@ class Core(
         .map(_.read(actRdAddr))
         .getOrElse(actMem.get.io.rdata.asTypeOf(Vec(batchSize, UInt(aWidth.W))))
 
-    // Output-memory port wires. The implementation (BRAM SyncReadMem vs URAM
-    // BlackBox) is selected by `outRamStyle` in the STORE section below; both
-    // present `outRdData` delayed by `outReadLat`, advanced/gated by `outRdEn`.
-    // The drain engine drives the write port.
+    // Output-memory port wires (implementation chosen by `outRamStyle` below). Both forms
+    // present `outRdData` delayed by `outReadLat`, advanced by `outRdEn`; the drain
+    // engine drives the write port.
     val outRdAddr = Wire(UInt(log2Ceil(outBramRows).W)); outRdAddr := 0.U
     val outRdEn   = WireDefault(false.B)
     val outWrEn   = WireDefault(false.B)
@@ -195,12 +152,8 @@ class Core(
     val outRdData = Wire(Vec(effOutBeatLanes, SInt(outAccWidth.W)))
 
     // ─── 250 MHz pipeline stages ──────────────────────────────────────────────
-    // Both failing paths at 250 MHz started at a BRAM read and ended across the
-    // module: actBram -> 64-col activation broadcast -> PE accumReg, and
-    // outBram -> DMA S2MM skid buffer. Each gets a 2-deep Decoupled queue so
-    // the BRAM read terminates at a register and the wide fanout starts from
-    // one. outBram rows are one m_axis beat wide, so the read data feeds outQ
-    // directly (lane select is folded into the row address — see drain engine).
+    // inQ / outQ are 2-deep queues so the actBram / outBram reads terminate at a
+    // register before the wide array fanout / the DMA side.
     //
     // `inQ` carries (weight beat, activation) PAIRS: the enqueue side owns the
     // actBram row counter (wrapping at cmpRows once per col tile, independent
@@ -216,26 +169,18 @@ class Core(
     inQ.io.enq.bits  := DontCare
     inQ.io.deq.ready := false.B
 
-    // Optional 1.6-bit weight unpacker (see packedWeights). Sits between s_axis and
-    // the inQ enqueue during COMPUTE streaming: it consumes densely packed bytes off
-    // the beat and regroups them into native outLanesPerTile-wide 2-bit weight beats,
-    // so each still-full wire beat carries ~1.25 weight beats' worth of trits (fewer
-    // wire beats → ~20% fewer weight bytes) with no change to the beat width or the
-    // enqueue handshake. flush/defaults are set with the other defaults below.
+    // Optional 1.6-bit weight unpacker between s_axis and the inQ enqueue: regroups densely
+    // packed bytes into outLanesPerTile-wide 2-bit weight beats.
     require(!packedWeights || axisDataWidth % 8 == 0,
         s"packedWeights needs a byte-aligned s_axis (axisDataWidth=$axisDataWidth)")
     val wtGearbox =
         if (packedWeights) Some(Module(new WeightUnpackGearbox(axisDataWidth, outLanesPerTile)))
         else None
 
-    // Array-feed source. Batched cores (yDim=B) double the PE grid, lengthening
-    // the inQ-read -> PE-accumulate path (the -0.39 ns path at B=2). A 1-deep
-    // registered slice (pipe=true keeps full throughput) terminates the inQ
-    // distributed-RAM read at a register so the accumulate starts fresh. B=1
-    // keeps the direct path (validated, closes timing) untouched. The uniform
-    // 1-cycle delay on every beat is functionally transparent (nAcc unchanged).
-    // Flushed with inQ (below) so stray streamed beats can't cross into the next op.
-    // The Option holds (deq port, flush-setter) so the B=1 and B>1 paths share the wiring.
+    // Array-feed source. For B>1 a 1-deep registered slice (pipe=true, full throughput)
+    // terminates the inQ read at a register before the larger PE grid; the uniform 1-cycle
+    // delay is functionally transparent. Flushed with inQ. B=1 feeds from inQ directly.
+    // The Option holds (deq port, flush-setter).
     val armSlice: Option[(DecoupledIO[StreamBeat], Bool => Unit)] =
       if (batchSize <= 1) None
       else {
@@ -309,23 +254,13 @@ class Core(
     val numColTiles     = Reg(UInt(log2Ceil(numColTilesMax + 1).W))
     val colTileCtr      = RegInit(0.U(log2Ceil(numColTilesMax + 1).W))
     val activeIdx       = RegInit(0.U(log2Ceil(maxN + 1).W))      // enq-side stream row (wraps at cmpRows per col tile)
-    // cmpRows-1 and a registered "activeIdx is the last row" flag, kept as the
-    // invariant activeIsLast == (activeIdx === cmpRowsM1). The old live compare
-    // `activeIdx === (cmpRows-1)` put cmpRows (and a wide subtract+compare) in the
-    // combinational cone that feeds the actBram/inQ read-address ENABLE — the
-    // route-dominated 6-LUT path that walls the 250 MHz builds. Precomputing both
-    // pulls cmpRows out of that cone: the remaining `(activeIdx+1)===cmpRowsM1`
-    // compare feeds only the activeIsLast flop, not the BRAM enable, so the enqueue
-    // address path shortens to reg→mux→BRAM.
+    // Invariant: activeIsLast == (activeIdx === cmpRowsM1). Registered so cmpRows and the
+    // wide compare stay out of the actBram read-address cone (a 250 MHz critical path);
+    // the enqueue address path is reg -> mux -> BRAM.
     val cmpRowsM1       = Reg(UInt(log2Ceil(maxN + 1).W))         // cmpRows - 1 (precomputed)
     val activeIsLast    = RegInit(false.B)                       // activeIdx === cmpRowsM1
-    // Runtime active batch count for THIS compute — how many of the built `batchSize`
-    // PE rows the drain actually writes out. Latched from the instruction's batch
-    // field (0 or >batchSize → full batchSize, so a legacy flags=0 host is unchanged).
-    // Lets a high-B bitstream serve a low-batch call: the weight stream is already
-    // batch-count-independent, and this stops the drain from writing (batchSize-b)
-    // dead rows — which is what makes the drain hide at small N and touches only b/B
-    // of outBram. batchSize==1 makes it a constant no-op.
+    // Runtime batch count for this COMPUTE: the drain writes only this many of the
+    // batchSize rows. From the instruction flags; 0 or > batchSize = full batchSize.
     val cmpBatch        = Reg(UInt(log2Ceil(batchSize + 1).W))
 
     // Captured tile, held flat (batch-major) so the drain engine can shift it
@@ -338,28 +273,19 @@ class Core(
     val drainSubCtr     = RegInit(0.U(log2Ceil(outSubBeats + 1).W))
     val drainBatchCtr   = RegInit(0.U(log2Ceil(batchSize + 1).W))
     val drainColTile    = Reg(UInt(log2Ceil(numColTilesMax + 1).W))
-    // Counts down the OutMemUltra write-pipeline flush after drainBusy falls, so
-    // completion (cDone) waits for the last write to land in the URAM. 0-effect
-    // when outWriteLat==0 (B=1 / BRAM path). See outWriteLat below.
+    // Counts down the OutMemUltra write pipeline after drainBusy falls so cDone waits
+    // for the last write to land. No effect when outWriteLat == 0.
     val drainFlush      = RegInit(0.U(log2Ceil(2).W))
 
-    // STORE — output memory + read pipeline.
-    // The deep outBram maps to a memory read cascade (~7 hops at 370M sizes) that
-    // eats the 4 ns budget. `outReadLat` registered read stages let the cascade
-    // pipeline so STORE closes 250 MHz; the store latency is hidden (drained while
-    // the next op streams), so it is free. Batched cores deepen outBram
-    // (B*tiles*subBeats) and use a URAM BlackBox (ram_style="ultra"): its internal
-    // pipeline packs into the URAM cascade AND it frees the BRAMs (needed for B>=4).
-    // B=1 keeps the BRAM SyncReadMem path (validated) untouched.
+    // STORE — output memory + read pipeline. `outReadLat` registered read stages let the
+    // deep memory close 250 MHz; the latency is hidden behind the next op. B>1 uses the
+    // URAM BlackBox (OutMemUltra, also frees BRAM); B=1 uses a BRAM SyncReadMem.
     val outRamStyle = if (batchSize > 1) "ultra" else "block"
     val outReadLat  = if (batchSize > 1) 4 else 2
     require(outReadLat >= 2, s"outReadLat=$outReadLat must be >= 2")
-    // Extra registered write stages inside OutMemUltra (ultra path only). The
-    // deep batched outBram's write-address arithmetic → URAM is the 250 MHz
-    // critical path at B>=6; pipelining the write port terminates it at a flop
-    // adjacent to the URAM. The drain writes during COMPUTE and reads happen in a
-    // later STORE, so the latency is hidden — but the drain-completion gate
-    // (cDone) must wait these extra cycles so a STORE off the IRQ sees it landed.
+    // Registered write stages inside OutMemUltra (ultra only): terminate the drain's
+    // write-address arithmetic at a flop next to the URAM. cDone waits them out
+    // (drainFlush) so a STORE issued off the IRQ sees the last write.
     val outWriteLat = if (outRamStyle == "ultra") 1 else 0
     require(outWriteLat <= 1, s"outWriteLat=$outWriteLat: widen drainFlush before raising this")
     val storeTotalBeats   = Reg(UInt(log2Ceil(outBramRows + 1).W))
@@ -367,11 +293,8 @@ class Core(
     val rdPtr             = RegInit(0.U(log2Ceil(outBramRows + outReadLat + 1).W))
     val primeCtr          = RegInit(0.U(log2Ceil(outReadLat + 1).W))
 
-    // Output-memory implementation. Both forms expose the wires declared above:
-    // a write port (drain) and an `outReadLat`-deep, `outRdEn`-gated read.
     if (outRamStyle == "ultra") {
-        // URAM BlackBox — pipeline registers live inside so they pack into the
-        // URAM cascade (external regs would SRL-optimize and never pipeline it).
+        // URAM BlackBox; the read pipeline registers live inside it (see OutMemUltra).
         val mem = Module(new OutMemUltra(outBramRows, effOutBeatLanes * outAccWidth, outReadLat,
                                          writeLat = outWriteLat.max(1), cascadeHeight = outCascadeHeight,
                                          bankDepth = outBankDepth))
@@ -383,8 +306,7 @@ class Core(
         mem.io.raddr := outRdAddr
         outRdData := mem.io.rdata.asTypeOf(outRdData)
     } else {
-        // BRAM SyncReadMem + an external register pipeline (outReadLat-1 stages
-        // after the 1-cycle synchronous read), gated by outRdEn.
+        // BRAM SyncReadMem + outReadLat-1 external stages after the 1-cycle read.
         val outBram = SyncReadMem(outBramRows, Vec(effOutBeatLanes, SInt(outAccWidth.W)))
         when(outWrEn) { outBram.write(outWrAddr, outWrData) }
         val raw  = outBram.read(outRdAddr, outRdEn)
@@ -454,26 +376,21 @@ class Core(
 
     // ─── sCompute: col tiling, one array pass per tile ───────────────────────
     //
-    // Enqueue side (s_axis + actBram -> inQ): runs through cStream/cReset
-    // so the stream never has to stall for the inter-tile merge. `activeIdx` is
-    // the STREAM's row position — it wraps at cmpRows once per col tile and is
-    // only reset when a new COMPUTE is accepted, because inQ may legitimately
-    // hold the first beats of tile t+1 while the array is still merging tile t.
+    // Enqueue side (s_axis + actBram -> inQ): runs through cStream/cReset so the
+    // stream never stalls for the inter-tile merge. `activeIdx` is the STREAM's row
+    // position: it wraps at cmpRows per col tile and is reset only on a new COMPUTE,
+    // because inQ may hold tile t+1's first beats while the array finishes tile t.
     when(state === sCompute && cState =/= cInit && cState =/= cDone) {
-        // Weight-beat source. Both branches present a Decoupled of outLanesPerTile
-        // 2-bit lanes; the inQ enqueue handshake below is identical either way.
         val (wtValid, wtBits) = wtGearbox match {
             case Some(gb) =>
-                // Packed: s_axis (dense bytes) feeds the gearbox; its regrouped
-                // output feeds inQ. s_axis is throttled by gearbox room, decoupling
-                // wire beats from weight beats.
+                // Packed: s_axis -> gearbox -> inQ; s_axis is throttled by gearbox room.
                 gb.io.in.valid  := s_axis.tvalid
                 gb.io.in.bits   := s_axis.tdata
                 s_axis.tready   := gb.io.in.ready
                 gb.io.out.ready := inQ.io.enq.ready
                 (gb.io.out.valid, gb.io.out.bits)
             case None =>
-                // Legacy: 2-bit lanes sliced straight off the beat (byte-identical SV).
+                // 2-bit lanes sliced straight off the beat.
                 val weightVec = VecInit(Seq.tabulate(outLanesPerTile) { i =>
                     s_axis.tdata((i + 1) * 2 - 1, i * 2)
                 })
@@ -489,8 +406,7 @@ class Core(
         actRdAddr := Mux(inQ.io.enq.fire, nextRow, activeIdx)(log2Ceil(maxN) - 1, 0)
         when(inQ.io.enq.fire) {
             activeIdx := nextRow
-            // Maintain the invariant for the NEXT activeIdx (= nextRow). The
-            // compare ends at this flop, off the BRAM-enable path.
+            // Maintain the invariant for the next activeIdx (= nextRow).
             activeIsLast := Mux(lastRow, cmpRowsM1 === 0.U, (activeIdx + 1.U) === cmpRowsM1)
         }
     }
@@ -498,8 +414,7 @@ class Core(
     when(state === sCompute) {
         switch(cState) {
             is(cInit) {
-                // Drive read addr for inner-dim 0 so the enqueue side sees
-                // mem[0] next cycle.
+                // Prefetch row 0 so the enqueue side sees mem[0] next cycle.
                 actRdAddr    := 0.U
                 activeIdx    := 0.U
                 activeIsLast := cmpRowsM1 === 0.U                // activeIdx=0 is last iff N==1
@@ -507,13 +422,11 @@ class Core(
             }
 
             is(cStream) {
-                // Dequeue side (inQ -> array). While the array output is
-                // pending the handshake is shut off so no spurious beat is
-                // lost — the queue absorbs the stall instead of
-                // back-pressuring the DMA. The capture itself additionally
-                // waits for the previous tile's drain to release tileAccums
-                // (only possible when cmpRows < batchSize*outSubBeats; real
-                // shapes hide the drain entirely under the next tile's pass).
+                // Dequeue side (inQ -> array). While the array output is pending
+                // (the capture cycle) the input handshake MUST be off, or a beat is
+                // silently consumed and lost; inQ absorbs the stall. Capture also waits
+                // for the previous tile's drain to release tileAccums (only when
+                // cmpRows < batchSize*outSubBeats).
                 val outPending = arrOutput.valid
                 val capture    = outPending && !drainBusy
 
@@ -537,10 +450,8 @@ class Core(
             }
 
             is(cReset) {
-                // Hard-reset the array so the next col tile starts clean.
-                // activeIdx / actRdAddr are NOT touched here — they belong to
-                // the enqueue side, which already wrapped at the tile boundary
-                // (and may have the next tile's first beats queued).
+                // Hard-reset the array for the next col tile. activeIdx / actRdAddr
+                // belong to the enqueue side (already wrapped) and are not touched.
                 arrLocalReset := true.B
 
                 val nextCol = colTileCtr + 1.U
@@ -553,9 +464,8 @@ class Core(
             }
 
             is(cDone) {
-                // Hold the completion until the last tile's drain has landed
-                // in outBram — a host could issue STORE right off the IRQ.
-                // drainFlush covers the OutMemUltra write-pipeline depth.
+                // Complete only once the last drain has landed (incl. the OutMemUltra
+                // write pipeline) — a host may issue STORE right off the IRQ.
                 when(!drainBusy && drainFlush === 0.U) {
                     handler.computeDone := true.B
                     state               := sIdle
@@ -565,11 +475,9 @@ class Core(
     }
 
     // ─── Drain engine: tileAccums -> outBram, one beat-wide row per cycle ────
-    // Kicked off by the cStream capture and runs in parallel with the next col
-    // tile's stream (batchSize*outSubBeats cycles, hidden under the >= cmpRows
-    // cycles of the next array pass). tileAccums shifts down by effOutBeatLanes
-    // lanes per cycle so the write data is always lanes [0, effOutBeatLanes) —
-    // the wide dynamic lane mux that failed timing at 250 MHz never exists.
+    // Runs in parallel with the next col tile's stream (cmpBatch*outSubBeats cycles).
+    // tileAccums shifts down by effOutBeatLanes lanes per cycle so the write data is
+    // always lanes [0, effOutBeatLanes) — no wide dynamic lane mux.
     when(drainBusy) {
         val writeVec = Wire(Vec(effOutBeatLanes, SInt(outAccWidth.W)))
         for (k <- 0 until effOutBeatLanes) {
@@ -601,9 +509,7 @@ class Core(
         }
     }
 
-    // While draining, keep the flush counter primed; once drainBusy falls, count
-    // down the OutMemUltra write-pipeline depth so the last write has landed
-    // before cDone signals completion (the URAM write port is `outWriteLat`-deep).
+    // Primed while draining; counts down outWriteLat cycles once drainBusy falls.
     when(drainBusy) {
         drainFlush := outWriteLat.U
     }.elsewhen(drainFlush =/= 0.U) {
@@ -611,14 +517,10 @@ class Core(
     }
 
     // ─── sStore: stream outBram rows (one per m_axis beat) via outQ ──────────
-    // Rows are exactly one beat wide and laid out in stream order, so the walk is
-    // a flat row counter — no sub-beat lane mux. The read is `outReadLat`-deep
-    // (inside the memory block above) so the tool pipelines the deep read cascade.
-    // `rdPtr` issues addresses, leading the emitted beat by `outReadLat`;
-    // `primeCtr` counts down the fill cycles before the first beat is valid;
-    // `outRdEn` advances/gates the read pipeline (freezes the whole read on a
-    // stall). m_axis drains outQ unconditionally — including the tail beats in
-    // flight after storeDone fires.
+    // Rows are laid out in stream order, so the walk is a flat row counter. `rdPtr`
+    // leads the emitted beat by `outReadLat`; `primeCtr` counts the fill cycles before
+    // the first valid beat; `outRdEn` freezes the whole read pipeline on a stall.
+    // m_axis drains outQ unconditionally, including tail beats after storeDone.
     when(state === sStore) {
         val primed = primeCtr === 0.U
         val fire   = outQ.io.enq.ready && primed

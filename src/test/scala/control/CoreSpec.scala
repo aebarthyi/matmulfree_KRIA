@@ -11,8 +11,7 @@ import org.scalatest.matchers.must.Matchers
 class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   import InstructionEncoder._
 
-  // Tiny config: xDim != batchSize to exercise the asymmetric layout. Default LM-head
-  // semantics use much larger params, but the small one keeps Verilator fast.
+  // Tiny config (fast in Verilator).
   private val aWidth       = 4
   private val maxAcc       = 8
   private val xDim         = 2
@@ -30,8 +29,6 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
 
   // No output chunking in the tiny config.
   private val effOutBeatLanes = outLanesPerTile
-  private val outSubBeats     = outLanesPerTile / effOutBeatLanes
-  private val outBeatWidth    = effOutBeatLanes * outLaneWidth
 
   private val ADDR_WIDTH = 32
   private val DATA_WIDTH = 128
@@ -39,7 +36,6 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   private val STRB_ALL   = (BigInt(1) << (DATA_WIDTH / 8)) - 1
 
   private val OFF_INSTR   = BigInt(0x000)
-  private val OFF_STATUS  = BigInt(0x010)
   private val OFF_IRQ_ACK = BigInt(0x020)
 
   private val OKAY = 0
@@ -73,10 +69,8 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     packedWeights = true
   )
 
-  /** Dense 1.6-bit weight stream: flatten the col-tile-major weight beats into one
-    * trit sequence (lane order == the gearbox's), base-3 pack 5/byte, then chunk into
-    * axisDataWidth-bit wire beats (last beat zero-padded). Mirrors what the offline
-    * packer must emit for a packedWeights bitstream. */
+  /** Dense 1.6-bit weight stream as the offline packer emits it: the col-tile-major
+    * trits packed 5/byte, chunked into axisDataWidth-bit wire beats (last zero-padded). */
   private def packWeightStreamDense(weightStream: Seq[Seq[Int]]): Seq[BigInt] = {
     require(axisDataWidth % 8 == 0)
     val bytes        = TernaryPack.packCodes(weightStream.flatten)
@@ -137,31 +131,6 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     dut.s_axi.wvalid.poke(false.B)
     dut.s_axi.bready.poke(false.B)
     resp
-  }
-
-  private def axiRead(dut: Core, addr: BigInt, maxCycles: Int = 50): (BigInt, Int) = {
-    dut.s_axi.arid.poke(0.U)
-    dut.s_axi.araddr.poke(addr.U)
-    dut.s_axi.arlen.poke(0.U)
-    dut.s_axi.arsize.poke(4.U)
-    dut.s_axi.arburst.poke(1.U)
-    dut.s_axi.arvalid.poke(true.B)
-    dut.s_axi.rready.poke(true.B)
-    var arA = true; var rR = true
-    var data = BigInt(0); var resp = 0; var done = false; var cycles = 0
-    while (!done && cycles < maxCycles) {
-      val arF = arA && dut.s_axi.arready.peek().litToBoolean
-      val rF  = rR  && dut.s_axi.rvalid.peek().litToBoolean
-      if (rF) { data = dut.s_axi.rdata.peek().litValue; resp = dut.s_axi.rresp.peek().litValue.toInt; done = true }
-      dut.clock.step()
-      if (arF) { dut.s_axi.arvalid.poke(false.B); arA = false }
-      if (rF)  { dut.s_axi.rready.poke(false.B);  rR  = false }
-      cycles += 1
-    }
-    require(done, s"axiRead from 0x${addr.toString(16)} timed out")
-    dut.s_axi.arvalid.poke(false.B)
-    dut.s_axi.rready.poke(false.B)
-    (data, resp)
   }
 
   // ───────────────────────── AXI-Stream helpers ─────────────────────────
@@ -242,14 +211,9 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   // ───────────────────────── Reference model ─────────────────────────
 
   /**
-    * Software reference for the redesigned Core.
-    *
-    *   - `acts`: shape [n][batchSize]  — one activation beat per inner-dim cycle.
-    *   - `weightStream`: numColTiles * n beats, col-tile-major. Each beat is
-    *     outLanesPerTile ternary values (one cycle's worth of weights for one tile).
-    *
-    * Returns a flat batch-major, col-ascending output stream matching what the
-    * Core emits on m_axis: out[b * cols + col] = sum_n A[n][b] * sign(W[n][col]).
+    * Software reference. `acts` is [n][batchSize]; `weightStream` is numColTiles*n
+    * col-tile-major beats of outLanesPerTile codes. Returns the m_axis order (batch-major,
+    * col-ascending): out[b * cols + col] = sum_n A[n][b] * sign(W[n][col]).
     */
   private def referenceCompute(
       acts:         Seq[Seq[Int]],
@@ -297,8 +261,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     pushAxisBeats(dut, acts.map(packActivations))
     waitForIrq(dut); ackIrq(dut)
 
-    // COMPUTE: rows=n, cols=m. Weights go out either 2-bit-per-beat (legacy) or as
-    // the dense 1.6-bit stream the gearbox unpacks — same numeric result.
+    // COMPUTE: rows=n, cols=m; weights 2-bit-per-beat or the dense 1.6-bit stream.
     val weightBeats = if (packed) packWeightStreamDense(weightStream) else weightStream.map(packWeights)
     axiWrite(dut, OFF_INSTR, encode(COMPUTE_MM, BigInt(0x300), BigInt(n), BigInt(m))) mustBe OKAY
     pushAxisBeats(dut, weightBeats, maxCyclesPerBeat = 200)
@@ -313,9 +276,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     unpackOutputs(raw)
   }
 
-  // ──────────────────────────────────────────────────────────────────────
-  // Tests
-  // ──────────────────────────────────────────────────────────────────────
+  // ───────────────────────── Tests ─────────────────────────
 
   "Core (redesigned)" - {
 
@@ -369,9 +330,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Numeric correctness
-    // ──────────────────────────────────────────────────────────────────
+    // ── Numeric correctness ──
 
     "numeric: constant activations × all-+1 weights → per-batch sum on every lane" in {
       simulate(mkCore) { dut =>
@@ -444,10 +403,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // 1.6-bit packed weights (packedWeights): identical results to the
-    // 2-bit path — the config lever is numerically transparent.
-    // ──────────────────────────────────────────────────────────────────
+    // ── 1.6-bit packed weights: must match the 2-bit path exactly ──
 
     "packed: random workloads match the 2-bit path and the reference (5 seeds)" in {
       val seeds = Seq(1L, 7L, 42L, 99L, 256L)
@@ -491,16 +447,9 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // The HW contract that column-tile splitting rests on: a projection can be run as
-    // several COMPUTEs over contiguous slices of its output column tiles, all sharing ONE
-    // LOAD_ACT, and the concatenated results equal the whole projection. This is what lets
-    // the host pipeline a big projection against itself (hide chunk j-1's readback under
-    // chunk j's COMPUTE) with no re-pack and no re-LOAD. Two facts make it work, and this
-    // test pins both: the weight stream is col-tile-major (beat ct*n+t), so a tile range is
-    // a CONTIGUOUS beat slice; and sCompute only READS actBram (a SyncReadMem written by
-    // sLoad), resetting nothing but its own pointers, so the activations survive.
-    // Chunk sizes are deliberately UNEVEN (1 tile then 2) — the host picks boundaries from
-    // blob alignment, not evenness, so the RTL must not assume equal chunks.
+    // Host column-tile splitting relies on this: COMPUTEs over contiguous col-tile slices
+    // sharing ONE LOAD_ACT concatenate to the whole projection (the weight stream is
+    // col-tile-major and sCompute never disturbs actBram). Chunks are deliberately uneven.
     "split: per-column-tile-chunk COMPUTEs on one LOAD == the whole projection" in {
       simulate(mkCore) { dut =>
         val n = 4
@@ -541,9 +490,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Edge cases
-    // ──────────────────────────────────────────────────────────────────
+    // ── Edge cases ──
 
     "edge: re-COMPUTE without intervening LOAD reuses the prior activations" in {
       simulate(mkCore) { dut =>
@@ -590,13 +537,8 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // ──────────────────────────────────────────────────────────────────
-    // Runtime batch count (instruction flags field). A high-B bitstream must
-    // serve a low-batch call by draining only the requested rows. Proven
-    // deterministically: a full-batch compute seeds BOTH outBram rows, then a
-    // batch=1 compute with different weights must overwrite ONLY row 0 and
-    // leave row 1 stale — so the drain bound is genuinely runtime, not batchSize.
-    // ──────────────────────────────────────────────────────────────────
+    // ── Runtime batch count (flags): a full-batch compute seeds both outBram rows, then
+    // a batch=1 compute must overwrite ONLY row 0, leaving row 1 stale. ──
 
     "runtime batch: batch=1 compute drains only row 0, leaving row 1 stale" in {
       simulate(mkCore) { dut =>
@@ -657,12 +599,8 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ──────────────────────────────────────────────────────────────────
-  // Column banking — systolic pipeline inside the array. End-to-end result
-  // must be identical to the broadcast Core (the banking only retimes the
-  // array; Core's capture/drain waits on completion, so the extra per-bank
-  // latency is transparent). colBankSize=1 with xDim=2 → 2 banks.
-  // ──────────────────────────────────────────────────────────────────
+  // Column banking only retimes the array, so results must match the broadcast Core.
+  // colBankSize=1 with xDim=2 → 2 banks.
 
   "Core with column banking (colBankSize=1)" - {
     def mkBankedCore = new Core(
@@ -703,29 +641,11 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ──────────────────────────────────────────────────────────────────
-  // The BANKED output memory. batchSize=2 here, so outRamStyle="ultra" and every test
-  // in this suite already runs through OutMemUltra — but at the production bank depth
-  // the tiny config's memory lands in ONE bank, so the bank-select decode and the
-  // registered mux, which are the entire point of the design, are never built. This
-  // block forces small bank depths so they are.
-  //
-  // What it protects: the banked read replaces two pass-through pipeline stages with
-  // two structural ones (bank output register, then the mux over registered outputs),
-  // and claims total read latency is UNCHANGED. That claim is one off-by-one away from
-  // being false, and a slip does not crash — it silently desynchronises the STORE
-  // stream and ships shifted output. Same seeds as the baseline, so any divergence is
-  // attributable to the memory and nothing else.
-  // ──────────────────────────────────────────────────────────────────
+  // Banked output memory. At the production bank depth the tiny config is ONE bank, so
+  // these force small bank depths to build the bank-select and registered mux. A read-
+  // latency off-by-one would silently shift the STORE stream rather than crash.
 
   "Core with the banked output memory" - {
-    // ── banked ──────────────────────────────────────────────────────────────
-    // outBankDepth is forced small here on purpose. The tiny config's output memory is
-    // only batchSize*numColTilesMax rows deep, so at the production default
-    // (4096*cascadeHeight) it lands in ONE bank and the registered mux — the entire
-    // point of the style — is never built, let alone exercised. outBankDepth=2 splits
-    // it across several banks so the bank-select decode, the write-side bank decode and
-    // the mux all run.
     def mkBankedCore(bankDepth: Int) = new Core(
       aWidth = aWidth, maxAcc = maxAcc, xDim = xDim, batchSize = batchSize,
       maxN = maxN, maxM = maxM, outBeatLanes = 0,
@@ -734,8 +654,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     )
 
     "banked: random workloads match reference across bank counts" in {
-      // bankDepth 1 and 2 give different bank counts and different select widths; the
-      // production default (one bank) is the degenerate path and must also still work.
+      // 1 and 2: different bank counts/select widths; 0: the production single bank.
       Seq(1, 2, 0).foreach { bd =>
         Seq(1L, 42L, 256L).foreach { seed =>
           simulate(mkBankedCore(bd)) { dut =>
@@ -756,10 +675,8 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // The bank-crossing case: enough col tiles that consecutive output rows land in
-    // DIFFERENT banks, with every row distinct. A wrong bank-select alignment (sel_q
-    // one cycle out of step with the bank output registers it selects among) returns a
-    // neighbouring bank's row, which is only visible when the banks hold different data.
+    // Consecutive rows in different banks with distinct data, so a sel_q misalignment
+    // (returning a neighbouring bank's row) is visible.
     "banked: consecutive rows in different banks stay correctly selected" in {
       simulate(mkBankedCore(bankDepth = 1)) { dut =>   // one row per bank: every row crosses
         resetDut(dut)
@@ -775,15 +692,8 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
 
   }
 
-  // ──────────────────────────────────────────────────────────────────
-  // actRamStyle — the control.ActMem BlackBox replacing the inferred SyncReadMem
-  // for the activation memory. It exists to carry ram_style/cascade_height so the
-  // RAMB36E2 depth cascade can be bounded at maxN=8192 (the worst 250 MHz path).
-  // The attributes are invisible to Verilator, so what these tests pin down is the
-  // thing that WOULD break: that the hand-written SV reproduces SyncReadMem's
-  // read/write timing exactly. A one-cycle slip here desynchronises the
-  // weight/activation pairing in inQ and corrupts results silently.
-  // ──────────────────────────────────────────────────────────────────
+  // ActMem activation memory: the hand-written SV must reproduce SyncReadMem's timing
+  // exactly; a one-cycle slip silently breaks the weight/activation pairing in inQ.
 
   "Core with an ActMem activation memory" - {
     def mkActMemCore(style: String, cascade: Int) = new Core(
@@ -793,9 +703,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       actRamStyle = style, actCascadeHeight = cascade
     )
 
-    // The headline claim: identical results on the same stimulus as the SyncReadMem
-    // path. Same seeds as the baseline "random workloads match reference" case above,
-    // so a divergence is attributable to the memory swap and nothing else.
+    // Same seeds as the SyncReadMem baseline above.
     "numeric: random workloads match reference (5 seeds)" in {
       Seq(1L, 7L, 42L, 99L, 256L).foreach { seed =>
         simulate(mkActMemCore("block", 2)) { dut =>
@@ -815,9 +723,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // Multi-col-tile: the read address wraps back to row 0 once per tile while the
-    // write port is idle. This is where a read/write-collision difference between the
-    // BlackBox and SyncReadMem would show up.
+    // The read address wraps to row 0 once per tile.
     "numeric: multi-col-tile reads wrap per tile" in {
       simulate(mkActMemCore("block", 2)) { dut =>
         resetDut(dut)
@@ -829,8 +735,6 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // Write path: a second LOAD must fully overwrite the first. Mirrors the
-    // "edge: re-LOAD overwrites activation BRAM cleanly" case on the legacy path.
     "edge: re-LOAD overwrites the activation memory cleanly" in {
       simulate(mkActMemCore("block", 2)) { dut =>
         resetDut(dut)
@@ -844,9 +748,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
       }
     }
 
-    // Both ram_style values and the cascade_height=0 (attribute omitted) case have to
-    // produce SV that elaborates and compiles — an unparseable attribute list or a
-    // module-name collision between two instantiations would only surface here.
+    // Catches unparseable attribute lists and module-name collisions.
     "every (ram_style, cascade_height) variant elaborates and computes" in {
       Seq(("block", 0), ("block", 1), ("ultra", 2)).foreach { case (style, cascade) =>
         simulate(mkActMemCore(style, cascade)) { dut =>
@@ -863,14 +765,10 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ──────────────────────────────────────────────────────────────────
-  // Output chunking — separate config with outBeatLanes < outLanesPerTile.
-  // ──────────────────────────────────────────────────────────────────
+  // Output chunking: outBeatLanes < outLanesPerTile.
 
   "Core with output chunking (outBeatLanes = outLanesPerTile/2)" - {
     val chunkLanes = outLanesPerTile / 2
-    val chunkSubBeats = outLanesPerTile / chunkLanes
-    val chunkBeatWidth = chunkLanes * outLaneWidth
 
     def mkChunked = new Core(
       aWidth       = aWidth,
@@ -896,8 +794,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
 
     "emits twice as many beats per col tile and still matches reference" in {
       simulate(mkChunked) { dut =>
-        // The helpers above bind to outLanesPerTile-wide unpacking; use the chunked one here.
-        // Reuse most of the pipeline by hand:
+        // runPipeline unpacks outLanesPerTile-wide beats, so drive the flow by hand.
         dut.s_axi.awvalid.poke(false.B); dut.s_axi.wvalid.poke(false.B)
         dut.s_axi.bready.poke(false.B);  dut.s_axi.arvalid.poke(false.B)
         dut.s_axi.rready.poke(false.B);  dut.s_axi.awid.poke(0.U)
@@ -907,7 +804,7 @@ class CoreSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
         dut.reset.poke(true.B); dut.clock.step(); dut.reset.poke(false.B); dut.clock.step()
 
         val n = 4
-        val m = 2 * outLanesPerTile   // 2 col tiles → 2 × chunkSubBeats per batch
+        val m = 2 * outLanesPerTile   // 2 col tiles
         val acts = Seq.fill(n)(Seq(2, 5))
         val w1 = Seq.fill(n)(Seq(1, 1, 0, 3))
         val w2 = Seq.fill(n)(Seq(3, 0, 1, 1))

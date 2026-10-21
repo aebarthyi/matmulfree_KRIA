@@ -1,25 +1,13 @@
 #!/usr/bin/env bash
 # clone_preset_hw.sh SRC_PRESET DST_PRESET
 #
-# Assemble transfer/presets/<DST>/ from an ALREADY-BUILT <SRC> bitstream, with DST's
-# own manifest and the overlay's udmabuf-wt nodes re-sized to DST's resident weight set.
-# No Vivado, no xsct — seconds instead of ~40 min.
+# Assemble transfer/presets/<DST>/ from an ALREADY-BUILT <SRC> bitstream, with DST's own
+# manifest and the overlay's udmabuf-wt nodes re-sized to DST's resident weight set. No Vivado.
+# For presets with byte-identical RTL (1.3B and 2.7B share one engine geometry).
 #
-# WHY THIS EXISTS. maxN = nextPow2(max(hidden, intermediate)) and maxM =
-# ceilTo(max(2*intermediate, vocab), 256), so 1.3B and 2.7B land on the SAME engine
-# geometry and CoreConfig emits byte-identical SystemVerilog for them. The presets differ
-# only in manifest fields that never reach the Core: MMFREE_MODEL, MMFREE_SHAPES and
-# UDMABUF_WT_SZ. Re-running Vivado for the smaller model would burn ~40 min to produce
-# the same bitstream. See [[universal_overlay_wt_patch]] for the hand version of this.
-#
-# SAFETY. The clone is REFUSED unless
-#   (1) generated/<SRC> and generated/<DST> hold byte-identical .sv (same RTL), and
-#   (2) their preset.env differ ONLY in the allow-listed non-RTL keys below.
-# Any other delta means the bitstream is genuinely different and must be built. The dtbo
-# patch is verified by re-decompiling and diffing the DTS: only the wt size lines may move.
-#
-# The timing record for a cloned preset is the SOURCE's report (reports/<SRC>_*.rpt) —
-# the bitstream is literally the same file, so its WNS carries over unchanged.
+# Refused unless (1) generated/<SRC> and generated/<DST> hold byte-identical .sv, and (2) their
+# preset.env differ only in ALLOWED_KEYS. The patched dtbo is verified by a DTS round-trip diff.
+# The clone's timing record is SRC's reports/<SRC>_*.rpt (it is the same bitstream file).
 #
 # Usage:
 #   ./mill matmulfree_KRIA.runMain control.EmitCore <DST> generated/<DST>   # manifest + SV
@@ -71,14 +59,8 @@ echo "    RTL sha256 ${h_src:0:16} — identical ($(sv_list "$SRC_GEN" | wc -l) 
 echo "==> [2/4] Verifying the manifest delta touches only: $ALLOWED_KEYS"
 keys_of() { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$1" | cut -d= -f1 | sort; }
 bad=0
-# A key present in DST but not in SRC is normally a MANIFEST-FORMAT addition, not a config
-# change: generated/<SRC> was emitted by an older tree that did not write that field yet.
-# (This is how it first showed up — MMFREE_ACT_RAM_STYLE / _CASCADE_HEIGHT arrived with the
-# ActMem BlackBox, so every manifest emitted before it lacks them.) That is benign only if
-# the new field is at its DEFAULT in DST — empty or 0 — because then SRC's silence and DST's
-# explicit default describe the same hardware. A new key with a NON-default value means DST
-# genuinely asks for something SRC's bitstream does not have, and must be built.
-# Keys missing from DST are never acceptable: DST's manifest is the one that ships.
+# A key only in DST is usually a newer manifest field that SRC's older tree didn't emit: benign
+# only at its default (empty or 0). Keys missing from DST are never acceptable (DST's ships).
 while read -r k; do
     grep -qE "^$k=" "$SRC_GEN/preset.env" && continue
     vd=$(grep -E "^$k=" "$DST_GEN/preset.env" | head -1 | cut -d= -f2-)

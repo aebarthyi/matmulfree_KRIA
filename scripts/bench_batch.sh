@@ -1,58 +1,22 @@
 #!/usr/bin/env bash
 # bench_batch.sh — batch sweep for one deployed bitstream, emitted as a single CSV.
 #
-# Runs the fpga_runner once per batch size b = 1..MMFREE_BATCH (the bitstream's compile-time
-# batchSize, read from the preset manifest) and collects one row per b:
-#
-#   time-to-first-token, prefill latency, per-step token latency, tok/s (aggregate and
-#   per-stream), plus the op-level and engine-phase profiling breakdowns as columns.
-#
-# Each b is `--serve b`: b concurrent streams sharing one weight stream per projection per
-# decode step. The runner also asserts every stream matches a single-stream decode, so a row
-# with streams_ok=0 is a CORRECTNESS failure and its timings mean nothing — check that column
-# before reading any number in the row.
-#
-# What streams_ok here does NOT cover: the sweep gives every stream the SAME prompt, and
-# sampling is greedy, so the streams are identical by construction (distinct_prompts=0 in
-# the CSV). That catches a dropped stream and any divergence from single-stream decode, but
-# identical streams are invariant under permutation — it cannot see the drain writing row 2
-# into stream 5. `make streams PRESET=<p>` runs the same path with a different prompt per
-# stream and checks each against its own reference; run it once per bitstream.
-#
-# This is the BOARD-side script (staged into the bundle by build_all.sh); run it from
-# ~/transfer with the target overlay already loaded:
-#
+# Board-side (staged into the bundle); run from ~/transfer with the overlay already loaded:
 #   sudo make deploy-hw PRESET=<preset>            # load the bitstream FIRST
 #   ./bench_batch.sh PRESET=<preset> [MODEL=<hf-id>] [GEN=64] [REPS=3] [WARMUP=1] [OUT=file.csv]
 #   ./bench_batch.sh PRESET=<preset> BATCHES="1 2 4 6"    # explicit list instead of 1..B
 #
-# BACKEND=cpu runs the SAME sweep with the engine out of the loop — the CPU baseline to
-# quote the FPGA speedup against. It is a true apples-to-apples control: only the model's
-# TernaryBackend differs (main_fpga.cpp header), everything else — prompt, greedy sampling,
-# --serve batching, warmup/reps, CSV columns — is the identical code path. Notes:
-#   * No overlay, no bitstream and no packed blob are needed (the runner never touches the
-#     engine), so a CPU sweep runs on any preset, even one whose blob isn't built. It still
-#     reads the preset manifest for the default batch ladder, so the b's line up with the
-#     FPGA run you're comparing to.
-#   * The CSV is a strict SUBSET of the FPGA one: the bl_* engine-phase columns are absent
-#     (there is no engine), headline + op_* columns are identical. split_sweep_csv.py just
-#     omits the _phases sheet.
-#   * Output is tagged _cpu so it never clobbers the FPGA CSV for the same preset.
-#   * Match POWER between the two runs before comparing — POWER=1 costs ~2% decode.
+# One `make run ... --serve b` per b = 1..MMFREE_BATCH (from the manifest), one CSV row each:
+# TTFT, prefill, token latency, tok/s, plus op/engine-phase breakdowns. A row with streams_ok=0
+# is a correctness failure. streams_ok uses one shared prompt, so it cannot see a row
+# permutation: run `make streams PRESET=<p>` once per bitstream for that.
 #
-# BACKEND=cpu-2bit / cpu-1p6 are the same CPU sweep with the weights held at the FPGA's two
-# encodings (2.0 and 1.625 bits/weight, mmfree/tq1.hpp) instead of one int8 per ternary weight,
-# so a CPU-vs-FPGA comparison can hold the weight format fixed. Both are bit-identical to
-# BACKEND=cpu, so the rows differ only in speed. MEASURED ON THE A53, per projection:
-#   cpu-2bit  0.96-1.25x of int8   (shift+mask extraction; wins at the largest inner dims)
-#   cpu-1p6   0.52-0.82x of int8   (base-3 multiply+compare costs more than the traffic saves)
-# The CPU ternary dot is ALU/issue-bound rather than weight-bandwidth-bound, which is why
-# packing does not pay off the way it does on the engine. `cpu` (int8) remains the CPU's
-# fastest configuration and hence the fair headline denominator.
-#
-# Defaults land the CSV in results/<preset>[_<model-slug>][_cpu]_batch_sweep.csv. Everything
-# else (device paths, geometry env, model resolution) is delegated to the bundle's Makefile,
-# so this stays consistent with `make run`/`make gate`.
+# BACKEND=cpu|cpu-2bit|cpu-1p6: the same sweep with the engine out of the loop (int8 / 2.0 /
+# 1.625 bits per weight, bit-identical results) -- the CPU baseline. Needs no overlay or packed
+# blob, omits the bl_* columns, and writes a separate _<backend> CSV.
+# Match POWER between runs before comparing: POWER=1 costs ~2% decode (this script defaults
+# to 0; `make sweep` passes 1).
+# Output: results/<preset>[_<model-slug>][_<backend>][_<TAG>]_batch_sweep.csv
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -64,8 +28,7 @@ for arg in "$@"; do
     case "$arg" in
         PRESET=*)  PRESET="${arg#*=}"  ;;
         MODEL=*)   MODEL="${arg#*=}"   ;;
-        # cpu = the no-engine baseline; both = CPU and FPGA in one run, every projection
-        # cross-checked (slow, and its timings include the comparison — don't quote them).
+        # both = CPU and FPGA cross-checked per projection (slow; don't quote its timings)
         BACKEND=*) BACKEND="${arg#*=}" ;;
         GEN=*)     GEN="${arg#*=}"     ;;
         REPS=*)    REPS="${arg#*=}"    ;;
@@ -73,16 +36,12 @@ for arg in "$@"; do
         OUT=*)     OUT="${arg#*=}"     ;;
         BATCHES=*) BATCHES="${arg#*=}" ;;
         POWER=*)   POWER="${arg#*=}"   ;;
-        # EXTRA is appended verbatim to the runner's flags, AFTER the sweep's own, so it can
-        # override them (the runner takes the last occurrence of a repeated flag). Needed for
-        # a non-default weight blob, e.g. the 1.6-bit build:
-        #   EXTRA="--packed-dir /home/ubuntu/transfer/models/<id>/packed-1p6"
+        # EXTRA is appended after the sweep's own flags, so it can override them
+        # (e.g. EXTRA="--packed-dir /home/ubuntu/transfer/models/<id>/packed-1p6").
         EXTRA=*)   EXTRA="${arg#*=}"   ;;
-        # TAG distinguishes output files when the same preset+model is swept more than once
-        # under different EXTRA (e.g. 2-bit vs 1.6-bit blob), so neither run clobbers the other.
+        # TAG keeps output files apart when one preset+model is swept more than once.
         TAG=*)     TAG="${arg#*=}"     ;;
-        # ENV="K=V K=V" reaches the workload's environment (sudo strips the caller's), for
-        # tuning knobs like MMFREE_SPLIT_CHUNKS that aren't runner flags.
+        # ENV="K=V ..." reaches the workload's environment (sudo strips the caller's).
         ENV=*)     RUNENV="${arg#*=}"  ;;
         *) echo "unknown arg '$arg' (KEY=VAL only)" >&2; exit 2 ;;
     esac
@@ -96,11 +55,8 @@ esac
 MANIFEST="presets/$PRESET/preset.env"
 [ -f "$MANIFEST" ] || { echo "ERROR: no manifest at $MANIFEST — '$PRESET' is not in this bundle." >&2; exit 1; }
 
-# The bitstream's compile-time batchSize is the sweep ceiling: --serve b requires
-# b <= batchSize (above it the engine has no PE row to put the extra stream in).
-# It is the DEFAULT ladder for every backend, so a CPU baseline sweeps the same b's as the
-# FPGA run it is compared against — but it is only a hard CAP when the engine is in play.
-# BACKEND=cpu has no PE rows to run out of, so an explicit BATCHES may go past it.
+# The bitstream's batchSize is the default ladder for every backend, but a hard cap only when
+# the engine is in play (cpu* backends may exceed it with an explicit BATCHES).
 HW_BATCH=$(grep -hE '^MMFREE_BATCH=' "$MANIFEST" | cut -d= -f2)
 HW_BATCH=${HW_BATCH:-1}
 if [ -z "$BATCHES" ]; then
@@ -131,19 +87,10 @@ failed=""
 for b in $BATCHES; do
     log="results/logs/${PRESET}${SLUG}_b${b}.log"
     echo "=== [$(date -Is)] b=$b -> $log"
-    # `make run` supplies the device paths + geometry env from the manifest; ARGS adds the
-    # sweep-specific flags. --serve b overrides the runner's default single-stream --bench
-    # path, and --csv makes it emit the machine-readable row we collect below.
-    # --backend goes in ARGS (not a make var) because the run target hardcodes
-    # `--backend fpga` before $(ARGS) and the runner keeps the LAST occurrence of a repeated
-    # flag; $EXTRA stays last so it can still override this.
-    # BATCH=$b and a per-arm POWER_DIR are what make the power samples usable. power_bench.sh
-    # names its output <preset>_a..x..b<B>_n..m.._<mode>.samples, taking B from this BATCH and
-    # falling back to the manifest's compile-time batchSize when it is unset. Without BATCH
-    # every b in the ladder resolved to the SAME name and overwrote the last, so a POWER=1
-    # sweep left exactly one samples file — the final batch — and per-batch perf/W was
-    # unobtainable. POWER_DIR then separates arms and passes, which the name alone does not:
-    # two passes of one preset, or the same preset at two backends, still collide otherwise.
+    # `make run` supplies device paths + geometry env. --backend goes in ARGS because the run
+    # target hardcodes `--backend fpga` and the runner keeps the LAST repeated flag; $EXTRA
+    # stays last so it can still override. BATCH=$b gives each b its own power samples file,
+    # and POWER_DIR keeps arms and passes of one preset apart.
     if ! make run PRESET="$PRESET" $MODEL_ARG POWER="$POWER" BATCH="$b" \
             POWER_DIR="power/${PRESET}${SLUG}" ${RUNENV:+ENV="$RUNENV"} \
             ARGS="--backend $BACKEND --serve $b --gen $GEN --warmup $WARMUP --reps $REPS --csv $EXTRA" \
@@ -153,10 +100,8 @@ for b in $BATCHES; do
         continue
     fi
 
-    # The runner prints exactly one '#CSVH <header>' and one '#CSVR <values>' line. Capture
-    # into variables rather than piping straight to the file: a pipeline's status is sed's,
-    # which succeeds even when grep matched nothing, so a run that died before the timed
-    # phase would silently append an empty line and be counted as a success.
+    # Capture into variables, not a pipeline into the file: the pipeline's status is sed's,
+    # so a run that died early would silently append an empty row.
     row=$(grep -m1 '^#CSVR ' "$log" | sed 's/^#CSVR //')
     if [ -z "$row" ]; then
         echo "    WARN: no #CSVR row in $log (did the run reach the timed phase?)"
@@ -171,8 +116,7 @@ for b in $BATCHES; do
     fi
     printf '%s\n' "$row" >> "$OUT"
 
-    # Surface correctness + the headline number per row while the sweep runs, so a broken
-    # bitstream is obvious immediately instead of after the whole sweep.
+    # Surface correctness + the headline number per row as the sweep runs.
     grep -E '^serve B=|^  (ttft|decode|token latency)' "$log" | sed 's/^/    /'
 done
 
@@ -183,9 +127,7 @@ else
     echo "# sweep complete: $OUT"
 fi
 
-# The wide CSV above is the raw record (one row per run, every metric its own column) — it is
-# ~65 columns and not meant to be read as a table. Split it into the readable sheets:
-# _summary (the benchmark table), _ops and _phases (long-format profiling).
+# Split the ~65-column wide CSV (the raw record) into _summary / _ops / _phases sheets.
 if [ "$wrote_header" -eq 1 ] && command -v python3 >/dev/null 2>&1; then
     python3 ./split_sweep_csv.py "$OUT" || echo "  WARN: split failed; the wide CSV is still complete"
 fi

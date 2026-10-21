@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """split_sweep_csv.py — reshape a wide batch-sweep CSV into tidy per-concern sheets.
 
-bench_batch.sh emits ONE row per batch size with every metric as its own column, which is
-the right wire format (one row per run, trivially appended) but ~65 columns wide: 19 headline
-metrics followed by three columns per profiled op and three per engine phase. That is
-unreadable as a table.
+bench_batch.sh writes one ~65-column row per batch size (the raw record, kept as is). This
+splits each such file into:
 
-This splits one such file into three, keeping the wide original as the raw record:
+  <stem>_summary.csv   one row per batch size: the headline metrics (the benchmark table)
+  <stem>_ops.csv       long: one row per (batch, op) -- ms_per_run, pct, us_per_call
+  <stem>_phases.csv    long: one row per (batch, engine phase) -- pack/load/compute/store/readback
 
-  <stem>_summary.csv   one row per batch size, headline metrics only — the benchmark table:
-                       ttft / prefill / token latency / tok-s. Wide is CORRECT here (each
-                       column is a different quantity of the same run).
-  <stem>_ops.csv       LONG: one row per (batch, op). Columns: batch, op, ms_per_run, pct,
-                       us_per_call. Long, not wide, because the op set is data — this
-                       pivots directly and does not change shape when an op appears or goes.
-  <stem>_phases.csv    LONG: one row per (batch, engine phase) — pack / load / compute /
-                       store / readback, the per-projection cost split.
-
-Identity columns (preset, clk_mhz, hw_batch, packed_weights, model) are carried onto every
-row of every sheet, so each file stands alone and several sweeps can be concatenated for
-comparison without losing which build a row came from.
+Identity columns (preset, clk_mhz, hw_batch, packed_weights, model) go on every row of every
+sheet, so sheets from several sweeps can be concatenated without losing which build is which.
 
   ./split_sweep_csv.py results/*_batch_sweep.csv          # -> alongside each input
   ./split_sweep_csv.py --out-dir tidy/ results/x.csv
@@ -32,8 +22,7 @@ import sys
 # Identity of the run: repeated on every row of every sheet so each is self-describing.
 ID_COLS = ["preset", "clk_mhz", "hw_batch", "hw_batch_max", "packed_weights", "model", "batch"]
 
-# The headline benchmark table, in report order. Anything here that the input lacks is
-# skipped rather than emitted empty, so this tolerates older/newer runner versions.
+# The headline benchmark table, in report order; columns the input lacks are skipped.
 SUMMARY_COLS = [
     "prompt_tokens", "gen_tokens", "reps", "streams_ok",
     "distinct_prompts", "distinct_refs",
@@ -54,11 +43,8 @@ PHASE_AGGREGATES = ["bl_calls_per_run", "bl_total_ms", "bl_us_call",
 
 
 def collect_items(fieldnames, prefix):
-    """Find the per-item names under `prefix` that have a full metric set.
-
-    e.g. prefix 'op_' over op_matmul_ms/_pct/_us_call yields 'matmul'. Requires ALL of
-    METRICS to be present so an aggregate like op_total_ms (no _pct/_us_call sibling) is not
-    mistaken for an item — that is what keeps OP_AGGREGATES off the long sheet.
+    """Per-item names under `prefix` with the full METRICS set (op_matmul_ms/_pct/_us_call ->
+    'matmul'). Requiring all of them keeps aggregates like op_total_ms off the long sheet.
     """
     names = []
     for f in fieldnames:
@@ -71,12 +57,8 @@ def collect_items(fieldnames, prefix):
 
 
 def model_slug(value):
-    """'/home/ubuntu/transfer/models/370m/model.mmfree' -> '370m'.
-
-    The runner records the blob it loaded, i.e. an absolute board path, which is pure noise
-    repeated on every row. The containing directory IS the model identity (models/<slug>/ or
-    models/<org>/<name>/), so use that.
-    """
+    """'/home/ubuntu/transfer/models/370m/model.mmfree' -> '370m': the blob's directory is the
+    model identity; the absolute board path is noise."""
     if not value:
         return value
     d = os.path.dirname(value.strip())
@@ -115,8 +97,7 @@ def split_one(path, out_dir=None):
             w.writerows(records)
         written.append((out, len(records)))
 
-    # ---- summary: headline metrics + the profiling AGGREGATES (one number each, so they
-    # belong on the benchmark table rather than forcing a reader into the long sheets).
+    # ---- summary: headline metrics + the one-number profiling aggregates.
     agg = [c for c in OP_AGGREGATES + PHASE_AGGREGATES if c in fields]
     cols = ids + [c for c in SUMMARY_COLS if c in fields] + agg
     write("summary", cols, [[r[c] for c in cols] for r in rows])

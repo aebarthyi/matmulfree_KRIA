@@ -60,26 +60,48 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "the deployable set is exactly the three released checkpoints" in {
-      // `deployable` is what the board bundle and the report quote, and that must not grow
-      // by accident.
       CoreConfig.deployable.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
     }
 
-    // With the 300 MHz question closed (2026-08-09) and its arms moved to `exploration`,
-    // the whole buildable registry IS the deployable set again. Both halves are asserted:
-    // that candidates is empty, and that a non-empty one would still be disjoint and
-    // reachable — so re-adding a candidate later cannot silently skip the check.
-    "the buildable registry is exactly the deployable set while no candidate is open" in {
-      CoreConfig.candidates mustBe empty
+    // Candidates must never shadow a shipped preset, and every name must reach byName.
+    "the buildable registry is the deployable set plus the open candidates" in {
       CoreConfig.candidates.keySet.intersect(CoreConfig.deployable.keySet) mustBe empty
       CoreConfig.presets mustBe (CoreConfig.deployable ++ CoreConfig.candidates)
       (CoreConfig.deployable.keys ++ CoreConfig.candidates.keys)
         .foreach { n => CoreConfig.byName(n) mustBe CoreConfig.presets(n) }
     }
 
-    // With "banked" there is no hard cascade left to bound — one URAM chain per bank,
-    // cascade_height=1 — and the value is baked into OutMemUltra's module name, so the two
-    // maxN=8192 presets must agree or scripts/clone_preset_hw.sh refuses the 1.3B clone.
+    // A 2-bit control must isolate the weight format; any other drift is a confound.
+    "each 2-bit candidate differs from its shipped twin in the weight format alone" in {
+      Seq("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b").foreach { base =>
+        val shipped = CoreConfig.deployable(base)
+        val control = CoreConfig.candidates(s"${base}_2bit")
+        withClue(s"$base: ") {
+          shipped.packedWeights mustBe true
+          control.packedWeights mustBe false
+          // Separate forModel calls, so this catches typos in the duplicated shapes.
+          // residentWtBytes is supposed to differ; it is checked below.
+          control mustBe shipped.copy(packedWeights   = false,
+                                      residentWtBytes = control.residentWtBytes)
+        }
+      }
+    }
+
+    // 2 bits/trit vs 1.6 => udmabuf-wt must grow ~1.25x. Guards the
+    // `.copy(packedWeights = false)` trap, which leaves residentWtBytes at the packed value.
+    "the 2-bit candidates size udmabuf-wt 1.25x their packed twins" in {
+      Seq("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b").foreach { base =>
+        val packedWt  = CoreConfig.deployable(base).udmabufWtBytes.toDouble
+        val controlWt = CoreConfig.candidates(s"${base}_2bit").udmabufWtBytes.toDouble
+        withClue(s"$base: packed=$packedWt control=$controlWt ratio=${controlWt / packedWt} ") {
+          (controlWt / packedWt) must be >= 1.20
+          (controlWt / packedWt) must be <= 1.30
+        }
+      }
+    }
+
+    // outCascadeHeight is part of OutMemUltra's module name, so 1.3B and 2.7B must agree
+    // or scripts/clone_preset_hw.sh refuses the 1.3B clone.
     "every deployable preset keeps the shipped output-memory cascade" in {
       CoreConfig.deployable.foreach { case (n, c) =>
         withClue(n) { c.outCascadeHeight mustBe 1 }
@@ -88,27 +110,19 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
         CoreConfig.deployable("mmfree_2_7b").outCascadeHeight
     }
 
-    // B8 fits only because the lane accumulators move into DSP48s (~22 pp of LUT at B6);
-    // without dspAccum the same array was a ~95% LUT capacity wall. B8 is now DEPLOYABLE, so
-    // pin that condition on the shipped set — a shipped preset must not be buildable in the
-    // configuration already measured not to fit.
+    // B8 fits only with the lane accumulators in DSP48s; without dspAccum it hits the LUT wall.
     "every deployable preset carries dspAccum, the condition that makes B8 fit at all" in {
       CoreConfig.deployable.foreach { case (n, c) =>
         withClue(n) {
           c.batchSize   mustBe 8
           c.dspAccum    mustBe true
-          c.colBankSize mustBe 4     // 800 spilled lanes need the shortest broadcast domains
+          c.colBankSize mustBe 4
           c.packedWeights mustBe true
         }
       }
     }
 
-    // These four fields ARE the conclusion of the optimization program: batching amortizes
-    // the weight stream (B4->B6 measured +11.8%, B6->B8 +11.5-15.4% at b=8 and free below it),
-    // 1.6-bit packing
-    // cuts the binding traffic ~20% (+4.3% at 2.7B b=6), 128-bit m_axis stops STORE being the
-    // batch bottleneck, and 250 is the top reachable rung. Any preset that loses one of them
-    // is a regression, not a variant — an ablation belongs on the `exploration` branch.
+    // Losing any of these on a shipped preset is a regression, not a variant.
     "every deployable preset carries the full optimization stack" in {
       CoreConfig.deployable.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
@@ -171,9 +185,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       Seq(m370, m1_3, m2_7).foreach(c => c.maxAcc mustBe c.maxN)
     }
 
-    // This is what lets scripts/clone_preset_hw.sh assemble the 1.3B bundle from the 2.7B
-    // bitstream in seconds instead of a second 50-minute Vivado run. If it ever stops
-    // holding, that script must stop being used for this pair.
+    // What lets scripts/clone_preset_hw.sh build the 1.3B bundle from the 2.7B bitstream.
     "1.3B and 2.7B emit identical RTL and differ only in deployment metadata" in {
       // shapesHint / modelName / residentWtBytes are manifest fields (bench sweep, target
       // checkpoint, udmabuf-wt sizing) and never reach the Core — normalize them out.
@@ -217,11 +229,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       }
     }
 
-    // PL0_REF only exists on discrete rungs and the PS IP snaps anything else DOWN, so an
-    // off-rung plClkMhz produces a bitstream constrained at the rung while every report,
-    // manifest and CSV carries the request. That went unnoticed for weeks: every "_230"
-    // preset was really a 199.998 MHz build, and two presets 5 MHz apart came out
-    // byte-identical. These two cases are the guard that makes it a build failure instead.
+    // An off-rung request snaps DOWN to a rung and would mislabel the build.
     "rejects a plClkMhz that is not a reachable PL0_REF rung" in {
       Seq(215, 220, 225, 230, 240, 275, 295).foreach { mhz =>
         withClue(s"plClkMhz=$mhz snaps down to a rung and mislabels the build") {
@@ -240,31 +248,26 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "actCascadeHeight requires an explicit actRamStyle to have any effect" in {
-      // The attribute rides on the ActMem BlackBox; with the inferred SyncReadMem there is
-      // nowhere to put it, so asking for one silently does nothing. Fail instead.
-      // m370 is the one default that does NOT set actRamStyle, so it is the valid base here.
+      // Without the ActMem BlackBox the attribute would silently do nothing. m370 is the
+      // shipped preset without actRamStyle, so it is the valid base here.
       m370.actRamStyle mustBe ""
       assertThrows[IllegalArgumentException] { m370.copy(actCascadeHeight = 2) }
       assertThrows[IllegalArgumentException] { m370.copy(actRamStyle = "lutram") }
     }
 
-    // The two paths these fix failed 0.005 ns apart at maxN=8192, so a build carrying only
-    // one of them moves WNS by 0.005 ns and wastes 50 minutes of Vivado. Pin the pairing.
+    // The two paths these fix fail by nearly the same margin at maxN=8192; one alone gains nothing.
     "the maxN=8192 presets carry both 250 MHz timing levers, not one" in {
       Seq(m1_3, m2_7).foreach { c =>
         withClue(s"${c.shapesHint}") {
           c.maxN             mustBe 8192
-          c.dspAccum         mustBe true     // frees ~22 pp LUT / ~34 pp CARRY8
+          c.dspAccum         mustBe true
           c.colBankSize      mustBe 4        // path 2: the route-bound broadcast net
           c.actRamStyle      mustBe "block"  // path 1: the 8-deep RAMB36E2 cascade
           c.actCascadeHeight mustBe 2
         }
       }
-      // 370M is maxN=4096, so it still carries NEITHER cascade lever — a 4-deep RAMB36E2
-      // chain is not the path that fails there. It does now carry dspAccum and the short
-      // broadcast domains, which is not a change of mind about its timing: at B6 it closed
-      // 250 on banking alone (dspAccum = false, colBankSize = 8), but B8 spills 800 lanes to
-      // fabric instead of 288, and dspAccum is the condition that makes that fit at all.
+      // 370M (maxN=4096, a 4-deep cascade) needs no ActMem cap; it carries dspAccum and
+      // colBankSize=4 because B8 needs them to fit.
       m370.maxN             mustBe 4096
       m370.dspAccum         mustBe true
       m370.colBankSize      mustBe 4
@@ -312,9 +315,6 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
       e("PL_CLK_MHZ")             mustBe "250"
       e("UDMABUF_ACT_SZ")         mustBe "0x00010000" // maxN*portBytes = 4096*16 = 64 KiB
       // OUT = batch*numColTilesMax*outLanesPerTile*outLaneBytes = 8*125*256*4, page-up.
-      // This grew with the B8 promotion (B6 was 0x000bc000) and the DT overlay carries it,
-      // so a B8 bitstream on a B6 overlay is refused at mmfree_lib_open rather than silently
-      // drained into a buffer 254 KiB too small.
       e("UDMABUF_OUT_SZ")         mustBe "0x000fa000"
     }
 

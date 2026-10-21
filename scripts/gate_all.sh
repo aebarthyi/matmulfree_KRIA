@@ -1,24 +1,11 @@
 #!/usr/bin/env bash
-# gate_all.sh — run the correctness gate for every deployable preset, on the KRIA.
+# gate_all.sh — run the bit-exact correctness gate for every deployable preset, on the KRIA.
 #
-# WHY THIS EXISTS. The 2026-08-09 rebuild swapped in the banked output memory, which
-# renames OutMemUltra and therefore produces genuinely new bitstreams for all three
-# presets. Nothing about that change is visible to simulation beyond what CoreSpec
-# already covers (read semantics and latency are identical by construction), so the
-# only thing that can promote "build-verified" to "shipped" is a gate on real hardware
-# at temperature. Until this passes, the WNS column in CLAUDE.md carries a ⚠️.
-#
-# It is a SCRIPT rather than something the assistant runs because `deploy-hw` needs
-# sudo and the board prompts for a password interactively.
-#
-# RUN IT ON THE BOARD, from ~/transfer:
-#     ./gate_all.sh                 # all three presets
+#     ./gate_all.sh                 # all three presets  (from ~/transfer, after `make deploy`)
 #     ./gate_all.sh mmfree_2_7b     # just one
 #
-# Deploy first from the build server:  make deploy BOARD=ubuntu@<kria>
-#
-# Each preset does: load overlay + driver (sudo), then `make gate`, which checks the
-# engine against the CPU reference bit-exactly. A pass is errs=0 on every shape.
+# Each preset: load overlay + driver (sudo; prompts for a password), then `make gate`, which
+# checks the engine against the CPU reference bit-exactly. A pass is errs=0 on every shape.
 
 set -uo pipefail        # NOT -e: a failing preset must not skip the ones after it
 
@@ -43,18 +30,14 @@ for p in "${PRESETS[@]}"; do
     echo "### $p"
     echo "############################################################"
 
-    # The overlay carries the bitstream AND the udmabuf sizing, so it must be reloaded
-    # per preset even when two presets share a bitstream (1.3B's resident weight set is
-    # half of 2.7B's, and the dtbo is patched for it).
+    # Reload per preset even when presets share a bitstream: the dtbo also carries udmabuf sizing.
     if ! sudo make deploy-hw PRESET="$p"; then
         echo "!! $p: deploy-hw FAILED — overlay/driver not loaded"
         RESULT[$p]="DEPLOY-FAIL"
         continue
     fi
 
-    # ⚠️ fclk0 sticks at the previously-loaded rate across overlay reloads, so a build
-    # constrained at one rung can silently RUN at another. All three presets are 250 here,
-    # but print it: a mismatch invalidates the timing claim the gate is meant to support.
+    # fclk0 sticks across overlay reloads, so print it: a mismatch invalidates the timing claim.
     if [ -r /sys/class/fclk/fclk0/set_rate ]; then
         echo "--- fclk0: $(cat /sys/class/fclk/fclk0/set_rate 2>/dev/null || echo '?') Hz (expect 250000000)"
     fi
@@ -77,10 +60,8 @@ for p in "${PRESETS[@]}"; do
 done
 echo
 if [ $rc -eq 0 ]; then
-    echo "ALL PASS — the banked-memory bitstreams are gated. Drop the ⚠️ from the"
-    echo "CLAUDE.md preset table, and re-measure tok/s if you intend to quote it."
+    echo "ALL PASS — every preset gated bit-exact against the CPU reference."
 else
-    echo "SOMETHING FAILED — do NOT ship. The previous (legacy-memory) bundles are the"
-    echo "known-good fallback; 2.7B's 200 MHz rung is the fallback below that."
+    echo "SOMETHING FAILED — do NOT ship these bundles."
 fi
 exit $rc

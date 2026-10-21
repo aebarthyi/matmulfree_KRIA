@@ -1,9 +1,7 @@
 """Systolic-array geometry — Python mirror of mmfree_geom_init (mmfree_runtime.c).
 
-The packed weight byte layout is fully determined by (aWidth, xDim): everything
-else here is derived exactly as the C runtime derives it, so a blob packed with
-this Geometry is byte-identical to what the loaded bitstream consumes. Keep this
-in lockstep with mmfree_runtime.c / CoreConfig.
+Only (aWidth, xDim, packed) are free; everything else is derived exactly as the C
+runtime derives it. Keep in lockstep with mmfree_runtime.c / CoreConfig.
 """
 
 from __future__ import annotations
@@ -134,5 +132,5 @@ class Geometry:
         return padded // self.numPorts
 
 
-# The verified signed-int16 engine (CoreConfig K26_MMFree370M_A16).
+# The signed-int16, xDim=32 engine geometry.
 A16 = Geometry.derive(aWidth=16, xDim=32)

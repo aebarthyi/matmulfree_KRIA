@@ -1,5 +1,3 @@
-// See README.md for license details.
-
 package systolic
 
 import scala.util.Random
@@ -117,9 +115,7 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   /** Generate a random ternary weight from {0, 1, 3} */
   private def randWeight(rng: Random): Int = Seq(0, 1, 3)(rng.nextInt(3))
 
-  // ---------------------------------------------------------------
-  // Deterministic functional tests
-  // ---------------------------------------------------------------
+  // ── Deterministic functional tests ──
 
   "PE(16, 1024) functional tests" - {
     val aWidth = 16
@@ -271,9 +267,7 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ---------------------------------------------------------------
-  // Parameterized aWidth tests
-  // ---------------------------------------------------------------
+  // ── Parameterized aWidth tests ──
 
   "PE with different aWidth configurations" - {
 
@@ -330,9 +324,7 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ---------------------------------------------------------------
-  // Handshake / protocol tests
-  // ---------------------------------------------------------------
+  // ── Handshake / protocol tests ──
 
   "PE handshake protocol" - {
 
@@ -416,9 +408,8 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
           dut.clock.step()
         }
 
-        // Gap right where the final beat is due, with garbage on the bus. The
-        // old PE grabbed the bus contents without a handshake here and finished
-        // one beat early, desyncing the upstream stream.
+        // Gap right where the final beat is due, with garbage on the bus: a PE that
+        // sampled without a handshake would finish one beat early here.
         dut.input.valid.poke(false.B)
         pokeInput(dut, Seq.fill(numLanes)(3), 99, nAcc)
         for (_ <- 0 until 3) {
@@ -453,9 +444,7 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ---------------------------------------------------------------
-  // Back-to-back operations (no reset between)
-  // ---------------------------------------------------------------
+  // ── Back-to-back operations (no reset between) ──
 
   "PE back-to-back operations" - {
 
@@ -532,9 +521,7 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ---------------------------------------------------------------
-  // Signed-activation mode (signedAct = true)
-  // ---------------------------------------------------------------
+  // ── Signed-activation mode (signedAct = true) ──
 
   "PE signed-activation mode" - {
 
@@ -624,9 +611,7 @@ class PESpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
     }
   }
 
-  // ---------------------------------------------------------------
-  // Randomized stress tests
-  // ---------------------------------------------------------------
+  // ── Randomized stress tests ──
 
   "Randomized model comparison" - {
 

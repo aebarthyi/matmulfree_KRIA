@@ -1,18 +1,6 @@
-/* test_readback.c — host check that the THREADED readback writes exactly what the serial
- * one does (no hardware).
- *
- * readback_rows_at partitions (row x column block) across cores when MMFREE_RB_THREADS is
- * set. The arithmetic that decides where each block lands is the risky part: the chunked
- * caller passes the FULL projection's M as acc_stride and the chunk's own first column as
- * col0, so a block that computes its bounds wrong scatters into a neighbouring chunk's
- * columns. That is silent — the values are all plausible int32s, the gate would catch it
- * on-board but only after a bitstream deploy and a several-minute run.
- *
- * So: an INDEPENDENT reference implementation here (not the serial branch of the function
- * under test, which could drift with it), compared element-by-element over the shapes that
- * actually occur, including the chunked ones.
- *
- * It #includes mmfree_lib.c the same way test_split_chunks.c does, to drive the real code.
+/* test_readback.c — host check of readback_rows_at (threaded and serial) against an
+ * independent reference, including chunked (acc_stride, col0) shapes, and that nothing
+ * is written outside each row's window. #includes mmfree_lib.c to drive the real code.
  *
  * Build+run:  cd software/integration/tests && make readback
  */
@@ -22,8 +10,7 @@
 
 static int fails;
 
-/* What the answer must be: sign-extend accWidth bits of each drained lane, row i of the
- * source landing at row i of acc, offset by col0 within a stride of acc_stride. */
+/* Reference: sign-extend accWidth bits; row i lands at acc[i*acc_stride + col0 + m]. */
 static void reference(const uint32_t *src, int32_t *acc, uint32_t b, uint32_t M,
                       uint32_t n_outputs, uint32_t acc_stride, uint32_t col0,
                       uint32_t accWidth) {
@@ -36,9 +23,8 @@ static void reference(const uint32_t *src, int32_t *acc, uint32_t b, uint32_t M,
     }
 }
 
-/* One shape: run the real function, compare against the reference, and verify it wrote
- * NOTHING outside its own [col0, col0+M) window of each row (a block whose upper bound is
- * computed wrong would show up here and nowhere else). */
+/* One shape: compare with the reference and check nothing outside [col0, col0+M) of
+ * each row was written. */
 static void check(uint32_t b, uint32_t M, uint32_t acc_stride, uint32_t col0,
                   uint32_t accWidth, const char *what) {
     const uint32_t n_outputs = M;
@@ -50,8 +36,7 @@ static void check(uint32_t b, uint32_t M, uint32_t acc_stride, uint32_t col0,
     int32_t  *want = malloc(nacc * sizeof(int32_t));
     if (!src || !got || !want) { printf("  FAIL: alloc\n"); fails++; return; }
 
-    /* High bits deliberately dirty: the drained lane carries garbage above accWidth, and
-     * the shift pair is what discards it. Values that were clean would not test that. */
+    /* Dirty high bits, which the sign extension must discard. */
     for (size_t i = 0; i < nsrc; i++) src[i] = (uint32_t)(i * 2654435761u) ^ 0xF0000000u;
 
     const int32_t canary = (int32_t)0xDEADBEEF;
@@ -91,14 +76,8 @@ static void check(uint32_t b, uint32_t M, uint32_t acc_stride, uint32_t col0,
 }
 
 int main(void) {
-    /* Force the threaded path on, and the threshold low enough that even the small shapes
-     * take it — otherwise this test would only ever exercise the serial branch and pass for
-     * the wrong reason.
-     *
-     * overwrite=0, NOT 1: the caller has to be able to override these, or `make readback`'s
-     * second arm (MMFREE_RB_THREADS=1, checking the serial fallback is also correct) would
-     * be silently overridden back to 4 and re-run the identical test twice. It did exactly
-     * that when this was setenv(..., 1) — a check that could not fail. */
+    /* Force the threaded path for every shape. overwrite=0 so `make readback`'s
+     * MMFREE_RB_THREADS=1 arm still gets the serial path. */
     setenv("MMFREE_RB_THREADS", "4", 0);
     setenv("MMFREE_RB_MIN_ELEMS", "1", 0);
 
@@ -110,16 +89,13 @@ int main(void) {
     printf("  (build with -fopenmp; this run only checks the serial branch)\n");
 #endif
 
-    /* Whole-projection case: acc_stride == M, col0 == 0. Real M values across the three
-     * models, and every batch the shipped and candidate bitstreams support. */
+    /* Whole-projection case: acc_stride == M, col0 == 0. */
     const uint32_t Ms[] = {1, 7, 512, 1024, 2816, 8192, 32000};
     for (uint32_t b = 1; b <= 8; b++)
         for (size_t i = 0; i < sizeof(Ms) / sizeof(*Ms); i++)
             check(b, Ms[i], Ms[i], 0, 28, "whole projection");
 
-    /* Chunked case: the caller passes the FULL M as the stride and the chunk's first column
-     * as col0, so chunks scatter into one shared [b][M] accumulator. Walk a 4- and an
-     * 8-chunk ladder over an lm_head-sized projection and a hidden-sized one. */
+    /* Chunked case: full M as the stride, the chunk's first column as col0. */
     const uint32_t fullM[] = {2816, 32000};
     const uint32_t nchunks[] = {4, 8};
     for (size_t f = 0; f < 2; f++) {
@@ -136,8 +112,7 @@ int main(void) {
         }
     }
 
-    /* accWidth is a geometry parameter, not a constant — check the sign extension at the
-     * other widths a preset could carry, including the no-op 32. */
+    /* Other accWidth values, including the no-op 32. */
     for (uint32_t w = 16; w <= 32; w += 4)
         for (uint32_t b = 1; b <= 6; b += 5)
             check(b, 2816, 2816, 0, w, "accWidth variant");

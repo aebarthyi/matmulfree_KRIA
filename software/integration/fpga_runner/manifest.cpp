@@ -30,8 +30,8 @@ Manifest read_manifest_tsv(const std::string& path) {
   while (std::getline(f, line)) {
     if (line.empty()) continue;
     if (line[0] == '#') {
-      // Metadata comment: "# total_bytes_per_port=<n> numPorts=<n>". Tolerate the
-      // pure header-comment line ("# name\tbyte_offset\t...") by ignoring misses.
+      // "# total_bytes_per_port=<n> numPorts=<n> weight_format=<fmt>"; other comment
+      // lines (the column header) simply match nothing.
       auto grab = [&](const char* key, uint64_t& out) {
         std::size_t k = line.find(key);
         if (k != std::string::npos) out = std::strtoull(line.c_str() + k + std::string(key).size(), nullptr, 10);
@@ -41,7 +41,6 @@ Manifest read_manifest_tsv(const std::string& path) {
       grab("numPorts=", np);
       man.total_bytes_per_port = tbp;
       man.num_ports = static_cast<uint32_t>(np);
-      // weight_format=<token> (blob packing format; cross-checked against the bitstream).
       std::size_t k = line.find("weight_format=");
       if (k != std::string::npos) {
         std::istringstream ws(line.substr(k + std::string("weight_format=").size()));

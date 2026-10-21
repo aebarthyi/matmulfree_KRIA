@@ -1,7 +1,7 @@
-"""Offline weight packer (Phase B).
+"""Offline weight packer.
 
-Turns each BitLinear weight matrix into the engine's col-tile-major, 2-bit,
-per-port byte layout — byte-identical to bench.c's pack loop — plus the scale
+Turns each BitLinear weight matrix into the engine's col-tile-major per-port byte
+layout (2-bit, byte-identical to bench.c's pack loop, or 1.6-bit) plus the scale
 `s` the runtime needs to dequantize. Pure numpy: no torch, no board.
 
 Numeric contract:
@@ -45,12 +45,9 @@ def codes_to_2bit(codes_MN: np.ndarray) -> np.ndarray:
     return (wt & 0x3).astype(np.uint8)
 
 
-# ── 1.6-bit packing (5 trits/byte) — mirrors systolic.TernaryPack ────────────
-#
-# When the loaded bitstream is built with packedWeights=true (an on-chip
-# WeightUnpackGearbox), weights stream at 1.6 bits/trit instead of 2: five
-# ternary digits pack into one byte in base 3 (3^5 = 243 <= 256), a flat 20%
-# fewer weight bytes on the DDR/HP-port wire (the decode bandwidth wall).
+# ---- 1.6-bit packing (5 trits/byte), mirrors systolic.TernaryPack ----
+# For packedWeights=true bitstreams (on-chip WeightUnpackGearbox): five trits per
+# byte in base 3 (3^5 = 243 <= 256).
 #
 # Digit convention (packer and hardware MUST agree — see WeightUnpack.scala):
 #   logical trit  ->  base-3 digit  ->  PE code
@@ -59,12 +56,10 @@ def codes_to_2bit(codes_MN: np.ndarray) -> np.ndarray:
 #       -1 (sub)           2               3
 # Byte value = d0 + 3*d1 + 9*d2 + 27*d3 + 81*d4, trit i at digit i (LSB-first).
 #
-# The gearbox reads the WHOLE assembled wire beat as a flat little-endian byte
-# stream (byte 0 = s_axis bits[7:0]) and regroups the trits into native
-# outLanesPerTile-wide weight beats. With port 0 carrying the LSBs of the beat
-# (CoreTop: Cat(ports.reverse)), flat byte b lives in port b//portBytes — so the
-# per-port blobs here are the wire beats sliced portBytes-at-a-time, NOT the
-# 2-bit path's per-port lane split.
+# The gearbox reads the whole wire beat as a flat little-endian byte stream
+# (byte 0 = s_axis bits[7:0]). Port 0 carries the beat LSBs, so flat byte b lives
+# in port b//portBytes: per-port blobs are wire beats sliced portBytes at a time,
+# NOT the 2-bit path's per-port lane split.
 
 TRITS_PER_BYTE = 5
 _POW3 = (3 ** np.arange(TRITS_PER_BYTE)).astype(np.uint16)  # [1,3,9,27,81]
@@ -160,9 +155,8 @@ class ProjEntry:
 class WeightPacker:
     """Accumulates projections into `numPorts` resident blobs + a manifest.
 
-    Weights are loaded into resident udmabufs once (Phase C); each projection
-    sits at its `byte_offset` and is never re-copied — COMPUTE_MM just points at
-    the offset. All ports share the same offsets (identical per-port structure).
+    Each projection sits at its `byte_offset` in the resident blobs; all ports
+    share the same offsets.
     """
 
     def __init__(self, geom: Geometry):
@@ -177,11 +171,7 @@ class WeightPacker:
         return self.add_quantized(name, codes, s)
 
     def add_quantized(self, name: str, codes_MN: np.ndarray, s: float) -> ProjEntry:
-        """Pack an already-quantized (M,N) ternary projection (codes in {-1,0,1}).
-
-        Lets a caller that needs the codes anyway (e.g. the bridge's reference
-        backend) quantize once and reuse them for both packing and simulation.
-        """
+        """Pack an already-quantized (M,N) ternary projection (codes in {-1,0,1})."""
         M, N = codes_MN.shape
         ports = (pack_projection_packed(codes_MN, self.geom) if self.geom.packed
                  else pack_projection(codes_MN, self.geom))
@@ -205,9 +195,7 @@ class WeightPacker:
 
     def manifest(self) -> Dict:
         return {
-            # Weight-blob format tag — the runtime/runner MUST reject a blob whose
-            # format disagrees with the loaded bitstream's packedWeights, else a
-            # 1.6-bit blob fed to a 2-bit engine (or vice versa) is silent garbage.
+            # The runner rejects a blob whose format disagrees with the bitstream.
             "weight_format": "ternary-1p6" if self.geom.packed else "ternary-2bit",
             "geometry": {
                 "aWidth": self.geom.aWidth, "xDim": self.geom.xDim,
@@ -223,9 +211,7 @@ class WeightPacker:
     def write(self, out_dir: str | Path, prefix: str = "weights") -> Dict:
         """Emit `<prefix>.port{p}.bin` blobs + `<prefix>.manifest.json` (+ `.tsv`).
 
-        The `.tsv` sidecar is the same projection table in a tab-separated form the
-        C++ FPGA runner parses without a JSON dependency; it is generated from the
-        same data as the JSON, so the two can't drift.
+        The `.tsv` sidecar is the same table for the C++ runner (no JSON dependency).
         """
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
@@ -241,8 +227,8 @@ class WeightPacker:
     def _manifest_tsv(self) -> str:
         """Tab-separated projection table for the C++ runner (see write()).
 
-        First line is geometry metadata (`# total_bytes_per_port=<n> numPorts=<n>`),
-        then a header comment, then one row per projection. Columns:
+        First line is metadata (`# total_bytes_per_port=<n> numPorts=<n>
+        weight_format=<fmt>`), then a header comment, then one row per projection:
             name  byte_offset  N  M  n_outputs  s
         """
         fmt = "ternary-1p6" if self.geom.packed else "ternary-2bit"

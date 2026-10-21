@@ -4,14 +4,8 @@ import chisel3._
 import chisel3.util._
 
 /**
-  * 1.6-bit ternary weight packing (5 trits per byte) + the on-chip unpack.
-  *
-  * Ternary weights carry log2(3) = 1.585 bits of information; today the engine
-  * streams them at 2 bits/trit (the PE code {0=hold, 1=+act, 3=-act}). Since
-  * 3^5 = 243 <= 256, five trits fit in one byte via a base-3 digit encoding —
-  * 8/5 = 1.600 bits/trit, 99.1% of the information floor, a flat 20% fewer
-  * weight bytes than the 2-bit format. Weights are the DDR/HP-port-bandwidth
-  * wall on decode, so those bytes convert (nearly) 1:1 to streaming time.
+  * 1.6-bit ternary weight packing: since 3^5 = 243 <= 256, five trits fit in one
+  * byte as base-3 digits (20% fewer weight bytes than the 2-bit PE code).
   *
   * Digit convention (packer and hardware MUST agree):
   *   logical trit  ->  base-3 digit  ->  PE code
@@ -59,18 +53,11 @@ object TernaryPack {
 }
 
 /**
-  * Streaming unpacker: a packed byte stream in, fixed-width weight beats out.
-  *
-  * `inWidthBits` bits (= inWidthBits/8 bytes = that x5 trits) arrive per input
-  * beat; `outLanes` 2-bit weights leave per output beat. Because 5 (trits/byte)
-  * does not divide `outLanes`, an elastic trit buffer bridges the two rates: it
-  * regroups whatever trits arrive into full `outLanes`-wide beats and carries the
-  * fractional remainder across input beats. This is what lets DRAM hold densely
-  * packed 1.6-bit weights (no per-beat padding, so the 20% saving is real on the
-  * wire) while the array still sees its native fixed-width weight beats.
-  *
-  * Standard Decoupled elastic buffer: capacity = outLanes + inTrits guarantees a
-  * beat is always acceptable whenever it cannot be drained, so no deadlock.
+  * Streaming unpacker: dense packed bytes in (inWidthBits/8 * 5 trits per beat),
+  * `outLanes` 2-bit weights out per beat. An elastic trit buffer regroups the input
+  * into full output beats and carries the remainder across input beats, so the
+  * packed stream needs no per-beat padding. Capacity = outLanes + inTrits guarantees
+  * an input beat is acceptable whenever no output can drain, so it cannot deadlock.
   */
 class WeightUnpackGearbox(val inWidthBits: Int, val outLanes: Int) extends Module {
   require(inWidthBits % 8 == 0, s"inWidthBits=$inWidthBits must be a byte multiple")
@@ -84,9 +71,8 @@ class WeightUnpackGearbox(val inWidthBits: Int, val outLanes: Int) extends Modul
   val io = IO(new Bundle {
     val in  = Flipped(Decoupled(UInt(inWidthBits.W)))
     val out = Decoupled(Vec(outLanes, UInt(2.W)))
-    // Synchronously drop all buffered trits. One dense packed stream per matmul may
-    // leave 1..4 padding trits in the buffer after its last full beat; pulse flush
-    // between streams so they never bleed into the next stream's first beat.
+    // Drop all buffered trits. A stream may leave padding trits after its last full
+    // beat; flush between streams so they never bleed into the next one.
     val flush = Input(Bool())
   })
 

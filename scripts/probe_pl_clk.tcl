@@ -1,27 +1,16 @@
 # scripts/probe_pl_clk.tcl — what does PL_CLK_MHZ actually CONSTRAIN?
 #
-# PL0_REF (pl_clk0, the fabric clock) only exists on the discrete rungs the PS
-# clock tree can synthesise. `PL_CLK_MHZ=230` therefore does NOT mean the design
-# is timed at 230 MHz: the zynq_ultra_ps_e IP recomputes ACT_FREQMHZ and every
-# setup path is timed against THAT. Nothing read it back until 2026-08-04, which
-# is why a "230 MHz" build's WNS was a number against an unknown period, and why
-# the 225 and 230 presets came out byte-identical.
-#
-# This answers it WITHOUT a 40-minute implementation run: build the real block
-# design once, then set FREQMHZ across a list of candidates and read ACT_FREQMHZ
-# back. Minutes, and it produces the whole rung table rather than one data point.
+# PL0_REF only exists on discrete rungs: the zynq_ultra_ps_e IP recomputes ACT_FREQMHZ and every
+# setup path is timed against that, not the request. This builds the real block design once and
+# reads ACT_FREQMHZ back per candidate -- the whole rung table in minutes, no implementation run.
 #
 #   vivado -mode batch -nojournal -notrace -source scripts/probe_pl_clk.tcl \
 #          -tclargs <ip_repo> [mhz ...]
 #
-#     ip_repo   a packaged CoreTop IP dir (generated/<preset>) — any preset will
-#               do, the PS clock tree does not depend on CoreTop
-#     mhz ...   candidate requests (default: the values this repo has shipped
-#               plus the rungs 1000/N and 1500/N would predict)
+#     ip_repo   a packaged CoreTop IP dir (generated/<preset>); any preset will do
+#     mhz ...   candidate requests (default: a spread of values from 100 to 300)
 #
-# NOTE the board is a SEPARATE question: fclk0's achievable rates come from
-# whatever the FSBL programmed, so Vivado's rung table and the board's need not
-# agree. deploy_kria.sh measures the board side; this measures the STA side.
+# STA side only: the board's achievable fclk0 rates can differ (deploy_kria.sh checks those).
 
 set script_dir [file dirname [file normalize [info script]]]
 set repo_root  [file dirname $script_dir]
@@ -48,10 +37,7 @@ catch { set_property board_part $board_part [current_project] }
 set_property ip_repo_paths [list $ip_repo] [current_project]
 update_ip_catalog -rebuild
 
-# Source the real bd.tcl so the PS is configured EXACTLY as a build configures it
-# (the rung table depends on the PLL/divisor config, so a hand-rolled PS would be
-# a different experiment). PL_CLK_MHZ is left at its default here; the sweep below
-# drives the property directly.
+# Source the real bd.tcl so the PS (hence the rung table) is configured exactly as in a build.
 if {[info exists ::env(PL_CLK_MHZ)]} { unset ::env(PL_CLK_MHZ) }
 puts "==> building block design (once) from vivado/bd.tcl"
 source [file join $repo_root vivado bd.tcl]

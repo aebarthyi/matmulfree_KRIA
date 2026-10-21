@@ -1,8 +1,5 @@
-// manifest.hpp — read the packer's <prefix>.manifest.tsv (Phase B output).
-//
-// The TSV sidecar (mmfree_pack/packer.py write()) lists every packed projection so
-// the runner can register each at its resident byte offset and map the C++ projection
-// tag -> engine proj_id. TSV (not JSON) keeps the runner dependency-free.
+// manifest.hpp — read <prefix>.manifest.tsv (written by mmfree_pack/packer.py): every
+// packed projection's resident byte offset and shape, keyed by C++ projection tag.
 #pragma once
 
 #include <cstdint>

@@ -1,47 +1,23 @@
 /*
- * bench.c — Ternary matmul benchmark sweep for the mmfree Core on KRIA.
+ * bench.c — ternary matmul benchmark sweep for the mmfree Core on KRIA.
  *
- * Sweep modes (MMFREE_SHAPES env, else the compiled-in default):
- *   pow2          : power-of-two N x M cross sweep within maxN / maxM (legacy)
- *   370m|1.3b|2.7b: every distinct projection of that MMfreeLM checkpoint
- *                   (i/f/g/o_proj, fused gate_up, down_proj, lm_head), plus a
- *                   per-token cost summary and compute-phase efficiency vs the
- *                   HP-port stream peak (MMFREE_CLK_MHZ, default 100, sets it).
- *   <arbitrary>   : set MMFREE_HIDDEN / MMFREE_INTER / MMFREE_VOCAB /
- *                   MMFREE_LAYERS to sweep any MMfreeLM-shaped model.
+ *   bench <core_phys> <dma_phys> <uio_dev> <udmabuf_act> <udmabuf_wt> <udmabuf_out>
  *
- * For each shape:
- *   1. Pack random activations + ternary weights into the prepared udmabuf
- *      buffers.
- *   2. LOAD_ACT, COMPUTE_MM, STORE_OUT — each timed end-to-end via
- *      clock_gettime(CLOCK_MONOTONIC_RAW).
- *   3. Verify against a tiny reference matmul on the host CPU (optional —
- *      controlled by MMFREE_VERIFY=1).
- *   4. Emit one result row per shape: aligned table on a terminal, CSV when
- *      piped/redirected (force with MMFREE_CSV=1/0).
+ * Sweep (MMFREE_SHAPES): pow2 = power-of-two N x M cross sweep within maxN/maxM;
+ * 370m|1.3b|2.7b = every distinct projection of that checkpoint plus a per-token
+ * rollup; any other name with MMFREE_HIDDEN/INTER/VOCAB/LAYERS = a custom model.
+ * Each shape is packed with random data, run LOAD/COMPUTE/STORE (best of
+ * MMFREE_REPS), optionally verified against a host reference (MMFREE_VERIFY, default
+ * on), and printed as a table on a tty or CSV otherwise (MMFREE_CSV=1/0 forces).
  *
- * Physical addresses + UIO node are passed as CLI args so this binary can move
- * between board configurations without recompiling:
- *
- *   bench  <core_phys> <dma_phys> <uio_dev> <udmabuf_act> <udmabuf_wt> <udmabuf_out>
- *
- * Example (matches the bring-up guide's recommended addr map):
- *   bench  0xA0010000 0xA0000000  /dev/uio0  /dev/udmabuf0 /dev/udmabuf1 /dev/udmabuf2
- *
- * Multi-HP-port geometries (xDim*aWidth > 128, i.e. xDim 32 or 64 at aWidth 16) split the
- * input stream across N DMAs/buffers. The CLI args stay base values: DMA i
- * defaults to 0xA0020000 + (i-1)*0x10000 (the bd.tcl map) and the act/wt
- * udmabuf paths get an index appended (/dev/udmabuf-wt -> /dev/udmabuf-wt0,
- * -wt1, ... — the names gen_overlay.tcl emits for N>1). Override per port
- * with MMFREE_DMA<i> / MMFREE_ACT<i> / MMFREE_WT<i> env vars. N==1 keeps the
- * exact legacy invocation. N itself comes from the geometry, like the RTL.
- *
- * No PetaLinux dependencies — just a stock Ubuntu-on-KRIA rootfs with the
- * `u-dma-buf` module loaded and a UIO binding for the Core's IRQ.
+ * Geometry comes from MMFREE_AWIDTH/XDIM/MAXACC/MAXN/MAXM/BATCH/SIGNED and must
+ * match the loaded bitstream. For numPorts > 1, DMA i defaults to
+ * 0xA0020000 + (i-1)*0x10000 and the act/wt paths get the port index appended
+ * (/dev/udmabuf-wt -> /dev/udmabuf-wt0, ...); MMFREE_DMA<i> / MMFREE_ACT<i> /
+ * MMFREE_WT<i> override per port.
  */
 
 #define _GNU_SOURCE
-#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -52,15 +28,7 @@
 
 #include "mmfree_runtime.h"
 
-/* ---------- default geometry (overridable at runtime) ----------
- * The geometry is now resolved at runtime into an mmfree_geom_t (env vars
- * MMFREE_AWIDTH / MMFREE_XDIM / MMFREE_MAXACC / MMFREE_MAXN / MMFREE_MAXM), so
- * one binary adapts to any array size without recompiling. These -D values are
- * only the defaults when the corresponding env var is unset. (Nothing in the tree
- * passes -DBENCH_* any more — the board Makefile exports the MMFREE_* vars from the
- * preset manifest instead, which is the path every real run takes.) The resolved
- * geometry MUST match the loaded bitstream's CoreConfig
- * (a mismatch wedges the core — caught by the completion timeout). */
+/* ---------- defaults when the MMFREE_* env var is unset ---------- */
 #ifndef BENCH_AWIDTH
 #define BENCH_AWIDTH        16
 #endif
@@ -77,50 +45,29 @@
 #define BENCH_MAX_M         1024
 #endif
 
-/* Default sweep mode: a build for a model preset compiles in that model's projection
- * sweep; everything else keeps the pow2 cross sweep. MMFREE_SHAPES
- * (="pow2" | "370m" | "1.3b" | "2.7b") overrides at runtime, and the board Makefile
- * sets it from the preset manifest's MMFREE_SHAPES. */
 #ifdef BENCH_SHAPES_370M
 #define BENCH_SHAPES_DEFAULT "370m"
 #else
 #define BENCH_SHAPES_DEFAULT "pow2"
 #endif
 
-/* Signed-activation default: the aWidth=16 signed preset compiles BENCH_SIGNED=1.
- * MMFREE_SIGNED=0/1 overrides at runtime. MUST match the bitstream's signedAct. */
 #ifdef BENCH_SIGNED
 #define BENCH_SIGNED_DEFAULT 1
 #else
 #define BENCH_SIGNED_DEFAULT 0
 #endif
 
-/* PL clock the bitstream was built with — sets the eff%% column's bandwidth
- * ceiling. Per-preset via the manifest's PL_CLK_MHZ (250 for the shipped presets since the
- * 2026-06 PL_CLK_MHZ bump); MMFREE_CLK_MHZ overrides at runtime. */
+/* PL clock (MMFREE_CLK_MHZ) — sets the stream-peak ceiling for the eff column. */
 #ifndef BENCH_CLK_MHZ
 #define BENCH_CLK_MHZ       100
 #endif
 
 /* ---------- helpers ---------- */
 
-/* Output mode: CSV when piped/redirected (e.g. `| tee bench.csv`), aligned
- * table on a terminal. Override with MMFREE_CSV=1 (force CSV) or =0 (table). */
-static int g_csv;
-
-/* Theoretical weight-stream peak: numPorts x portBytes x PL clock. This is the
- * ceiling for cmp_GBps — the eff%% column reports how close each shape gets. */
-static double g_peak_gbps;
-
-/* Signed activations: set for the aWidth=16 signed preset (BENCH_SIGNED compile
- * default, MMFREE_SIGNED env override). The loaded bitstream's CoreConfig must
- * have signedAct=true or results mismatch on negative activations. */
-static int g_signed;
-
-/* Batch size = CoreConfig.batchSize of the loaded bitstream (MMFREE_BATCH env).
- * The engine runs B activation vectors through one weight stream, so a batched
- * bench reports ~B x the GOPS of B=1 at the same weight bandwidth. 1 = unbatched. */
-static int g_batch = 1;
+static int g_csv;              /* CSV rows instead of the aligned table */
+static double g_peak_gbps;     /* weight-stream peak: numPorts x portBytes x clock */
+static int g_signed;           /* signed activations; must match bitstream signedAct */
+static int g_batch = 1;        /* CoreConfig.batchSize of the loaded bitstream */
 
 static double now_us(void) {
     struct timespec ts;
@@ -129,19 +76,16 @@ static double now_us(void) {
 }
 
 static uint64_t next_rand(uint64_t *s) {
-    /* xorshift64* — small and fast, deterministic per-shape. */
+    /* xorshift64* */
     uint64_t x = *s;
     x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
     *s = x;
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-/* Pack 2-bit ternary weights {0, 1, 3} into one s_axis beat of `nbytes` bytes,
- * 4 lanes per byte. Lane l sits at bit l*2, matching Chisel's Core.scala:
- * weightVec(i) = s_axis.tdata((i+1)*2-1, i*2). Written byte-wise straight into
- * the (volatile, Device-memory) udmabuf — every byte of the beat is written so
- * there is no stale padding. There are exactly nbytes*4 = outLanesPerTile lanes
- * per beat, so the whole beat is meaningful weight data. */
+/* Pack 2-bit ternary codes {0,1,3} into `nbytes` bytes, 4 lanes per byte, lane l
+ * at bit 2l (Core.scala: weightVec(i) = tdata((i+1)*2-1, i*2)). Byte stores are
+ * safe on the Device-memory udmabuf. */
 static inline void pack_weights(const uint8_t *lanes /* outLanesPerTile vals in {0,1,3} */,
                                 volatile uint8_t *dst, uint32_t nbytes) {
     for (uint32_t b = 0; b < nbytes; b++) {
@@ -154,21 +98,17 @@ static inline void pack_weights(const uint8_t *lanes /* outLanesPerTile vals in 
     }
 }
 
-/* Write one activation beat of `nbytes`: the activation occupies the low
- * `abytes` (= aWidth/8) bytes little-endian, the rest of the port slice is
- * zeroed. `value` is written as two's complement, so signed activations (the
- * aWidth=16 signed preset) land correctly; for the small positive values the
- * unsigned presets use, this is identical to the old single-byte write. */
+/* One activation beat: `value` (two's complement, little-endian) in the low
+ * `abytes` bytes, the rest of the port slice zeroed. */
 static inline void write_act_beat(volatile uint8_t *dst, uint32_t value,
                                   uint32_t abytes, uint32_t nbytes) {
     for (uint32_t b = 0; b < nbytes; b++)
         dst[b] = (b < abytes) ? (uint8_t)((value >> (b * 8)) & 0xFFu) : 0u;
 }
 
-/* Write one batched activation beat: `batch` values, value r in bytes
- * [r*abytes, (r+1)*abytes) little-endian two's complement, the rest zeroed.
- * Mirrors Core.scala sLoad's per-row unpack (row r = tdata[(r+1)*aWidth-1:r*aWidth]).
- * Requires batch*abytes <= nbytes (holds for batch <= xDim). */
+/* One batched activation beat: value r in bytes [r*abytes, (r+1)*abytes), the rest
+ * zeroed (Core.scala sLoad: row r = tdata[(r+1)*aWidth-1 : r*aWidth]).
+ * Requires batch*abytes <= nbytes. */
 static inline void write_act_beat_batch(volatile uint8_t *dst, const int32_t *vals,
                                         uint32_t batch, uint32_t abytes, uint32_t nbytes) {
     for (uint32_t r = 0; r < batch; r++) {
@@ -179,9 +119,7 @@ static inline void write_act_beat_batch(volatile uint8_t *dst, const int32_t *va
     for (uint32_t k = batch * abytes; k < nbytes; k++) dst[k] = 0u;
 }
 
-/* Sign-extend an `accWidth`-bit accumulator that arrives right-aligned in an
- * outLaneWidth-bit container. Returns it as a signed 64-bit value (handles
- * accWidth up to 63). */
+/* Sign-extend a right-aligned `accWidth`-bit accumulator from its output lane. */
 static inline int64_t expand_acc(uint64_t raw, uint32_t accWidth) {
     uint64_t mask = (accWidth >= 64) ? ~0ull : ((1ull << accWidth) - 1u);
     uint64_t sign = 1ull << (accWidth - 1u);
@@ -189,15 +127,12 @@ static inline int64_t expand_acc(uint64_t raw, uint32_t accWidth) {
     return (int64_t)((raw ^ sign) - sign);
 }
 
-/* Decimal digit count, for auto-sizing the N/M table columns. */
 static int ndigits(uint32_t x) {
     int n = 1;
     while (x >= 10u) { x /= 10u; n++; }
     return n;
 }
 
-/* Read an environment variable as uint32, falling back to `dflt` when unset
- * or empty. Accepts 0x.. hex and decimal. */
 static uint32_t env_u32(const char *name, uint32_t dflt) {
     const char *e = getenv(name);
     if (!e || !*e) return dflt;
@@ -210,9 +145,8 @@ static uint64_t env_u64(const char *name, uint64_t dflt) {
     return strtoull(e, NULL, 0);
 }
 
-/* Resolve the device path for port `i` of a multi-port resource: the
- * MMFREE_<PFX><i> env var wins, else `<base><i>` (matching gen_overlay.tcl's
- * udmabuf-act0/-wt0/... node names). Only used when numPorts > 1. */
+/* Device path for port `i`: MMFREE_<PFX><i> if set, else `<base><i>` (the
+ * gen_overlay.tcl node names). Only used when numPorts > 1. */
 static const char *port_dev_path(char *out, size_t outsz, const char *base,
                                  uint32_t i, const char *env_prefix) {
     char env_name[32];
@@ -223,9 +157,8 @@ static const char *port_dev_path(char *out, size_t outsz, const char *base,
     return out;
 }
 
-/* Open a udmabuf and verify it is big enough. mmfree_buf_open silently clamps
- * the mapping to the node's real size, so an undersized device-tree node would
- * otherwise SIGBUS halfway through a weight fill instead of failing here. */
+/* Open a udmabuf and fail if it is smaller than `need` (mmfree_buf_open clamps
+ * silently, and an undersized node would SIGBUS mid-fill). */
 static int buf_open_checked(mmfree_buf_t *b, const char *path, size_t need) {
     if (mmfree_buf_open(b, path, need, /*cached=*/0) < 0) return -1;
     if (b->size < need) {
@@ -237,7 +170,6 @@ static int buf_open_checked(mmfree_buf_t *b, const char *path, size_t need) {
     return 0;
 }
 
-/* Reference matmul on the host CPU. Slow but only used on verify. */
 static void ref_matmul(const int32_t *act,       /* len N (signed) */
                        const int8_t *wt,         /* shape (N, M) row-major, vals {-1,0,+1} */
                        int32_t      *out,        /* len M */
@@ -260,17 +192,9 @@ typedef struct {
     uint32_t    count;  /* instances per forward pass (token); 0 = n/a */
 } bench_shape_t;
 
-/* MMfreeLM architecture table. The per-token BitLinear shapes are fully
- * determined by (hidden H, GLU intermediate I, vocab V, layers L):
- *   i/f/g/o_proj : H x H        (4 per layer x L layers)
- *   gate_up      : H x 2I       (fused gate+up)
- *   down_proj    : I x H        (L per pass)
- *   lm_head      : H x V        (vocab; untied from the embedding)
- * Every M is a multiple of the a16 geometry's 256-lane col tile (H,2I,V all
- * 256-aligned for these checkpoints), so no shape carries padding lanes.
- * Values are the released ridger/MMfreeLM checkpoints (vocab=32000). Select at
- * runtime with MMFREE_SHAPES=370m|1.3b|2.7b, or override an arbitrary model with
- * MMFREE_HIDDEN / MMFREE_INTER / MMFREE_VOCAB / MMFREE_LAYERS. */
+/* MMfreeLM per-token BitLinear shapes from (hidden H, GLU intermediate I, vocab V,
+ * layers L): i/f/g/o_proj H x H (4L), gate_up H x 2I (L), down_proj I x H (L),
+ * lm_head H x V (1). Values are the released ridger/MMfreeLM checkpoints. */
 typedef struct {
     const char *name;
     uint32_t    hidden, inter, vocab, layers;
@@ -310,34 +234,29 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
     const uint32_t N = sh->N, M = sh->M;
     const char *name = sh->name ? sh->name : "-";
 
-    /* Generate activations. Unsigned mode: small 0..15 (legacy bring-up).
-     * Signed mode (g_signed, the aWidth=16 signed preset): a signed range that
-     * exercises sign-extension, kept modest so the accumulator can't overflow
-     * even at large N. Stored as int32 so the same array serves int8/int16. */
+    /* Random activations: 0..15 unsigned, or [-2048,2047] signed (exercises sign
+     * extension without overflowing the accumulator at large N). */
     const uint32_t abytes = g->aWidth / 8u;          /* activation bytes/beat */
-    const uint32_t B = g->batch ? g->batch : 1u;     /* activation vectors / weight stream */
+    const uint32_t B = g->batch ? g->batch : 1u;
     int32_t *act_int = malloc((size_t)B * N * sizeof(int32_t));   /* [B][N], row-major */
     int8_t  *wt_int  = NULL;
     int32_t *ref_out = NULL;
-    uint8_t *lanes   = malloc(g->outLanesPerTile);  /* one col-tile of codes */
+    uint8_t *lanes   = malloc(g->outLanesPerTile);
     if (verify) {
-        wt_int  = malloc((size_t)N * M);             /* shared across batch (broadcast) */
+        wt_int  = malloc((size_t)N * M);
         ref_out = malloc((size_t)B * M * sizeof(int32_t));        /* [B][M] */
     }
 
     uint64_t rng = seed;
 
-    /* Fill activation udmabuf (port 0 only — ports 1..P-1 were zero-filled once
-     * at startup). For batch B, each beat carries B activations packed into the
-     * low B*abytes bytes of port 0's slice (B fits for B<=8 at aWidth=16); the
-     * activation for vector r sits at byte r*abytes (matching Core.scala sLoad).
-     * Byte stores are fine on Device memory (only glibc memset's dc-zva SIGBUSes). */
+    /* Fill port 0's activation slices (ports 1..P-1 were zeroed at startup); vector
+     * r sits at byte r*abytes of each beat. */
     volatile uint8_t *act_dma = (volatile uint8_t *)bs->act_buf[0].vaddr;
     for (uint32_t r = 0; r < B; r++)
         for (uint32_t i = 0; i < N; i++)
             act_int[(size_t)r * N + i] =
-                g_signed ? ((int32_t)(next_rand(&rng) % 4096u) - 2048)  /* [-2048,2047] */
-                         : (int32_t)(next_rand(&rng) & 0xFu);           /* 0..15 */
+                g_signed ? ((int32_t)(next_rand(&rng) % 4096u) - 2048)
+                         : (int32_t)(next_rand(&rng) & 0xFu);
     {
         int32_t vals[64];   /* B <= xDim <= 64 */
         for (uint32_t i = 0; i < N; i++) {
@@ -346,14 +265,10 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
         }
     }
 
-    /* Fill weight udmabufs. Layout MUST match Core.scala's COMPUTE_MM
-     * consumption order: col-tile-major. Core processes one col tile at a
-     * time, streaming N s_axis beats per tile, so each buffer is laid out as
+    /* Weights are col-tile-major, the order COMPUTE_MM consumes them (NOT row-major):
      *   [t=0, n=0..N-1], [t=1, n=0..N-1], ..., [t=T-1, n=0..N-1]
-     * Each wide beat packs outLanesPerTile ternary codes (2 bits each); lane l
-     * (LSB-first) corresponds to output column m = t * outLanesPerTile + l.
-     * Port p's buffer carries lanes [p*lanes_per_port, (p+1)*lanes_per_port)
-     * — the CoreTop join Cats port 0 into the least-significant bits. */
+     * Lane l of a beat is output column t*outLanesPerTile + l. Port p carries lanes
+     * [p*lanes_per_port, (p+1)*lanes_per_port); CoreTop puts port 0 in the LSBs. */
     uint32_t num_col_tiles = (M + g->outLanesPerTile - 1) / g->outLanesPerTile;
     uint32_t lanes_per_port = g->outLanesPerTile / g->numPorts;
     volatile uint8_t *wt_dma[MMFREE_MAX_DMA];
@@ -367,13 +282,11 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
                 uint8_t code = 0;
                 if (m < M) {
                     uint64_t r = next_rand(&rng) & 0x3u;
-                    /* {0:hold(0), 1:+1, 2:hold(0), 3:-1} → ternary set */
+                    /* code -> value: 0:0, 1:+1, 2:0 (hold), 3:-1 */
                     static const uint8_t  c_map[4] = { 0, 1, 0, 3 };
                     static const int8_t   v_map[4] = { 0, 1, 0, -1 };
                     code = c_map[r];
-                    /* wt_int is N*M — padding lanes (m >= M) must not write
-                     * it. Possible since bench32/64: sweep shapes can be
-                     * smaller than one col tile (M=64 < 128/256 lanes). */
+                    /* Padding lanes (m >= M) must not index wt_int. */
                     if (verify) wt_int[(size_t)n * M + m] = v_map[r];
                 }
                 lanes[lane] = code;
@@ -386,14 +299,11 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
         }
     }
 
-    /* Run + time. Short phases carry tens of µs of IRQ/scheduler jitter per
-     * shot (observed swinging short-op totals 2-3x between runs), so each
-     * shape runs MMFREE_REPS times and the best COHERENT run (min total, with
-     * its own phase split) is reported — that's the hardware's capability;
-     * the jitter belongs to Linux, not the datapath. Default: 5 reps for the
-     * named model shapes, 1 for the pow2 sweep (legacy behavior). */
+    /* Short ops carry tens of us of scheduler jitter, so run MMFREE_REPS times
+     * (default 5 for model shapes, 1 for pow2) and report the run with the minimum
+     * total, with its own phase split. */
     uint32_t n_outputs = num_col_tiles * g->outLanesPerTile;  /* padded to tile, per vector */
-    uint32_t total_outputs = B * n_outputs;                   /* engine drains all B vectors */
+    uint32_t total_outputs = B * n_outputs;
     uint32_t reps = env_u32("MMFREE_REPS", sh->name ? 5 : 1);
     if (reps == 0) reps = 1;
 
@@ -416,12 +326,11 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
         }
     }
 
-    /* Verify (the data is identical every rep — checking the last suffices). */
+    /* Verify (data is identical every rep). */
     uint32_t errs = 0;
     if (verify) {
         volatile uint8_t *ob = (volatile uint8_t *)bs->out_buf.vaddr;
-        /* Outputs are batch-major: vector r occupies lanes [r*n_outputs, +M).
-         * Each vector is the SAME weights against its own activations. */
+        /* Outputs are batch-major: vector r occupies lanes [r*n_outputs, +M). */
         for (uint32_t r = 0; r < B; r++) {
             ref_matmul(act_int + (size_t)r * N, wt_int, ref_out + (size_t)r * M, N, M);
             for (uint32_t m = 0; m < M; m++) {
@@ -442,15 +351,12 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
         }
     }
 
-    /* The compute kernel does N*M multiply-add equivalents. Ternary multiplies
-     * are essentially add/sub, so report "ops/s" rather than GFLOPS. */
-    double ops   = 2.0 * (double)N * (double)M * (double)B;  /* B vectors share one weight stream */
-    double gops  = ops / (us_total * 1e3);        /* ops / (us_total * 1000 ns) = ops/ns = Gops/s */
+    /* 2*N*M ops per vector (a ternary multiply-add is an add/sub). */
+    double ops   = 2.0 * (double)N * (double)M * (double)B;
+    double gops  = ops / (us_total * 1e3);
     double gops_compute = ops / (us_compute * 1e3);
 
-    /* DRAM bandwidth per op (bytes / ns = GB/s). The compute weight stream is
-     * the dominant DDR4 consumer — watch cmp_GBps to see when the stream, not
-     * the array, is the bottleneck. */
+    /* Per-phase DRAM bandwidth (bytes/ns = GB/s). */
     double ld_bytes  = (double)N * g->sAxisBytes;
     double cmp_bytes = (double)N * (double)num_col_tiles * g->sAxisBytes;
     double st_bytes  = (double)total_outputs * g->outLaneBytes;
@@ -482,9 +388,7 @@ static int run_shape(bench_state_t *bs, const bench_shape_t *sh, int verify,
     return errs == 0 ? 0 : -1;
 
 fail:
-    /* -2 = an op timed out / errored (state dump already printed by the
-     * runtime). The core is likely wedged mid-FSM; the caller should abort
-     * the sweep rather than time out on every remaining shape. */
+    /* -2: an op timed out/errored; the core is likely wedged, so abort the sweep. */
     free(act_int);
     free(wt_int);
     free(ref_out);
@@ -492,12 +396,9 @@ fail:
     return -2;
 }
 
-/* Port-order self-test (numPorts > 1 only). Streams a tiny matmul whose +1
- * weights live ONLY in the lanes of the most-significant port slice. If the
- * BD wires the DMAs to the wrong CoreTop s_axis indices (a reversed Cat),
- * the nonzero results land in the wrong output columns — caught here in a
- * few ms instead of as silent corruption halfway through the sweep.
- * Returns 0 on pass. */
+/* Port-order self-test (numPorts > 1): +1 weights only in the top port's lanes, so
+ * a DMA wired to the wrong s_axis index (silent corruption otherwise) shows up as
+ * nonzero results in the wrong columns. Returns 0 on pass. */
 static int cat_order_selftest(bench_state_t *bs) {
     const mmfree_geom_t *g = &bs->ctx.geom;
     uint32_t nports = g->numPorts;
@@ -513,7 +414,7 @@ static int cat_order_selftest(bench_state_t *bs) {
         write_act_beat(&act_dma[(size_t)i * g->portBytes], 1u, g->aWidth / 8u, g->portBytes);
 
     for (uint32_t lane = 0; lane < g->outLanesPerTile; lane++)
-        lanes[lane] = (lane >= hi_base) ? 1u : 0u;      /* +1 in top slice only */
+        lanes[lane] = (lane >= hi_base) ? 1u : 0u;
     for (uint32_t n = 0; n < N; n++) {
         for (uint32_t p = 0; p < nports; p++) {
             volatile uint8_t *dst = (volatile uint8_t *)bs->wt_buf[p].vaddr;
@@ -572,9 +473,6 @@ int main(int argc, char **argv) {
 
     g_signed = (int)env_u32("MMFREE_SIGNED", BENCH_SIGNED_DEFAULT);
 
-    /* Resolve the runtime geometry. Env vars override the compiled defaults, so one
-     * binary targets any array size — but it MUST match the loaded bitstream's
-     * CoreConfig. */
     mmfree_geom_t geom;
     if (mmfree_geom_init(&geom,
                          env_u32("MMFREE_AWIDTH", BENCH_AWIDTH),
@@ -586,26 +484,21 @@ int main(int argc, char **argv) {
                         "bytes and no dimension may be zero\n");
         return 2;
     }
-    /* Batch (CoreConfig.batchSize): B activation vectors per weight stream. Must
-     * match the loaded bitstream and be <= xDim (B activations share port 0's
-     * slice). The output buffer and STORE scale xB; weights/activations LOAD do not. */
+    /* Batch must match the bitstream and be <= xDim (B activations share port 0's
+     * slice). Only the output buffer and STORE scale with B. */
     g_batch = (int)env_u32("MMFREE_BATCH", 1);
     if (g_batch < 1 || (uint32_t)g_batch > geom.xDim) {
         fprintf(stderr, "MMFREE_BATCH=%d out of range 1..xDim(%u)\n", g_batch, geom.xDim);
         return 2;
     }
     geom.batch = (uint32_t)g_batch;
-    /* The bench packs its synthetic weights 2-bit inline; it has no 1.6-bit packer,
-     * so refuse a packedWeights bitstream rather than stream garbage to it. The
-     * model path (fpga_runner + mmfree_pack) is what exercises packed weights. */
+    /* The bench only packs 2-bit weights; refuse a packedWeights bitstream. */
     if (env_u32("MMFREE_PACKED_WEIGHTS", 0)) {
         fprintf(stderr, "MMFREE_PACKED_WEIGHTS=1 but bench packs 2-bit only; "
                         "use the fpga_runner (gate/run) for packed weights\n");
         return 2;
     }
 
-    /* Cross-check the resolved geometry against the loaded bitstream's preset
-     * manifest ($MMFREE_MANIFEST), if set. WARN-only unless MMFREE_STRICT=1. */
     if (mmfree_geom_check_env(&geom) < 0) {
         fprintf(stderr, "MMFREE_STRICT: aborting on geometry/bitstream mismatch\n");
         return 2;
@@ -616,15 +509,13 @@ int main(int argc, char **argv) {
     const char *mode = getenv("MMFREE_SHAPES");
     if (!mode || !*mode) mode = BENCH_SHAPES_DEFAULT;
 
-    /* Resolve `mode` to a named model, an env-described arbitrary model, or the
-     * pow2 cross sweep. `model_name` non-NULL => named-model rollup. */
+    /* Named model, env-described custom model, or pow2. `model_name` set => rollup. */
     const char *model_name = NULL;
     model_cfg_t custom;
     const model_cfg_t *mc = NULL;
     for (size_t k = 0; k < sizeof(models) / sizeof(models[0]); k++)
         if (strcmp(mode, models[k].name) == 0) { mc = &models[k]; break; }
     if (!mc && getenv("MMFREE_HIDDEN")) {
-        /* Arbitrary model from the environment (MMFREE_SHAPES names the label). */
         custom = (model_cfg_t){
             .name   = (strcmp(mode, "pow2") == 0) ? "custom" : mode,
             .hidden = env_u32("MMFREE_HIDDEN", 0),
@@ -662,7 +553,7 @@ int main(int argc, char **argv) {
         }
         model_name = mc->name;
     } else {
-        /* Power-of-two cross sweep up to maxN x maxM (legacy behavior). */
+        /* Power-of-two cross sweep up to maxN x maxM. */
         uint32_t ns[16], ms[16]; size_t nn = 0, nm = 0;
         for (uint32_t s = 64; s <= geom.maxN && nn < 16; s <<= 1) ns[nn++] = s;
         for (uint32_t s = 64; s <= geom.maxM && nm < 16; s <<= 1) ms[nm++] = s;
@@ -673,9 +564,7 @@ int main(int argc, char **argv) {
                 sweep[nsweep++] = (bench_shape_t){ NULL, ns[i], ms[j], 0 };
     }
 
-    /* Buffer requirements = worst case over the sweep, NOT over maxN x maxM —
-     * the 370m sweep's weight worst case (lm_head: 2 MiB/port) is 4x smaller
-     * than the geometry's theoretical maximum. */
+    /* Size buffers for the sweep's worst shape, not for maxN x maxM. */
     uint32_t act_beats = 0, wt_slices = 0, out_tiles = 0;
     for (size_t i = 0; i < nsweep; i++) {
         uint32_t t = (sweep[i].M + geom.outLanesPerTile - 1) / geom.outLanesPerTile;
@@ -684,14 +573,12 @@ int main(int argc, char **argv) {
         if (t > out_tiles)                  out_tiles = t;
     }
 
-    /* Compute-phase bandwidth ceiling: every port streams portBytes per cycle. */
     uint32_t clk_mhz = env_u32("MMFREE_CLK_MHZ", BENCH_CLK_MHZ);
     g_peak_gbps = (double)geom.numPorts * geom.portBytes * clk_mhz / 1000.0;
 
     bench_state_t bs;
     memset(&bs, 0, sizeof(bs));
-    /* fd=0 (stdin) is a valid descriptor — mark every buffer unopened so the
-     * cleanup path can't close fds it doesn't own. */
+    /* fd=0 is valid (stdin); mark buffers unopened so cleanup can't close it. */
     for (uint32_t p = 0; p < MMFREE_MAX_DMA; p++) {
         bs.act_buf[p].fd = -1;
         bs.wt_buf[p].fd  = -1;
@@ -699,9 +586,7 @@ int main(int argc, char **argv) {
     bs.out_buf.fd = -1;
     int failed = 0;
 
-    /* DMA register bases, one per s_axis port. Port 0 comes from the CLI;
-     * ports 1..N-1 default to the bd.tcl address map (0xA0020000 + 0x10000
-     * per extra DMA), overridable with MMFREE_DMA<i>. */
+    /* DMA 0 from the CLI; DMAs 1..N-1 from the bd.tcl map or MMFREE_DMA<i>. */
     uint32_t nports = geom.numPorts;
     uint64_t dma_phys_arr[MMFREE_MAX_DMA] = {0};
     dma_phys_arr[0] = dma_phys;
@@ -711,18 +596,13 @@ int main(int argc, char **argv) {
         dma_phys_arr[p] = env_u64(env_name, 0xA0020000ull + (p - 1u) * 0x10000ull);
     }
 
-    /* Core register window: 4 KiB is plenty (12-bit aperture).
-     * AXI DMA register window: 64 KiB is a safe default for the Xilinx IP. */
+    /* Core window 4 KiB (12-bit aperture); AXI DMA window 64 KiB. */
     if (mmfree_open(&bs.ctx, core_phys, 0x1000, dma_phys_arr, nports, 0x10000, uio_dev) < 0) {
         fprintf(stderr, "mmfree_open failed\n");
         return 1;
     }
-    bs.ctx.geom = geom;   /* the byte-count math + run_shape read this */
+    bs.ctx.geom = geom;
 
-    /* Per-port act (act_beats beat slices) + wt (wt_slices beat slices)
-     * buffers, sized to the sweep's worst shape. N==1 uses the CLI paths
-     * as-is; N>1 appends the port index (matching gen_overlay.tcl's node
-     * names) unless MMFREE_ACT<i> / MMFREE_WT<i> override. */
     for (uint32_t p = 0; p < nports; p++) {
         char apath[256], wpath[256];
         const char *ap = act_udma, *wp = wt_udma;
@@ -733,21 +613,16 @@ int main(int argc, char **argv) {
         if (buf_open_checked(&bs.act_buf[p], ap, (size_t)act_beats * geom.portBytes) < 0) { failed = 1; goto out; }
         if (buf_open_checked(&bs.wt_buf[p],  wp, (size_t)wt_slices * geom.portBytes) < 0) { failed = 1; goto out; }
     }
-    /* output buffer: batch * out_tiles * outLanesPerTile lanes (the engine drains
-     * all B activation vectors' outputs, batch-major). */
+    /* Output: batch * out_tiles * outLanesPerTile lanes, batch-major. */
     if (buf_open_checked(&bs.out_buf, out_udma, (size_t)g_batch * out_tiles * geom.outLanesPerTile * geom.outLaneBytes) < 0) { failed = 1; goto out; }
 
-    /* Activation slices for ports 1..N-1 carry zeros forever (LOAD data lives
-     * in the wide beat's low bits = port 0) — fill once. Word stores, NOT
-     * glibc memset (dc-zva SIGBUSes on Device memory). */
+    /* Ports 1..N-1 activation slices are always zero — fill once with word stores,
+     * NOT glibc memset (its dc zva SIGBUSes on Device memory). */
     for (uint32_t p = 1; p < nports; p++) {
         volatile uint32_t *z = (volatile uint32_t *)bs.act_buf[p].vaddr;
         for (size_t k = 0; k < bs.act_buf[p].size / 4u; k++) z[k] = 0;
     }
 
-    /* Resolved geometry — must match the loaded bitstream's CoreConfig. A
-     * mismatch hangs the core mid-op (beat-count disagreement), so make it
-     * easy to eyeball against the deployed preset. */
     printf("# bench geometry: aWidth=%u xDim=%u batch=%u maxAcc=%u maxN=%u maxM=%u\n",
            geom.aWidth, geom.xDim, geom.batch, geom.maxAcc, geom.maxN, geom.maxM);
     printf("#   s_axis beat=%uB (%u port%s x %uB)  %u lanes/tile  accWidth=%u  out lane=%uB\n",
@@ -767,16 +642,11 @@ int main(int argc, char **argv) {
            env_u32("MMFREE_REPS", model_name ? 5 : 1),
            env_u32("MMFREE_REPS", model_name ? 5 : 1) == 1 ? "" : "s");
 
-    /* For split streams, prove the DMA->s_axis_i wiring/order before the
-     * sweep: a reversed port Cat corrupts results silently rather than
-     * hanging, so it deserves a dedicated cheap check. */
     if (nports > 1) {
         if (cat_order_selftest(&bs) < 0) { failed = 1; goto out; }
         printf("# port-order self-test: PASS (%u ports)\n", nports);
     }
 
-    /* N/M column width auto-sizes to the largest dimension so big arrays don't
-     * blow the alignment. */
     int iw = 4;
     for (size_t i = 0; i < nsweep; i++) {
         uint32_t d = sweep[i].N > sweep[i].M ? sweep[i].N : sweep[i].M;
@@ -797,23 +667,20 @@ int main(int argc, char **argv) {
                "--------------------------------------------------------------");
     }
 
-    /* Per-token rollup (named-model mode): time for ALL projections of one
-     * forward pass = sum of count_i * t_i over the distinct shapes. */
+    /* Per-token rollup (named-model mode): sum of count_i * t_i over the shapes. */
     double tok_us = 0, tok_cmp_us = 0, tok_wt_bytes = 0;
     int tok_valid = (model_name != NULL);
 
     uint32_t prevN = 0;
     for (size_t i = 0; i < nsweep; i++) {
         if (!g_csv && i > 0 && sweep[i].N != prevN)
-            printf("\n");   /* visual break between N groups */
+            printf("\n");
         prevN = sweep[i].N;
         uint64_t seed = ((uint64_t)sweep[i].N << 32) ^ sweep[i].M ^ 0xC0FFEE00ULL;
         double us_tot = 0, us_cmp = 0;
         int rc = run_shape(&bs, &sweep[i], verify, seed, iw, &us_tot, &us_cmp);
         if (rc < 0) { failed++; tok_valid = 0; }
         if (rc == -2) {
-            /* Op hang/error — the core is wedged; the remaining shapes
-             * would each burn a full timeout. Bail with the dump above. */
             fprintf(stderr, "aborting sweep at N=%u M=%u (core wedged)\n",
                     sweep[i].N, sweep[i].M);
             goto out;
@@ -827,10 +694,8 @@ int main(int argc, char **argv) {
     }
 
     if (tok_valid && tok_us > 0) {
-        /* With batch B, one weight pass (tok_us, tok_wt_bytes) yields B tokens, so
-         * throughput scales xB and per-token weight traffic is 1/B. The stream
-         * floor (one weight pass) and its efficiency are unchanged — that is the
-         * whole point of batching: same weight bandwidth, B tokens. */
+        /* One weight pass yields B tokens: throughput scales xB, per-token weight
+         * traffic 1/B; the stream floor is unchanged. */
         double Bf = (double)g_batch;
         double floor_us = tok_wt_bytes / (g_peak_gbps * 1e3);
         printf("\n# %s projection cost (batch=%d): %.0f us total, %.0f us compute-only"

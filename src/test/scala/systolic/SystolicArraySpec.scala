@@ -128,9 +128,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
 
   private def randWeight(rng: Random): Int = Seq(0, 1, 3)(rng.nextInt(3))
 
-  // ---------------------------------------------------------------
-  // Deterministic functional tests
-  // ---------------------------------------------------------------
+  // ── Deterministic functional tests ──
 
   "SystolicArray(aWidth=8, maxAcc=64, xDim=2, yDim=2) functional tests" - {
     val aWidth = 8
@@ -194,9 +192,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
   }
 
-  // ---------------------------------------------------------------
-  // Handshake protocol
-  // ---------------------------------------------------------------
+  // ── Handshake protocol ──
 
   "SystolicArray handshake" - {
     val aWidth = 8
@@ -240,9 +236,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
   }
 
-  // ---------------------------------------------------------------
-  // Randomized model comparison
-  // ---------------------------------------------------------------
+  // ── Randomized model comparison ──
 
   "SystolicArray random model comparison" - {
     Seq((8, 64, 2, 2), (4, 32, 3, 4), (8, 128, 4, 2)).foreach { case (aw, mA, xD, yD) =>
@@ -264,10 +258,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
   }
 
-  // ---------------------------------------------------------------
-  // Column banking (systolic pipeline) — must be numerically identical
-  // to the broadcast array, just finishing (numBanks-1) cycles later.
-  // ---------------------------------------------------------------
+  // ── Column banking: numerically identical to broadcast, (numBanks-1) cycles later ──
 
   /** Like runAndCheck, but tolerates the per-bank pipeline latency: after the last
     * beat it polls output.valid for up to `maxSkew` cycles before checking. */

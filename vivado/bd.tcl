@@ -40,12 +40,7 @@ if { [string first $scripts_vivado_version $current_vivado_version] == -1 } {
 # START
 ################################################################
 
-# To test this script, run the following commands from Vivado Tcl console:
-# source t_matmul_script.tcl
-
-# If there is no project opened, this script will create a
-# project, but make sure you do not have an existing project
-# <./myproj/project_1.xpr> in the current working folder.
+# Creates a project (myproj/project_1) only when none is open; build_project.tcl opens its own.
 
 set list_projs [get_projects -quiet]
 if { $list_projs eq "" } {
@@ -58,9 +53,6 @@ if { $list_projs eq "" } {
 variable design_name
 set design_name t_matmul
 
-# If you do not already have an existing IP Integrator design open,
-# you can create a design using the following command:
-#    create_bd_design $design_name
 
 # Creating design if needed
 set errMsg ""
@@ -621,15 +613,11 @@ Port;FD4A0000;FD4AFFFF;1|FPD;DPDMA;FD4C0000;FD4CFFFF;1|FPD;DDR_XMPU5_CFG;FD05000
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
   ] $zynq_ultra_ps_e_0
 
-  # MM2S width must match CoreTop's per-port s_axis width: xDim*aWidth when
-  # that fits one HP port (64 for k26_bench, 128 for k26_bench16), else 128
-  # per port with the stream split across NUM_DMA parallel DMAs/HP ports
-  # (k26_bench32 -> 2, k26_bench64 -> 4). build_all.sh exports both.
+  # MM2S width = CoreTop's per-port s_axis width: xDim*aWidth, capped at 128 per HP port with
+  # the stream split across NUM_DMA DMAs above that. build_all.sh exports MM2S/S2MM_WIDTH.
   set mm2s_width 64
   if { [info exists ::env(MM2S_WIDTH)] } { set mm2s_width $::env(MM2S_WIDTH) }
-  # S2MM (output) stream width = CoreTop m_axis = outBeatLanes*outLaneWidth.
-  # Default 32 (outBeatLanes=1); batched presets set 128 (outBeatLanes=4) so the
-  # store isn't capped at the 32-bit ~1 GB/s ceiling. Capped at the 128-bit HP port.
+  # S2MM width = CoreTop m_axis (outBeatLanes*outLaneWidth): 32 by default, 128 when batched.
   set s2mm_width 32
   if { [info exists ::env(S2MM_WIDTH)] } { set s2mm_width $::env(S2MM_WIDTH) }
   set num_dma 1
@@ -639,24 +627,15 @@ Port;FD4A0000;FD4AFFFF;1|FPD;DPDMA;FD4C0000;FD4CFFFF;1|FPD;DDR_XMPU5_CFG;FD05000
     return 4
   }
 
-  # PL fabric clock (pl_clk0 = PL0_REF). The static config above is 100 MHz;
-  # build_all.sh exports PL_CLK_MHZ to raise it (250 for k26_mmfree370m:
-  # CoreTop closes 250 MHz OOC with WNS +0.79 ns, and 4 HP ports x 16 B at
-  # 250 MHz lift the weight-stream peak 6.4 -> 16 GB/s ~= the DDR4 wall).
-  # The PS config wizard recomputes ACT_FREQMHZ and the derived timing
-  # constraints, and createdts picks the new rate up in the clocking fragment.
+  # PL fabric clock (pl_clk0 = PL0_REF): the static config above is 100 MHz; build_all.sh
+  # exports PL_CLK_MHZ to raise it (createdts picks the new rate up for the overlay).
   set pl_clk_mhz 100
   if { [info exists ::env(PL_CLK_MHZ)] } { set pl_clk_mhz $::env(PL_CLK_MHZ) }
   if { $pl_clk_mhz != 100 } {
     set_property CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $pl_clk_mhz $zynq_ultra_ps_e_0
   }
-  # PL0_REF only exists on the discrete rungs the PS clock tree can synthesise, so
-  # the REQUESTED FREQMHZ above is not necessarily what gets constrained: the IP
-  # recomputes ACT_FREQMHZ and THAT is the rate the generated clock (and hence every
-  # setup path) is timed against. Until 2026-08-04 nothing read it back, so a build
-  # labelled "230 MHz" recorded a WNS against an unknown period — and two presets
-  # (225/230) produced byte-identical bitstreams without anything explaining why.
-  # Publish it as a global so build_project.tcl can record the real constrained rate.
+  # PL0_REF only has discrete rungs, so the IP's recomputed ACT_FREQMHZ (not the request) is
+  # what every path is timed against. Publish it for build_project.tcl's report.
   set ::mmfree_pl_clk_req $pl_clk_mhz
   set ::mmfree_pl_clk_act \
       [get_property CONFIG.PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ $zynq_ultra_ps_e_0]
@@ -681,11 +660,8 @@ Port;FD4A0000;FD4AFFFF;1|FPD;DPDMA;FD4C0000;FD4CFFFF;1|FPD;DDR_XMPU5_CFG;FD05000
   }
 
   # Create instance: axi_dma_0, and set properties.
-  # Burst sizes are max (256 beats): at 250 MHz a 64-beat MM2S burst is only
-  # 256 ns on the wire and the ~190 ns DDR read-latency gap between bursts
-  # capped throughput at ~56% (measured on k26_mmfree370m); 256-beat bursts
-  # amortize the gap to ~85%+. S2MM default (16 beats = 64 B at 32-bit width)
-  # halved store bandwidth the same way.
+  # Max (256-beat) bursts: shorter ones leave the DDR read-latency gap between bursts exposed
+  # and cap streaming throughput well below the port peak.
   set axi_dma_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:7.1 axi_dma_0 ]
   set_property -dict [list \
     CONFIG.c_addr_width {40} \

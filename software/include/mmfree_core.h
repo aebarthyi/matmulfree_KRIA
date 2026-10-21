@@ -1,16 +1,12 @@
 /*
- * mmfree_core.h — PS-side register and instruction definitions for the
- * matmulfree ternary-matmul Core IP. Single source of truth, mirrors:
- *   - control/AxiInstructionHandler.scala (RegMap, Opcode, ErrorCode, StatusReg)
- *   - control/Core.scala                  (instruction semantics)
+ * mmfree_core.h — PS-side register map and instruction encoding for the Core IP.
+ * Mirrors control/AxiInstructionHandler.scala (RegMap, Opcode, ErrorCode, StatusReg)
+ * and control/Core.scala.
  *
- * Conventions:
- *   - All addresses are byte offsets from the IP's AXI4 base address.
- *   - Instructions are 128-bit beats written to MMFREE_REG_INSTR. Single-beat
- *     only (AWLEN/ARLEN must be 0). The PS-side driver is expected to use a
- *     128-bit MMIO store (e.g., NEON vst1q on AArch64).
- *   - Status is read as a 32-bit word at MMFREE_REG_STATUS. Reading 128 bits
- *     also works; the high 96 bits are zero.
+ *   - Addresses are byte offsets from the IP's AXI4 base.
+ *   - Instructions are single 128-bit beats to MMFREE_REG_INSTR (AWLEN/ARLEN = 0);
+ *     the driver must use one 128-bit MMIO store (NEON vst1q on AArch64).
+ *   - Status is a 32-bit word at MMFREE_REG_STATUS (a 128-bit read returns zeros above).
  *   - IRQ is level-high; write any value to MMFREE_REG_IRQ_ACK to clear.
  */
 
@@ -66,7 +62,7 @@ extern "C" {
  *   [ 47:  8] ptr     (40b — physical / SMMU-translated bus address)
  *   [ 79: 48] dim0    (32b)
  *   [111: 80] dim1    (32b)
- *   [127:112] flags   (16b reserved)
+ *   [127:112] flags   (16b; COMPUTE: active batch count, 0 = full batchSize)
  *
  * dim0 / dim1 semantics by opcode:
  *   LOAD_ACT      : dim0 = #activations, dim1 = 0
@@ -100,16 +96,12 @@ static inline mmfree_instr_t mmfree_encode(uint8_t  opcode,
     return i;
 }
 
-/* Convenience wrappers — produced encodings match the Chisel decoder exactly. */
-
 static inline mmfree_instr_t mmfree_inst_load(uint64_t ptr, uint32_t n_activations)
 { return mmfree_encode(MMFREE_OP_LOAD_ACT, ptr, n_activations, 0, 0); }
 
-/* COMPUTE: `batch` (the active-row count b) rides the 16-bit flags field. The Core
- * decodes it as cmpBatch and drains only b of B rows, so one high-B bitstream serves
- * a low-batch (b<B) call at ~B1 cost. batch==0 clamps to the full compile-time
- * batchSize — the legacy unbatched encoding, which is why there is no separate
- * wrapper for it. Caller must ensure 1 <= batch <= bitstream batchSize. */
+/* COMPUTE: `batch` (active-row count b) rides the flags field; the Core decodes it
+ * as cmpBatch and drains only b of B rows. batch==0 means the full compile-time
+ * batchSize. Otherwise 1 <= batch <= bitstream batchSize. */
 static inline mmfree_instr_t mmfree_inst_compute_b(uint64_t weights_ptr,
                                                    uint32_t rows, uint32_t cols,
                                                    uint16_t batch)

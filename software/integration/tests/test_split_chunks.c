@@ -1,14 +1,6 @@
-/* test_split_chunks.c — host check of the column-tile split PLAN (no hardware).
- *
- * mmfree_bitlinear_batch_split runs a projection as several COMPUTEs over slices of its
- * output column tiles. Whether the RESULTS are right is gated on-board by `make gate`
- * (bit-exact CPU vs FPGA); what THIS test covers is the arithmetic that decides where the
- * slices go, because a bad boundary is silent — the DMA streams happily from a wrong offset
- * and produces plausible-looking garbage.
- *
- * It #includes mmfree_lib.c so it drives the REAL chunk_offset/pick_chunks/chunk_view rather
- * than a copy that could drift. Nothing here opens a device: only the pure geometry helpers
- * are called, with a handle whose projection table we fill directly.
+/* test_split_chunks.c — host check of the column-tile split plan (no hardware). A bad
+ * boundary is silent on the board: the DMA streams from a wrong offset. #includes
+ * mmfree_lib.c to drive the real chunk_offset/chunk_boundaries/chunk_view.
  *
  * For every real projection shape of 370M / 1.3B / 2.7B, in BOTH weight encodings, assert:
  *   1. chunks tile [0, num_col_tiles) exactly — contiguous, no gap, no overlap
@@ -33,8 +25,7 @@ static int fails;
                        printf("\n"); fails++; }                              \
     } while (0)
 
-/* The chunk ladder from fpga_backend.cpp split_chunks() — kept in step by hand; if it
- * changes there, change it here so the test still covers what ships. */
+/* Mirror of fpga_backend.cpp split_chunks() — keep in step by hand. */
 static uint32_t want_for(uint32_t M) {
     if (M >= 16384) return 8;
     if (M >= 8192)  return 4;
@@ -42,8 +33,7 @@ static uint32_t want_for(uint32_t M) {
     return 1;
 }
 
-/* Minimal handle: mmfree_split_plan reads only ctx.geom and projs[], so filling those is
- * enough to exercise the real planner. */
+/* mmfree_split_plan reads only ctx.geom and projs[]. */
 static void check_shape(mmfree_geom_t *g, const char *name, uint32_t N, uint32_t M) {
     mmfree_lib_t h;
     memset(&h, 0, sizeof(h));
@@ -93,8 +83,7 @@ static void check_shape(mmfree_geom_t *g, const char *name, uint32_t N, uint32_t
           name, tile_cursor, tiles);
     CHECK(col_cursor == M, "%s: chunks covered %u cols, projection has %u",
           name, col_cursor, M);
-    /* 3 (sum): splitting must not change the weights streamed. 2-bit is exact; 1.6-bit can
-     * cost a little per-chunk tail padding, so bound it rather than demand equality. */
+    /* 3 (sum): 2-bit is exact; 1.6-bit may add per-chunk tail padding, so bound it. */
     if (!g->packed) {
         CHECK(byte_sum == whole, "%s: chunk bytes %llu != whole %u",
               name, (unsigned long long)byte_sum, whole);
@@ -125,11 +114,8 @@ static void run_model(const char *label, uint32_t hidden, uint32_t inter, uint32
     check_shape(&g, "lm_head",      hidden, vocab);
 }
 
-/* The other silent-failure mode: a chunk's lanes landing in the wrong columns of `acc`.
- * readback_rows_at reads OUT (batch-major over the CHUNK's n_outputs) and must scatter into
- * the caller's [b][M] accumulator at the chunk's column offset. Drive it against a fake OUT
- * filled with values that encode (row, lane), then assert every element of the reassembled
- * accumulator equals what the whole-projection readback would have produced. */
+/* Chunked readback_rows_at must scatter each chunk's lanes into the right columns of the
+ * caller's [b][M] accumulator: compare against one whole-projection readback. */
 static void check_scatter(void) {
     mmfree_geom_t g;
     if (mmfree_geom_init(&g, 16, 32, 8192, 8192, 32000) < 0) { fails++; return; }
@@ -139,8 +125,7 @@ static void check_scatter(void) {
     mmfree_lib_t h;
     memset(&h, 0, sizeof(h));
     h.ctx.geom = g;
-    /* Cached + 4-byte lanes + accWidth<=32 selects the fast non-volatile path, the one that
-     * actually runs on the board. */
+    /* Cached + 4-byte lanes + accWidth<=32 selects the fast path used on the board. */
     static uint32_t fake_out[4 * 6 * 256];
     h.out.vaddr = fake_out;
     h.out.size = sizeof(fake_out);
@@ -156,8 +141,7 @@ static void check_scatter(void) {
     proj_t whole = { .byte_offset = 0, .N = 2560, .M = M, .n_outputs = M };
     readback_rows_at(&h, &whole, want, b, M, 0u);
 
-    /* Split: 3 chunks of 2 tiles. Each chunk's OUT is batch-major over ITS 2*olt lanes, so
-     * re-lay the fake OUT per chunk exactly as the engine would drain it. */
+    /* Split: 3 chunks of 2 tiles, each with OUT laid out as the engine would drain it. */
     const uint32_t ct = 2, span = ct * olt;
     for (uint32_t j = 0; j < tiles / ct; j++) {
         uint32_t col0 = j * span;
@@ -177,10 +161,8 @@ static void check_scatter(void) {
                      b, M, tiles / ct);
 }
 
-/* The per-chunk callback (mmfree_chunk_cb_t) drives the caller's dequant, so if a column is
- * visited twice it is scaled twice, and if one is missed it is left as a raw int32 — both
- * silent. Drive the real split driver's callback bookkeeping over the plan and assert each
- * column of [0,M) is reported EXACTLY once, for every shape and both encodings. */
+/* The per-chunk callback drives dequant, so every column of [0,M) must be reported
+ * exactly once (twice = double-scaled, never = raw int32). */
 static uint8_t seen_cols[32000];
 static uint32_t seen_M;
 static void count_cb(void *ctx, uint32_t col0, uint32_t ncols) {
@@ -204,8 +186,7 @@ static void check_cb_coverage(mmfree_geom_t *g, const char *name, uint32_t N, ui
 
     memset(seen_cols, 0, sizeof(seen_cols));
     seen_M = M;
-    /* Mirror the driver's callback schedule: chunks 0..k-2 fire inside the following
-     * chunk's COMPUTE window, chunk k-1 fires after the loop. Every chunk fires once. */
+    /* The driver fires the callback once per chunk. */
     for (int j = 0; j < k; j++) count_cb(NULL, plan[j].first_col, plan[j].M);
 
     uint32_t missed = 0, dup = 0;

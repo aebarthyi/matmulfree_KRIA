@@ -1,4 +1,4 @@
-"""Map an MMfreeLM-370M checkpoint to the engine's projection list.
+"""Map an MMfreeLM checkpoint to the engine's projection list.
 
 Per layer (state_dict keys under `model.layers.{L}.`):
   - i/f/g_proj  -> FUSED into one (3*input_dim, hidden) projection `layers.{L}.ifg`
@@ -16,23 +16,21 @@ with synthetic tensors; `load_checkpoint` is the only torch entry point.
 from __future__ import annotations
 
 import re
-from typing import Callable, Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import numpy as np
 
 # Per-layer projections to emit, in COMPUTE order. Each is (out_name, [src keys]).
 # FUSED: i/f/g are concatenated along the output dim (axis 0) into one matmul.
-# NOTE: fusion is only numerically exact if the three RMSNorm weights are folded
-# into the projection weights at pack time (each *_proj has its OWN norm); the
-# bridge uses the UNFUSED form for correctness and treats fusion as a perf step.
+# NOTE: fusion is only numerically exact if each *_proj's own RMSNorm weight is
+# folded into its projection weights at pack time.
 _LAYER_PROJS_FUSED: List[Tuple[str, List[str]]] = [
     ("ifg",       ["attn.i_proj.weight", "attn.f_proj.weight", "attn.g_proj.weight"]),
     ("o_proj",    ["attn.o_proj.weight"]),
     ("gate_up",   ["mlp.gate_proj.weight"]),
     ("down_proj", ["mlp.down_proj.weight"]),
 ]
-# UNFUSED: one projection per BitLinear; names are the module-path suffix so the
-# torch patch can map each FusedBitLinear instance to its projection 1:1.
+# UNFUSED: one projection per BitLinear, named by module-path suffix.
 _LAYER_PROJS_UNFUSED: List[Tuple[str, List[str]]] = [
     ("attn.i_proj",   ["attn.i_proj.weight"]),
     ("attn.f_proj",   ["attn.f_proj.weight"]),
@@ -44,9 +42,8 @@ _LAYER_PROJS_UNFUSED: List[Tuple[str, List[str]]] = [
 
 _LAYER_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.")
 
-# Per-layer projection order for packing from a model.mmfree blob (compute order;
-# unfused, one projection per BitLinear — mirrors the C++ block, which calls i/f/g
-# separately with the shared post-norm input). The blob tags use these suffixes.
+# Per-layer projection order (compute order, unfused) for packing from a
+# model.mmfree blob; the blob tags use these suffixes.
 _BLOB_LAYER_PROJS = ["i_proj", "f_proj", "g_proj", "o_proj", "gate_proj", "down_proj"]
 
 
@@ -110,8 +107,7 @@ def iter_projections(
 
     W is the nn.Linear weight (out_features, in_features); fused groups are
     concatenated along axis 0 (output dim). With fuse_ifg=False, every BitLinear
-    is its own projection named by module-path suffix (e.g. layers.0.attn.i_proj)
-    so the torch bridge can map instances 1:1.
+    is its own projection named by module-path suffix (e.g. layers.0.attn.i_proj).
     """
     table = _LAYER_PROJS_FUSED if fuse_ifg else _LAYER_PROJS_UNFUSED
     for L in range(_num_layers(weights)):

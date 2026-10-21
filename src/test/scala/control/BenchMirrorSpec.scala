@@ -8,27 +8,16 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /**
-  * Mirror of the `software/bench/bench.c` flow, parameterized over the bench
-  * presets' geometry (see concrete subclasses at the bottom: K26_Bench through
-  * K26_Bench64 shapes, all batchSize=1 / outBeatLanes=1). CoreSpec tests Core
-  * in isolation with weights pre-arranged in the order Core expects; this spec
-  * exercises the SOFTWARE-side packing — the layout bench.c writes to udmabuf
-  * for the DMA to stream — and asserts it produces results matching a
-  * straightforward on-host reference matmul.
+  * Mirror of the `software/bench/bench.c` flow, parameterized over geometry (concrete
+  * subclasses at the bottom). Unlike CoreSpec, this exercises the SOFTWARE-side weight
+  * layout bench.c writes for the DMA and checks it against a plain host matmul.
   *
-  * Drives [[CoreTop]] (not bare Core) so the N-way s_axis port join is in the
-  * tested path: geometries wider than 128 bits split each beat into N 128-bit
-  * slices fed on `s_axis_0..s_axis_{N-1}` in lockstep, exactly as N parallel
-  * HP-port DMAs would on the board. N==1 geometries collapse to the legacy
-  * single `s_axis` pass-through.
+  * Drives [[CoreTop]] so the N-way s_axis port join is in the tested path: beats wider
+  * than 128 bits are split into N 128-bit slices on `s_axis_0..s_axis_{N-1}`, as N
+  * parallel HP-port DMAs would on the board.
   *
-  * If the random-buffer test passes, the only remaining gap to a working board
-  * run is the DMA-side mechanics (start / length register pokes), a much
-  * smaller surface to debug than the full pack/load/compute/store flow.
-  *
-  * The "regression guard" test re-packs the same weight matrix in the
-  * row-major order that bench.c used before the 2026-05-23 fix, and asserts
-  * the output does NOT match — proving this spec would have caught that bug.
+  * The "regression guard" test re-packs weights in the old (buggy) row-major bench.c
+  * order and asserts the output does NOT match.
   */
 abstract class BenchMirrorSpecBase(
     geomName: String,
@@ -57,8 +46,6 @@ abstract class BenchMirrorSpecBase(
   private val sliceMask  = (BigInt(1) << portWidth) - 1
 
   private val effOutBeatLanes = outBeatLanes
-  private val outSubBeats     = outLanesPerTile / effOutBeatLanes
-  private val outBeatWidth    = effOutBeatLanes * outLaneWidth
 
   private val ADDR_WIDTH = 32
   private val DATA_WIDTH = 128
@@ -112,8 +99,6 @@ abstract class BenchMirrorSpecBase(
   }
 
   // ───────────────────────── AXI4 helpers ─────────────────────────
-  // (Duplicated from CoreSpec to keep each spec self-contained — refactor into
-  // a shared trait if a third spec needs them.)
 
   private def axiWrite(dut: CoreTop, addr: BigInt, data: BigInt, maxCycles: Int = 50): Int = {
     dut.s_axi.awid.poke(0.U)
@@ -150,11 +135,9 @@ abstract class BenchMirrorSpecBase(
 
   // ───────────────────────── AXI-Stream helpers ─────────────────────────
 
-  /** Push wide beats, slicing each into numInPorts port-width slices fed in
-    * lockstep (port 0 = LSBs — the CoreTop join's Cat order). With `stagger`
-    * set, each port's tvalid is randomly deasserted some cycles, mimicking N
-    * independent DMAs that are not cycle-aligned; the join must still accept
-    * every beat on all ports simultaneously, so a single index suffices. */
+  /** Push wide beats as numInPorts port-width slices (port 0 = LSBs). `stagger`
+    * randomly drops each port's tvalid, mimicking unaligned DMAs; the join still
+    * accepts each beat on all ports at once, so a single index suffices. */
   private def pushAxisBeats(
       dut: CoreTop, beats: Seq[BigInt],
       maxCyclesPerBeat: Int = 50, stagger: Option[Random] = None
@@ -251,8 +234,7 @@ abstract class BenchMirrorSpecBase(
     buf.toSeq
   }
 
-  /** Yesterday's bug: row-major outer loop. Kept here so the regression-guard
-    * test can verify this spec would have caught the bench.c bug. */
+  /** The old (buggy) bench.c row-major order, for the regression-guard test. */
   private def packBenchWeightBuffer_RowMajorBuggy(
       weightMat: Array[Array[Int]], n: Int, m: Int): Seq[BigInt] = {
     val numColTiles = m / outLanesPerTile
@@ -306,11 +288,8 @@ abstract class BenchMirrorSpecBase(
   }
 
   // ───────────────────── Batched (batchSize > 1) variants ─────────────────────
-  // The engine is activation-stationary + weight-broadcast: one weight stream
-  // feeds all `batchSize` PE rows, each row carrying its own activation vector.
-  // So a batched op is: LOAD B-wide activation beats, COMPUTE the SAME weight
-  // stream once, STORE B*m outputs (batch-major — see Core.scala drain rowAddr
-  // = (batch*numColTiles + colTile)*outSubBeats + sub).
+  // One weight stream feeds all batchSize rows: LOAD B-wide activation beats, COMPUTE
+  // the same weight stream once, STORE B*m outputs batch-major.
 
   /** One LOAD beat carrying all B batch items' activations for inner-dim row n:
     * item b occupies bits [(b+1)*aWidth-1 : b*aWidth], matching Core.scala sLoad's
@@ -368,15 +347,11 @@ abstract class BenchMirrorSpecBase(
       }
     }
 
-  // ──────────────────────────────────────────────────────────────────────
-  // Tests
-  // ──────────────────────────────────────────────────────────────────────
+  // ───────────────────────── Tests ─────────────────────────
 
   s"Bench mirror at $geomName params (aWidth=$aWidth, xDim=$xDim, batchSize=$batchSize)" - {
 
-    // Single-vector flow tests: these LOAD one activation/beat and check m
-    // outputs, so they are only meaningful at batchSize == 1. The batched
-    // subclasses run the B-wide tests below instead.
+    // Single-vector flow tests (batchSize == 1 only).
     if (batchSize == 1) {
     "single col tile: bench-style packing matches ref matmul" in {
       simulateRaw(mkTop) { dut =>
@@ -521,52 +496,37 @@ abstract class BenchMirrorSpecBase(
   }
 }
 
-/** K26_Bench geometry (aWidth=16, xDim=4). maxAcc / maxN / maxM scaled down
-  * for sim speed — the packing logic is identical at any size so a 2-3
-  * col-tile workload is sufficient to catch ordering bugs. */
+/** aWidth=16, xDim=4; sizes scaled down for sim speed (2-3 col tiles catch ordering bugs). */
 class BenchMirrorSpec extends BenchMirrorSpecBase(
   geomName = "K26_Bench", aWidth = 16, maxAcc = 256, xDim = 4, maxN = 128, maxM = 128)
 
-/** K26_Bench16 geometry (aWidth=8, xDim=16 → 64-lane col tiles, 128-bit
-  * s_axis). maxAcc kept at the real 4096 so outAccWidth=20 / outLaneWidth=32
-  * match the deployed bitstream's m_axis packing exactly. maxM=192 fits the
-  * multi-tile test's worst case of 3 col tiles x 64 lanes. */
+/** aWidth=8, xDim=16 (64-lane col tiles, 128-bit s_axis). maxAcc=4096 keeps the real
+  * 32-bit output lanes; maxM=192 fits 3 col tiles. */
 class BenchMirror16Spec extends BenchMirrorSpecBase(
   geomName = "K26_Bench16", aWidth = 8, maxAcc = 4096, xDim = 16, maxN = 128, maxM = 192)
 
-/** K26_Bench32 geometry (aWidth=8, xDim=32 → 256-bit s_axis split across N=2
-  * 128-bit ports). maxM=384 fits 3 col tiles x 128 lanes. */
+/** aWidth=8, xDim=32: 256-bit s_axis split across 2 ports. */
 class BenchMirror32Spec extends BenchMirrorSpecBase(
   geomName = "K26_Bench32", aWidth = 8, maxAcc = 4096, xDim = 32, maxN = 128, maxM = 384)
 
-/** K26_Bench64 geometry (aWidth=8, xDim=64 → 512-bit s_axis split across N=4
-  * 128-bit ports). maxM=768 fits 3 col tiles x 256 lanes. */
+/** aWidth=8, xDim=64: 512-bit s_axis split across 4 ports. */
 class BenchMirror64Spec extends BenchMirrorSpecBase(
   geomName = "K26_Bench64", aWidth = 8, maxAcc = 4096, xDim = 64, maxN = 128, maxM = 768)
 
-/** K26_MMFree370M geometry at FULL size (maxN=4096, maxM=32000) so the real
-  * register widths are elaborated (15-bit cmpCols, 125-col-tile counters,
-  * 4096-entry act BRAM) and the N=2816 non-pow2 inner dim (down_proj) runs
-  * through the 4-way port join. Datapath is otherwise BenchMirror64Spec's. */
+/** Full-size maxN=4096 / maxM=32000 so real counter widths elaborate and the N=2816
+  * (down_proj) inner dim runs through the 4-way join. */
 class BenchMirror370MSpec extends BenchMirrorSpecBase(
   geomName = "K26_MMFree370M", aWidth = 8, maxAcc = 4096, xDim = 64, maxN = 4096, maxM = 32000)
 
-/** K26_MMFree370M_A16 geometry (aWidth=16, xDim=32 → 512-bit s_axis split across
-  * N=4 ports, SIGNED activations). Reduced maxN/maxM for sim speed; the point is
-  * to exercise the signed sign-extension path end-to-end through the 4-way join
-  * with negative activations (genAct returns [-2048,2047]). outLanesPerTile=256
-  * (=32*8), so maxM=512 spans 2 col tiles. */
+/** a16 geometry (aWidth=16, xDim=32, 4-way join) with SIGNED activations: exercises
+  * sign extension end-to-end with negative values. */
 class BenchMirror370M_A16Spec extends BenchMirrorSpecBase(
   geomName = "K26_MMFree370M_A16", aWidth = 16, maxAcc = 4096, xDim = 32,
   maxN = 128, maxM = 768, signedAct = true)
 
-// ─── Batched (batchSize > 1) specs — Phase 0 hardening of the Core FSM batch
-//     path (the SystolicArray grid is already verified at yDim=2 in
-//     SystolicArraySpec; these close the LOAD/drain/STORE wrapper gap). ───
+// ─── Batched (batchSize > 1) specs: B-wide LOAD, batch-major drain, B*m STORE ───
 
-/** Small/fast batch geometry (xDim=4, single 32-bit port): primary correctness
-  * for B=2 and B=4 — exercises the B-wide LOAD, B-row compute, batch-major
-  * drain and B*m STORE cheaply. */
+/** Small/fast batch geometry (xDim=4, single 32-bit port). */
 class BenchMirrorBatch2Spec extends BenchMirrorSpecBase(
   geomName = "Batch-small", aWidth = 8, maxAcc = 256, xDim = 4,
   maxN = 128, maxM = 128, batchSize = 2)
@@ -575,19 +535,12 @@ class BenchMirrorBatch4Spec extends BenchMirrorSpecBase(
   geomName = "Batch-small", aWidth = 8, maxAcc = 256, xDim = 4,
   maxN = 128, maxM = 128, batchSize = 4)
 
-/** Realistic deployed geometry batched: a16 (aWidth=16, xDim=32 → 256-lane col
-  * tiles, 4-way port join, signed activations), batchSize=2. Reduced maxN/maxM
-  * for sim speed; the point is the full batched datapath at the real array
-  * width. (Drain = B*256 cycles/tile here — slow in sim but functionally what
-  * the bitstream does.) */
+/** Batched a16 geometry (real array width, 4-way join, signed), reduced maxN/maxM. */
 class BenchMirror370M_A16_B2Spec extends BenchMirrorSpecBase(
   geomName = "K26_MMFree370M_A16_B2", aWidth = 16, maxAcc = 4096, xDim = 32,
   maxN = 64, maxM = 512, batchSize = 2, signedAct = true)
 
-// ─── outBeatLanes=4 (128-bit m_axis) batched specs — the store-bandwidth config
-//     (board B=4 showed the 32-bit store was the batch bottleneck). Exercise the
-//     4-lane drain + multi-lane m_axis beats together with batch. The batched a16
-//     presets (k26_mmfree370m_a16_b{2,4,8}) now carry outBeatLanes=4. ───
+// ─── outBeatLanes=4 (128-bit m_axis, as shipped) with batch: 4-lane drain + multi-lane beats ───
 class BenchMirrorBatch4_Obl4Spec extends BenchMirrorSpecBase(
   geomName = "Batch-small-obl4", aWidth = 8, maxAcc = 256, xDim = 4,
   maxN = 128, maxM = 128, batchSize = 4, outBeatLanes = 4)
@@ -596,10 +549,8 @@ class BenchMirror370M_A16_B4_Obl4Spec extends BenchMirrorSpecBase(
   geomName = "K26_MMFree370M_A16_B4", aWidth = 16, maxAcc = 4096, xDim = 32,
   maxN = 64, maxM = 512, batchSize = 4, outBeatLanes = 4, signedAct = true)
 
-// B=6: the K26 device sweet spot (B8 overflowed the fabric — see CoreConfig
-// K26_MMFree370M_A16_B6). Non-power-of-2 batch exercises the arithmetic batch
-// addressing (drainBatchCtr*numColTiles+…, outBram depth 6*…) at the real a16
-// array width with the 4-lane store.
+// Non-power-of-2 batch exercises the arithmetic batch addressing
+// (drainBatchCtr*numColTiles+…) at the real a16 array width.
 class BenchMirror370M_A16_B6_Obl4Spec extends BenchMirrorSpecBase(
   geomName = "K26_MMFree370M_A16_B6", aWidth = 16, maxAcc = 4096, xDim = 32,
   maxN = 64, maxM = 512, batchSize = 6, outBeatLanes = 4, signedAct = true)

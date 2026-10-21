@@ -1,8 +1,8 @@
 # matmulfree_KRIA
 
-A Chisel3 hardware implementation of a ternary-accumulating systolic array for matmulfree LLM inference, packaged as an AXI4 IP for the Xilinx KRIA SoM (KV260 / KR260) with userspace driver and benchmark.
+A Chisel3 hardware implementation of a ternary-accumulating systolic array for matmulfree LLM inference, packaged as an AXI4 IP for the Xilinx Kria K26 SoM (KV260 / KR260), with a userspace driver, a CPU-vs-FPGA decode runner, and the measurement scripts behind the published numbers.
 
-> "Matmulfree" here means weights are restricted to the ternary set `{-1, 0, +1}`, so every multiply collapses to an add, subtract, or hold. No DSP slices are consumed by the multiply itself — the array is built entirely from adders.
+> "Matmulfree" here means weights are restricted to the ternary set `{-1, 0, +1}`, so every multiply collapses to an add, subtract, or hold. The array needs no multipliers; the shipped presets map the lane accumulators onto DSP48E2 slices used as adders (`dspAccum`).
 
 ## Architecture
 
@@ -25,10 +25,10 @@ A Chisel3 hardware implementation of a ternary-accumulating systolic array for m
 
 The Core exposes three external interfaces:
 - **`s_axi`** — AXI4 slave for 128-bit instruction MMIO + status reads + IRQ ack.
-- **`s_axis`** — AXI4-Stream slave; time-multiplexed between **activations** during `LOAD_ACT` and **weights** during `COMPUTE_MM`. Activations land in on-chip BRAM and stay there; weights stream from DRAM each cycle.
+- **`s_axis`** — AXI4-Stream slave; time-multiplexed between **activations** during `LOAD_ACT` and **weights** during `COMPUTE_MM`. Activations land in on-chip BRAM and stay there; weights stream from DRAM each cycle (1.6-bit packed on the shipped presets, expanded on chip by `WeightUnpackGearbox`).
 - **`m_axis`** — AXI4-Stream master; emits accumulator lanes during `STORE_OUT`.
 
-The compute primitive is a `yDim × xDim` grid of ternary-MAC PEs. Each PE holds `aWidth/2` lane-accumulators; per cycle it consumes `xDim·aWidth/2` ternary weights (broadcast across the batch dim) + one activation per batch row, producing `outLanesPerTile = xDim · aWidth/2` accumulators per array pass. The Core tiles the output column dimension `M` across multiple array passes, reading the same activation BRAM for each tile.
+The compute primitive is a `batchSize × xDim` grid of ternary-MAC PEs. Each PE holds `aWidth/2` lane-accumulators; per cycle it consumes `xDim·aWidth/2` ternary weights (broadcast across the batch dim) + one activation per batch row, producing `outLanesPerTile = xDim · aWidth/2` accumulators per array pass. The Core tiles the output column dimension `M` across multiple array passes, reading the same activation BRAM for each tile. Each `COMPUTE` carries the active row count, so one bitstream serves any batch `b ≤ batchSize`.
 
 See `src/main/scala/control/CoreConfig.scala` for the full parameter set and the named presets.
 
@@ -37,59 +37,45 @@ See `src/main/scala/control/CoreConfig.scala` for the full parameter set and the
 ```
 Makefile             Build-server task runner (sim / build / stage / model / deploy).
                      The board's verbs live in scripts/transfer.mk — see below.
-board.conf.example   Per-board addresses + device paths (copy to board.conf).
+board.conf.example   Build-server deploy target (BOARD, BOARD_DEST); copy to board.conf.
 
 src/main/scala/
-  systolic/          PE.scala, SystolicArray.scala — the compute primitive
+  systolic/          PE.scala, SystolicArray.scala, WeightUnpack.scala (1.6-bit gearbox)
   control/           Core.scala (FSM + BRAMs), CoreTop.scala (Vivado-facing wrapper),
                      AxiInstructionHandler.scala (instruction MMIO),
-                     CoreConfig.scala (parameter holder + presets + manifest emitters),
+                     ActMem.scala / OutMem.scala (activation / output memories),
+                     CoreConfig.scala (parameters + presets + manifest emitters),
                      EmitCore.scala (SystemVerilog + preset-manifest emission)
+src/test/scala/      systolic/{PE,SystolicArray,WeightUnpack}Spec,
+                     control/{Core,AxiInstructionHandler,BenchMirror,CoreConfig}Spec
 
-src/test/scala/
-  systolic/{PESpec, SystolicArraySpec, WeightUnpackSpec}.scala — compute primitives
-  control/{CoreSpec, AxiInstructionHandlerSpec, BenchMirror*Spec, CoreConfigSpec}.scala
-
-software/            PS-side userspace stack
-  include/           Single-header register / instruction / runtime API
-  bench/             bench.c (sweep harness), mmfree_runtime.c (driver glue)
-  Makefile           Native build on the KRIA (or cross-compile via CC=)
-  integration/       MMfreeLM model integration (packer + engine API + runner)
-    mmfree_pack/     offline weight packer → per-port blobs (geometry from the manifest)
-    libmmfree/       mmfree_lib.c — resident-weights BitLinear engine API (built into the runner)
-    fpga_runner/     C++ CPU-vs-FPGA decode runner (gate / serve) — the offload path
-    tests/           Host-side checks: split-chunk plan, threaded readback, packed round-trip
+software/            PS-side userspace stack (software/README.md)
+  include/ bench/    register map + instruction encoder, AXI-DMA/udmabuf runtime, bench.c
+  integration/       MMfreeLM weight packer, libmmfree engine API, fpga_runner decode runner
 
 scripts/
-  build_all.sh       Chisel → SV+manifest → IP → bitstream → overlay → transfer/<preset>/
-  build_project.tcl / bd.tcl / package_ip.tcl   Vivado project + block design + IP packaging
-  gen_overlay.tcl    xsct script: .xsa → .dtbo + .bit + shell.json (udmabufs from the manifest)
-  deploy_kria.sh     run ON the board: install overlay, load app, verify udmabuf sizes
-  ooc_synth.tcl      Out-of-context synthesis driver for each preset
+  build_all.sh       Chisel → SV+manifest → IP → bitstream → overlay → transfer/presets/<p>/
+  build_project.tcl / package_ip.tcl / gen_overlay.tcl / ooc_synth.tcl   Vivado + xsct steps
+  clone_preset_hw.sh build a same-RTL preset's bundle from an existing bitstream
+  transfer.mk        SOURCE for the bundle's board Makefile (staged → transfer/Makefile)
+  deploy_kria.sh, bench_batch.sh, power_bench.sh, cma_reclaim.sh, final_sweep_board.sh, …
+                     board-side scripts, staged into transfer/
+  final_sweep_xeon.sh, final_dataset.py   x86 baseline sweep + the data-set aggregator
+vivado/bd.tcl        Block design (PS + N×AXI-DMA + CoreTop)
 
-external/udmabuf/    Vendored u-dma-buf kernel driver (submodule; built + loaded by deploy)
-matmulfreellmCPU/    CPU reference model (submodule)
+external/udmabuf/    Vendored u-dma-buf kernel driver (submodule; built + loaded by deploy-hw)
+matmulfreellmCPU/    C++ CPU engine + provisioning tools (submodule)
 
-generated/<preset>/  EmitCore + IP-packaging output: SystemVerilog + component.xml +
-                     preset.env/.json (the manifest). Build product — gitignored,
-                     regenerated by `make build`; build_all.sh re-packages the IP if absent.
-transfer/            The self-contained bundle the KRIA needs — and NOTHING else from the
-                     repo. `make deploy` rsyncs this whole tree to the board. Build product —
-                     gitignored (the board files under it are tracked in scripts/, see below):
-                       Makefile             board task runner (from scripts/transfer.mk)
-                       deploy_kria.sh       overlay + driver loader (from scripts/)
-                       board.conf.example   board device map (from scripts/)
-                       udmabuf/             vendored u-dma-buf driver source (shared)
-                       src/                 C++ sources the board native-compiles:
-                         software/  matmulfreellmCPU/cpp/  (nesting preserved)
-                       models/<hf-id>/      provisioned + packed weights (model.mmfree,
-                                            tokenizer.mmtok, packed/), keyed by HF id
-                                            e.g. models/ridger/MMfreeLM-2.7B/
-                       presets/<preset>/    per-preset HW: bit.bin, dtbo, shell.json, manifest
-build/               Build artifacts (Mill, OOC synth, overlay outputs)
-
-scripts/transfer.mk        SOURCE for the bundle's board Makefile (staged → transfer/Makefile).
-scripts/board.conf.example SOURCE for the bundle's board device map.
+generated/<preset>/  Build product: SystemVerilog + packaged IP + preset.env/.json (the manifest)
+build/               Build product: Vivado project, OOC synth, overlay outputs (Mill uses out/)
+transfer/            Build product: the self-contained bundle the KRIA needs — and NOTHING
+                     else from the repo. `make deploy` rsyncs this whole tree to the board:
+                       Makefile, *.sh           board task runner + scripts (from scripts/)
+                       udmabuf/                 u-dma-buf driver source
+                       src/                     software/ + matmulfreellmCPU/cpp/, compiled on the board
+                       presets/<preset>/        core_bench.bit.bin, .dtbo, shell.json, preset.env/.json
+                       models/<hf-id>/          model.mmfree, tokenizer.mmtok, packed/ (2-bit blob),
+                                                packed-1p6/ (1.6-bit blob), e.g. models/ridger/MMfreeLM-2.7B/
 ```
 
 ### Single source of truth: the preset manifest
@@ -97,11 +83,11 @@ scripts/board.conf.example SOURCE for the bundle's board device map.
 Every preset's geometry is defined **once** in `CoreConfig.scala`. `EmitCore` emits it
 alongside the SystemVerilog as `generated/<preset>/preset.env` (KEY=VAL, sourced by the
 shell/C build) and `preset.json` (read by the Python tools). Everything downstream —
-`build_all.sh`, `software/Makefile`, `gen_overlay.tcl`, the weight packer, the C runtime —
+`build_all.sh`, `gen_overlay.tcl`, the board Makefile, the weight packer, the C runtime —
 **consumes the manifest instead of re-deriving geometry**, so an array-size change is a
-one-line edit in `CoreConfig` with no hand-syncing across scripts. The C runtime even
-cross-checks its resolved geometry against the manifest at startup (`MMFREE_MANIFEST`),
-warning (or, with `MMFREE_STRICT=1`, aborting) on any disagreement with the loaded bitstream.
+one-line edit in `CoreConfig`. The C runtime cross-checks its resolved geometry against the
+manifest at startup (`MMFREE_MANIFEST`), warning (or, with `MMFREE_STRICT=1`, aborting) on any
+disagreement with the loaded bitstream.
 
 ## Prerequisites
 
@@ -111,22 +97,19 @@ warning (or, with `MMFREE_STRICT=1`, aborting) on any disagreement with the load
 - No need to install Mill; the repo ships a `./mill` bootstrap (Mill is the sole build tool)
 
 **Host (KRIA bring-up):**
-- Xilinx Vivado / Vitis 2025.2 (for `vivado`, `xsct`, IP packaging, bitstream gen) — `build_all.sh` also needs `bootgen`
-- `dtc` (`sudo apt install device-tree-compiler`)
-- `unzip`
+- Xilinx Vivado / Vitis 2025.2 (`vivado`, `xsct`, `bootgen`)
+- `dtc` (`sudo apt install device-tree-compiler`), `unzip`, `rsync`
 
-**KRIA target** (needs ONLY the scp'd `transfer/` bundle — no repo checkout):
-- Ubuntu-on-KRIA (22.04 or 24.04 LTS Xilinx image)
-- `xmutil` (ships with the Xilinx Ubuntu image)
+**KRIA target** (needs ONLY the `transfer/` bundle — no repo checkout):
+- Ubuntu-on-KRIA (22.04 or 24.04 LTS Xilinx image) with `xmutil`
 - `gcc`, `g++` (C++17), `make`, `cmake` — the board `make build` native-compiles `bench` and
   the `fpga_runner` (which builds `libmmfreecpu.a` via CMake) from the bundled `src/` tree
-- kernel headers — `sudo apt install linux-headers-$(uname -r)` — to build the **vendored
-  `u-dma-buf` driver** (shipped in `transfer/udmabuf/`). `sudo make deploy-hw` builds + loads
-  it for you; no externally-installed module is required.
+- kernel headers (`sudo apt install linux-headers-$(uname -r)`) — `sudo make deploy-hw`
+  builds + loads the vendored `u-dma-buf` driver; no externally-installed module is required
 
-**MMfreeLM integration (optional, `software/integration/`):**
-- Python 3.10+ with `numpy` (weight packer); `torch` only for `--checkpoint` loads
-- `g++` (C++17) for the `fpga_runner` decode runner
+**Model provisioning + packing (build server):**
+- Python 3.10+: `pip install -r matmulfreellmCPU/tools/requirements.txt` (download + quantize)
+  and `software/integration/requirements.txt` (the packer needs only `numpy`)
 
 ## Quickstart
 
@@ -139,63 +122,63 @@ cd matmulfree_KRIA
 git submodule update --init --recursive
 ```
 
-Submodules: `matmulfreellmCPU` (the CPU reference model) and `external/udmabuf` (the
-vendored `u-dma-buf` kernel driver, staged into the bundle and built + loaded on the board by `sudo make deploy-hw`).
-
 ### 2. The command reference
 
 The flow is split across **two Makefiles by responsibility**, so it is never ambiguous which
-command runs where. Both read geometry from the preset manifest (the single source of truth).
-Every target below is real — `make help` on either side prints the same list.
+command runs where. Both read geometry from the preset manifest, both default to
+`PRESET=mmfree_2_7b`, and `make help` on either side lists the verbs plus the presets
+(and, on the board, models) present.
 
 #### Build server — root `Makefile`
 
-Run from the repo root. This is where all compute-heavy work happens (Chisel, Vivado, model
+Run from the repo root. All compute-heavy work happens here (Chisel, Vivado, model
 provisioning); the board never sees the repo.
 
 | Command | What it does |
 |---|---|
-| `make help` | the verb list, plus the presets currently emitted under `generated/` |
 | `make sim [SPEC=substr]` | Mill test suite; `SPEC` filters by test-name substring |
 | `make build PRESET=<p>` | Chisel → SV+manifest → IP → bitstream → `transfer/presets/<p>/`, **and** stage the C++ sources into `transfer/src/` |
-| `make stage` | re-stage `transfer/{Makefile,*.sh,src/}` only — no Vivado, no bitstream |
-| `make model PRESET=<p>` | provision **+** pack the preset's checkpoint → `transfer/models/<hf-id>/` |
+| `make stage` | re-stage `transfer/{Makefile,*.sh,src/}` only — no Vivado. Run it after editing `software/` or `scripts/`, or the board compiles the old copy |
+| `make model PRESET=<p>` | `provision` + `pack` the preset's checkpoint → `transfer/models/<hf-id>/` (see [Provision + pack](#provision--pack-model-weights-host) for the 1.6-bit output dir) |
 | `make provision PRESET=<p>` | stage 1 only: HF download → `model.mmfree` + `tokenizer.mmtok` |
-| `make pack PRESET=<p>` | stage 2 only: `model.mmfree` → per-port engine blobs in `packed/` |
+| `make pack PRESET=<p>` | stage 2 only: `model.mmfree` → per-port engine blobs (format from the manifest) |
 | `make deploy BOARD=user@host` | rsync the whole `transfer/` bundle → `<board>:~/transfer/` |
 
-Common variables: `PRESET=` (required by most), `MODEL=<hf-id>` overrides the preset's
-checkpoint, `OUT=<dir>` / `BLOB=<file>` retarget provision/pack, `CKPT=<hf-id>` packs straight
-from a checkpoint, `ARGS="…"` passes through to the underlying tool, `DEPLOY_MODELS="<hf-id> …"`
-limits which models ship (HW presets and `src/` always ship), `BOARD_DEST=` changes the remote
-directory (default `~`).
+Variables: `MODEL=<hf-id>` overrides the preset's checkpoint, `OUT=<dir>` / `BLOB=<file>` /
+`PACKED_DIR=<dir>` retarget provision/pack, `ARGS="…"` passes through to the underlying tool,
+`DEPLOY_MODELS="<hf-id> …"` limits which models ship (HW presets and `src/` always ship),
+`BOARD_DEST=` changes the remote directory (default `~`).
 
 #### KRIA — `transfer/Makefile` (staged from `scripts/transfer.mk`)
 
-Run from `~/transfer` on the board. The board has **only** the scp'd bundle — no repo, no
-toolchain beyond gcc/g++/make/cmake.
+Run from `~/transfer` on the board.
 
 | Command | What it does |
 |---|---|
-| `make help` | the verb list, plus the presets and models present in the bundle |
 | `make build` | native-compile `bench` + `fpga_runner` from `src/` |
-| `sudo make deploy-hw PRESET=<p>` | load the bitstream overlay + build/load u-dma-buf, verify udmabuf sizes |
-| `make bench PRESET=<p> [BATCH=N]` | native sweep benchmark (+ rail power) |
-| `make gate PRESET=<p> [MODEL=<hf-id>]` | exact-match gate: CPU == FPGA, bit for bit |
+| `sudo make deploy-hw PRESET=<p>` | load the bitstream overlay + build/load u-dma-buf, program `fclk0`, verify udmabuf sizes |
+| `make gate PRESET=<p> [MODEL=<hf-id>]` | exact-match gate: CPU == FPGA, bit for bit, every projection |
 | `make streams PRESET=<p> [STREAMS=n]` | batched decode with a **different prompt per stream**, each checked against its own single-stream run (the row-order check the sweep cannot do) |
 | `make run PRESET=<p> [MODEL=<hf-id>]` | FPGA decode, timed + profiled (+ rail power) |
-| `make gen PRESET=<p> PROMPT="…" [GEN=n]` | interactive generation, live streamed text |
-| `make sweep PRESET=<p> [GEN=n] [REPS=n]` | batch ladder b=1..batchSize → one CSV row per batch |
+| `make gen PRESET=<p> PROMPT="…" [GEN=n]` | interactive generation, live streamed text (`TEMP`/`TOPK`/`SEED` for sampling) |
+| `make sweep PRESET=<p> [GEN=n] [REPS=n]` | batch ladder b=1..batchSize → one CSV row per batch in `results/` |
+| `make bench PRESET=<p> [BATCH=N]` | synthetic per-projection sweep (+ rail power). 2-bit bitstreams only — it refuses a packed-weight preset |
 
-`sweep` also takes `BACKEND=cpu` (same ladder with the engine out of the loop — the CPU
-baseline) or `BACKEND=cpu-tq1` (CPU arm with 1.6-bit weights: bit-identical, ~0.6-0.8× on the
-A53). Power sampling is on by default for `bench`/`run`; `POWER=0` disables it, and
-`POWER_INTERVAL` / `POWER_ARGS` / `POWER_DIR` tune it. Note that a `POWER=1` arm costs ~2%
-decode, so compare only arms with matching flags.
+`sweep` also takes `BACKEND=cpu` (the same ladder with the engine out of the loop — the CPU
+baseline, int8 weights) or `BACKEND=cpu-2bit` / `cpu-1p6` (CPU weights held at the FPGA's two
+encodings; bit-identical results, only speed differs). The CPU arms batch at the `--serve`
+width like the engine does; `ENV="MMFREE_CPU_BATCH=1"` forces the one-stream-at-a-time CPU path
+for an A/B.
 
-`sudo` is required wherever the runtime opens `/dev/mem` (`deploy-hw`, `bench`, `gate`,
-`streams`, `run`, `gen`) — the Makefile hands the geometry through `sudo env`, because `sudo`
-strips the environment.
+Power sampling (`xlnx_platformstats` → `power/`) is on by default for `bench`, `run` and
+`sweep`; `POWER=0` disables it, `POWER_INTERVAL` / `POWER_ARGS` / `POWER_DIR` tune it. A
+`POWER=1` arm costs ~2% decode, so compare only arms with matching flags.
+
+The verbs that open `/dev/mem` invoke `sudo` themselves and hand the manifest geometry through
+`sudo env`, because `sudo` strips the environment. For the same reason, runtime knobs go in
+`ENV="K=V …"` (e.g. `ENV="MMFREE_SPLIT_CHUNKS=0"`) and runner flags in `ARGS="…"`, which is
+appended last so it wins. The knobs themselves are listed in `software/README.md` and
+`software/integration/fpga_runner/README.md`.
 
 #### Component Makefiles (rarely needed directly)
 
@@ -203,7 +186,7 @@ strips the environment.
 |---|---|
 | `make -C software` | build `bench` (the board's `make build` delegates here) |
 | `make -C software/integration/fpga_runner` | build `mmfree-cli-fpga` + `libmmfreecpu.a` |
-| `make -C software/integration/tests` | host-side checks: split-chunk plan, threaded readback, packed round-trip |
+| `make -C software/integration/tests` | host-side checks: split-chunk plan, threaded readback, 1.6-bit pack round-trip |
 | `make -C matmulfreellmCPU` | build the standalone CPU engine (`mmfree-cli`); also `model`, `run`, `bench`, `test` |
 
 ### 3. Run the test suite
@@ -214,10 +197,9 @@ make sim SPEC=CoreConfig       # one suite by name substring
 ./mill matmulfree_KRIA.test -z "CoreSpec"   # equivalent direct form
 ```
 
-Expected: 158 tests, 0 failures, across `PESpec`, `SystolicArraySpec`, `WeightUnpackSpec`,
-`CoreSpec`, `AxiInstructionHandlerSpec`, the `BenchMirror*Spec` family, and `CoreConfigSpec`.
-First run is slow (Verilator compiles each DUT) — budget ~6 minutes; subsequent runs reuse the
-cache.
+Suites: `PESpec`, `SystolicArraySpec`, `WeightUnpackSpec`, `CoreSpec`,
+`AxiInstructionHandlerSpec`, the `BenchMirror*Spec` family, and `CoreConfigSpec`. The first
+run is slow (Verilator compiles each DUT); later runs reuse the cache.
 
 ### 4. Emit SystemVerilog + manifest for a preset
 
@@ -229,30 +211,39 @@ cache.
 ```
 
 `main` carries exactly three deployable presets — one per released MMfreeLM checkpoint
-(`CoreConfig.scala`, registry `CoreConfigs.deployable`):
+(`CoreConfig.scala`, registry `CoreConfig.deployable`):
 
-| Preset | Checkpoint | xDim | batch | aWidth | maxN | maxM | ports×width | m_axis | clk |
-|---|---|---|---|---|---|---|---|---|---|
-| `mmfree_370m` | MMfreeLM-370M | 32 | 8 | 16 | 4096 | 32000 | 4×128 b | 128 b | 250 |
-| `mmfree_1_3b` | MMfreeLM-1.3B | 32 | 8 | 16 | 8192 | 32000 | 4×128 b | 128 b | 250 |
-| `mmfree_2_7b` | MMfreeLM-2.7B | 32 | 8 | 16 | 8192 | 32000 | 4×128 b | 128 b | 250 |
+| Preset | Checkpoint | xDim | batch | aWidth | maxN | maxM | ports×width | m_axis | clk | tok/s @ b=8 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `mmfree_370m` | MMfreeLM-370M | 32 | 8 | 16 | 4096 | 32000 | 4×128 b | 128 b | 250 | 137.06 |
+| `mmfree_1_3b` | MMfreeLM-1.3B | 32 | 8 | 16 | 8192 | 32000 | 4×128 b | 128 b | 250 | 66.27 |
+| `mmfree_2_7b` | MMfreeLM-2.7B | 32 | 8 | 16 | 8192 | 32000 | 4×128 b | 128 b | 250 | 44.69 |
 
 All three are B8 + `dspAccum` + 1.6-bit packed weights + column banking + the banked output
 memory. **1.3B and 2.7B emit byte-identical RTL**, so build 2.7B once and assemble the 1.3B
-bundle with `scripts/clone_preset_hw.sh` rather than running Vivado twice.
+bundle with `scripts/clone_preset_hw.sh` rather than running Vivado twice. tok/s is aggregate
+decode, the five-pass median on the board with rail power sampled. The 1.3B cell moves between
+sessions with a bimodal host-side pack cost; its b=1..6 rows are the stable ones.
 
 `s_axis` is `max(xDim, batchSize) × aWidth` bits, split across `ports` of ≤128 b (one PS HP port
-each). `m_axis` is `outBeatLanes × outLaneWidth`. `clk` is the target PL fabric clock
-(`plClkMhz`) — and note it is an STA target only: the real fabric rate is `fclk0`, which sticks
-across overlay reloads. All of these land in `preset.env`/`preset.json`.
+each). `m_axis` is `outBeatLanes × outLaneWidth`. `clk` is the PL clock the design is
+timing-closed for (`plClkMhz`); `deploy-hw` programs `fclk0` to it and reports the achieved rate,
+since an overlay reload alone leaves `fclk0` at whatever rate it had. All of these land in
+`preset.env`/`preset.json`.
 
-The ~50 ablation presets (batch ladders, clock rungs, banking widths, DSP-accum on/off) live on
+**2-bit control arm.** `CoreConfig.candidates` holds `mmfree_370m_2bit` / `mmfree_1_3b_2bit` /
+`mmfree_2_7b_2bit`: the shipped presets with `packedWeights` off and nothing else changed, so
+each pair isolates the weight encoding. They build and clone the same way and read the 2-bit
+blob in `packed/`. Their udmabuf-wt is 1.25× larger (2.7B: 624 MiB over 4 ports), so on the
+board run `sudo ./cma_reclaim.sh` before deploying the 2.7B one.
+
+The ablation presets (batch ladders, clock rungs, banking widths, DSP-accum on/off) live on
 the **`exploration`** branch, along with the sweep harness that produced their numbers.
 
-The default preset directory is `generated/<preset_name>/`; override with `EmitCore <preset> <dir>`.
-`EmitCore` does **not** clean that directory first, so `rm -rf generated/<preset>` before
-re-emitting a preset whose geometry changed — otherwise stale `.sv` files sit alongside the new
-ones and any hash-the-SV comparison (including `clone_preset_hw.sh`'s RTL check) is wrong.
+`EmitCore <preset> <dir>` overrides the output directory. `EmitCore` does **not** clean it
+first, so `rm -rf generated/<preset>` before re-emitting a preset whose geometry changed —
+otherwise stale `.sv` files sit alongside the new ones and any hash-the-SV comparison
+(including `clone_preset_hw.sh`'s RTL check) is wrong.
 
 ### 5. (Optional) Out-of-context synthesis
 
@@ -265,158 +256,128 @@ vivado -mode batch -source scripts/ooc_synth.tcl -tclargs mmfree_370m
 
 ## KRIA board bring-up
 
-The whole flow is scripted.
-
-**The whole build-and-deploy, end to end** (2.7B here; 370M is identical with `PRESET=mmfree_370m`):
+**The whole build-and-deploy, end to end** (2.7B here; 370M is identical with its own
+`PRESET` and model dir):
 
 ```bash
 # ── on the BUILD SERVER ───────────────────────────────────────────────────────
-source /tools/Xilinx/Vivado/2025.2/settings64.sh
-make sim                                   # optional: 158 tests, ~6 min
-make build  PRESET=mmfree_2_7b             # Chisel → bitstream → transfer/presets/ + src/
-make model  PRESET=mmfree_2_7b             # download + pack the checkpoint → transfer/models/
+source /opt/Xilinx/2025.2/Vivado/settings64.sh   # your install path; also puts Vitis' xsct on PATH
+make sim                                   # optional
+make build PRESET=mmfree_2_7b              # Chisel → bitstream → transfer/presets/ + src/
+make model PRESET=mmfree_2_7b              # provision + pack into transfer/models/<hf-id>/
 make deploy BOARD=ubuntu@kria              # rsync transfer/ → the board (incremental)
 
 # ── on the KRIA, in ~/transfer ────────────────────────────────────────────────
 make build                                 # native-compile bench + fpga_runner
 sudo make deploy-hw PRESET=mmfree_2_7b     # load overlay + u-dma-buf, verify sizes
-make gate  PRESET=mmfree_2_7b              # CPU == FPGA, bit for bit  ← always run this first
-make run   PRESET=mmfree_2_7b              # profiled FPGA decode
-make gen   PRESET=mmfree_2_7b PROMPT="The capital of France is" GEN=40
+make gate PRESET=mmfree_2_7b               # CPU == FPGA, bit for bit  ← always run this first
+make run  PRESET=mmfree_2_7b               # profiled FPGA decode
+make gen  PRESET=mmfree_2_7b PROMPT="The capital of France is" GEN=40
 ```
 
-Building 1.3B is the exception: it emits byte-identical RTL to 2.7B, so build 2.7B and clone
-the bundle instead of running Vivado again:
+1.3B is built by cloning, since it emits byte-identical RTL to 2.7B:
 
 ```bash
 rm -rf generated/mmfree_1_3b                                        # EmitCore does not clean
 ./mill matmulfree_KRIA.runMain control.EmitCore mmfree_1_3b generated/mmfree_1_3b
 scripts/clone_preset_hw.sh mmfree_2_7b mmfree_1_3b                  # seconds, not ~40 min
-make model PRESET=mmfree_1_3b && make deploy BOARD=ubuntu@kria
+make model PRESET=mmfree_1_3b
+make deploy BOARD=ubuntu@kria
 ```
 
 The clone is **refused** unless the two presets emit byte-identical `.sv` and their manifests
-differ only in non-RTL keys (`MMFREE_MODEL`, `MMFREE_SHAPES`, `UDMABUF_WT_SZ`) — so it cannot
-quietly ship the wrong bitstream. The cloned preset's timing record is the source's report,
-since the bitstream is literally the same file.
+differ only in non-RTL keys (`MMFREE_PRESET`, `MMFREE_MODEL`, `MMFREE_SHAPES`, `UDMABUF_WT_SZ`),
+so it cannot quietly ship the wrong bitstream. It re-sizes the overlay's udmabuf-wt nodes to the
+destination's model; the timing record is the source's report.
 
-### 1. Build the bitstream + transfer bundle (host)
+### Build options (host)
 
-Source your Vivado settings first (needs `vivado`, `xsct`, `dtc`, `bootgen`, `unzip` on PATH):
-
-```bash
-source /tools/Xilinx/Vivado/2025.2/settings64.sh
-make build PRESET=mmfree_370m        # = PRESET=… ./scripts/build_all.sh
-```
-
-`build_all.sh` runs the full chain — emit SV + manifest → package the `CoreTop` IP →
-build the block design (PS + N×AXI-DMA + CoreTop) → bitstream → `.xsa` → device-tree
-overlay → `bootgen` — and assembles the per-preset HW into **`transfer/presets/<preset>/`**
-(`.bit.bin`, `.dtbo`, `shell.json`, `preset.env`/`preset.json`). It then **stages the shared,
-preset-independent parts** into `transfer/`: the board `Makefile` + `deploy_kria.sh` (from
-`scripts/`), the vendored `udmabuf/` driver, and the C++ sources under `src/` (`software/` +
-`matmulfreellmCPU/cpp/`, nesting preserved) that the board native-compiles. It sources the
-manifest for every geometry value (port count, stream widths, PL clock, udmabuf sizes), so
-there is nothing to set by hand. Useful overrides:
+`make build` runs `scripts/build_all.sh`: emit SV + manifest → package the `CoreTop` IP →
+block design (PS + N×AXI-DMA + CoreTop) → bitstream → `.xsa` → device-tree overlay →
+`bootgen`, then assembles `transfer/presets/<preset>/` and stages the shared bundle parts. Every
+geometry value (port count, stream widths, PL clock, udmabuf sizes) comes from the manifest.
+Useful overrides (environment):
 
 - `REPACKAGE=1` — re-package the IP from SV (needed when ports/interfaces or the SV file set changed)
-- `BITSTREAM_ONLY=1` / `PACKAGE_ONLY=1` — stop after the XSA / only assemble from an existing XSA
-- `UDMABUF_WT_SZ=0x01800000` — enlarge a udmabuf default (e.g. the resident full-model runner's 24 MiB working set)
-- `PL_CLK_MHZ=100` — rebuild a 250 MHz preset at the legacy clock
+- `BITSTREAM_ONLY=1` / `PACKAGE_ONLY=1` — stop after the XSA / only re-run the overlay + assembly
+  steps from the last-built `build/t_matmul.xsa`
+- `UDMABUF_WT_SZ=<bytes>` — override a udmabuf size (the manifest already sizes udmabuf-wt for
+  the whole resident model)
 
-### 2. Deploy to the board (host → ship)
+### Deploy (host → board)
 
-```bash
-# On the HOST — rsync the whole self-contained bundle to the board (incremental):
-make deploy BOARD=ubuntu@kria          # → ubuntu@kria:~/transfer/   (BOARD_DEST=~)
-# DEPLOY_MODELS="ridger/MMfreeLM-1.3B" limits which model dirs ship (HF ids, space-separated);
-# HW presets + src/ always ship.
-```
+`make deploy BOARD=ubuntu@kria` is **pure file transfer**: it rsyncs the entire `transfer/`
+tree into `<board>:$(BOARD_DEST)/transfer/` and runs nothing on the board. Unchanged files
+(including the multi-GB models) don't re-transfer. First time only: if it reports the directory
+is missing, run `mkdir -p ~/transfer` on the board.
 
-`make deploy` is **pure file transfer** — it rsyncs the entire `transfer/` tree into
-`<board>:$(BOARD_DEST)/transfer/`. Because it's rsync, unchanged files (including the multi-GB
-models) don't re-transfer. It does **not** run anything on the board. (First time only: if it
-reports the directory is missing, run `mkdir -p ~/transfer` on the board once.)
+### On the board
 
-### 3. Build + run on the board (the board has ONLY `~/transfer/`)
-
-Everything happens inside the bundle — no repo checkout needed. Board prerequisites:
-`gcc`, `g++` (C++17), `make`, `cmake`, and kernel headers (`linux-headers-$(uname -r)`).
-
-```bash
-cd ~/transfer
-make build                                   # native-compile bench + fpga_runner from src/
-sudo make deploy-hw PRESET=mmfree_1_3b   # install overlay + load u-dma-buf + verify sizes
-```
-
-`deploy-hw` installs the overlay under `/lib/firmware/xilinx/core_bench/`, **builds + loads the
-vendored `u-dma-buf` driver** from `udmabuf/` (needs kernel headers), (re)loads the app with
-`xmutil`, and **verifies each u-dma-buf node's size against the manifest**. After it loads:
+`sudo make deploy-hw PRESET=<p>` installs the overlay under `/lib/firmware/xilinx/core_bench/`,
+builds + loads the vendored `u-dma-buf` driver from `udmabuf/`, (re)loads the app with
+`xmutil`, programs `fclk0`, and **verifies each u-dma-buf node's size against the manifest**.
+After it loads (4-port presets):
 
 ```bash
 ls /dev/uio*         # → /dev/uio4            (CoreTop)
-ls /dev/udmabuf*     # → /dev/udmabuf-act{,0..3} /dev/udmabuf-wt{,0..3} /dev/udmabuf-out
+ls /dev/udmabuf*     # → /dev/udmabuf-act0..3 /dev/udmabuf-wt0..3 /dev/udmabuf-out
 ```
 
-Each verb defaults to the preset's own checkpoint; `MODEL=<hf-id>` re-points it to a different
-model dir (and sweep) on the same overlay:
-
-```bash
-make bench PRESET=mmfree_1_3b                          # sweep benchmark
-make gate  PRESET=mmfree_1_3b                          # CPU==FPGA exact match (preset's model)
-make run   PRESET=mmfree_1_3b MODEL=ridger/MMfreeLM-2.7B   # profiled FPGA decode, 2.7B on the same overlay
-make gen   PRESET=mmfree_1_3b PROMPT="The capital of France is" GEN=40
-```
-
-Each board verb sources the preset manifest, exports the geometry as `MMFREE_*` (handing it
-through `sudo env`, since `sudo` strips the environment), and passes the addresses/device paths
-from `transfer/board.conf` (or the standard defaults). `sudo` is required because the runtime
-opens `/dev/mem`. `make gate/run/gen` find the model at `models/<hf-id>/` automatically (from the
-manifest's `MMFREE_MODEL`, or the `MODEL=` override); the tokenizer is auto-found beside the blob.
-
-Runtime knobs (env): `MMFREE_VERIFY=0` skips the on-host reference for a pure perf sweep;
-`MMFREE_SHAPES=370m|pow2` picks the sweep; `MMFREE_BATCH=N` sets the batch; `MMFREE_CLK_MHZ`
-overrides the eff%-ceiling clock; `MMFREE_STRICT=1` turns the geometry/manifest cross-check
-from a warning into a hard error.
+Each verb defaults to the preset's own checkpoint; `MODEL=<hf-id>` points it at another model
+on the same overlay, provided the bitstream's `maxN` spans it and its blob fits the overlay's
+udmabuf-wt (sized for the preset's own model). Addresses and device paths come from
+`transfer/board.conf` (copy `board.conf.example`) or the standard defaults. `gate/run/gen` find
+`models/<hf-id>/model.mmfree` from the manifest's `MMFREE_MODEL`, the tokenizer beside it, and
+the packed blob in `packed-1p6/` when the manifest has `MMFREE_PACKED_WEIGHTS=1`, else `packed/`.
 
 ### Provision + pack model weights (host)
 
-The common path is a single command — `make model PRESET=<p>` reads the checkpoint from the
-preset's manifest (`MMFREE_MODEL`) and runs both stages into `transfer/models/<hf-id>/`:
+`make model PRESET=<p>` reads the checkpoint from the preset's manifest (`MMFREE_MODEL`) and runs
+both stages into `transfer/models/<hf-id>/`:
 
 ```bash
-pip install -r matmulfreellmCPU/tools/requirements.txt   # once
-make model PRESET=mmfree_2_7b                  # → transfer/models/ridger/MMfreeLM-2.7B/{model.mmfree,tokenizer.mmtok,packed/}
+make provision PRESET=mmfree_2_7b   # → transfer/models/ridger/MMfreeLM-2.7B/{model.mmfree,tokenizer.mmtok}
+make pack      PRESET=mmfree_2_7b        # 1.6-bit blob → .../packed-1p6/
+make pack      PRESET=mmfree_2_7b_2bit                     # 2-bit blob → .../packed/
 ```
 
-Under the hood it is two stages, each usable on its own for finer control. First **provision** —
-download the HF checkpoint and pack the engine's two inputs, `model.mmfree` (ternary weights) and
-`tokenizer.mmtok` (BPE tokenizer), via `matmulfreellmCPU/tools/provision.py`:
+`provision` runs `matmulfreellmCPU/tools/provision.py` (`ARGS="--skip-download"` /
+`"--tokenizer-only"` pass through). `pack` runs `software/integration/mmfree_pack` with the
+manifest, so the blob's geometry and encoding match the bitstream, and writes it where the
+board looks: `packed-1p6/` for a packed-weight preset, else `packed/` (`PACKED_DIR=` or `OUT=`
+overrides). The runner refuses a blob whose encoding doesn't match the bitstream.
+
+### Reproducing the measurements
+
+The published numbers come from two sweeps and one aggregator:
 
 ```bash
-make provision PRESET=mmfree_1_3b              # → transfer/models/ridger/MMfreeLM-1.3B/{model.mmfree,tokenizer.mmtok}
-# MODEL=<hf-id> overrides the preset's checkpoint; OUT=<dir> overrides the location;
-# ARGS="--skip-download" / "--tokenizer-only" pass through.
+# on the KRIA, in ~/transfer — settings go AFTER sudo, which strips the environment
+sudo ./final_sweep_board.sh                        # everything; `fpga` or `cpu` runs one half
+sudo CPU_BATCHES="1 2" ./final_sweep_board.sh cpu  # truncate the slow A53 arms' ladder
+sudo PRESETS="mmfree_370m_2bit mmfree_1_3b_2bit mmfree_2_7b_2bit" ./final_sweep_board.sh fpga
+
+# on the build server
+./scripts/final_sweep_xeon.sh                      # x86 CPU arms, RAPL power
+./scripts/final_dataset.py --board ~/results/final_<date> --xeon reports/host_cpu/final \
+    [--cpu-ladder "1 2"] [--fpga-formats 1p6,2bit]
 ```
 
-Then **pack** `model.mmfree` into per-port engine blobs (the geometry comes from the manifest,
-so it matches the bitstream). `BLOB`/`OUT` default to this model's bundle dir:
-
-```bash
-make pack PRESET=mmfree_1_3b                   # → transfer/models/ridger/MMfreeLM-1.3B/packed/
-# or, skipping provision entirely, re-quantize straight from HF (no tokenizer.mmtok produced):
-#      make pack PRESET=mmfree_1_3b CKPT=ridger/MMfreeLM-1.3B
-```
-
-`make deploy` then ships these under `transfer/models/<hf-id>/`; the board's `make gate`/`run`/`gen`
-consume all three artifacts — `--blob` points at `model.mmfree`, `tokenizer.mmtok` is auto-found
-beside it, and `--packed-dir` is `models/<hf-id>/packed`.
+`final_sweep_board.sh` runs one pass of the A53 CPU arms (int8 / 2-bit / 1.6-bit) and, per
+preset, the gate, `make streams` and five independent FPGA passes, all with rail power and an
+idle-power sample; it ends by printing the `rsync` that pulls `results/` + `power/` into a
+fresh directory.
+`final_dataset.py` merges board and Xeon CSVs into `dataset.csv` (+ per-model `ops_<model>.csv`)
+under `--out` (default `reports/final`), with tok/J net of a per-session idle baseline, and
+refuses to call a set complete if any arm is short of the batch ladder. Declare a deliberately
+truncated A53 ladder with `--cpu-ladder` (matching `CPU_BATCHES`), and a 2-bit FPGA arm with
+`--fpga-formats 1p6,2bit`.
 
 ## Where to read next
 
-- **`make help`** — the task-runner verbs at a glance.
-- **`software/README.md`** — driver / register-map orientation.
+- **`make help`** — the task-runner verbs at a glance (root and `~/transfer`).
+- **`software/README.md`** — driver / register map, runtime and bench knobs.
+- **`software/integration/README.md`** — MMfreeLM weight packer and the C engine API.
+- **`software/integration/fpga_runner/README.md`** — the CPU-vs-FPGA decode runner.
 - **`matmulfreellmCPU/README.md`** — the standalone CPU engine (build, provision, `--weights` packing modes).
-- **`software/integration/README.md`** — MMfreeLM weight packer, the C engine API, and the C++ decode runner.
-- **`CLAUDE.md`** — short orientation for Claude Code sessions in this repo.
-- **`src/main/scala/control/CoreConfig.scala`** — parameter definitions, derived widths, presets, the manifest emitters (`presetEnv`/`presetJson`), and the `forShape(n, m, …)` smart constructor for one-off configs.
+- **`src/main/scala/control/CoreConfig.scala`** — parameter definitions, derived widths, presets, the manifest emitters (`presetEnv`/`presetJson`), and the `forModel` / `forShape` smart constructors.

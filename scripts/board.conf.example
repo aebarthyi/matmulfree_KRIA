@@ -1,10 +1,7 @@
 # board.conf — per-board device map for the bundle's Makefile (transfer/Makefile).
-#
-# This ships in the bundle as board.conf.example. The board Makefile -includes
-# board.conf and falls back to these same defaults (the standard KRIA address map)
-# when it is absent — so you only need to copy this to board.conf and edit if your
-# addresses/nodes differ. KEY=VAL only (make-includable AND bash-sourceable): no
-# spaces around '=', literals only (no $-expansion).
+# Ships as transfer/board.conf.example. Copy to board.conf only if your addresses/nodes differ
+# from these defaults (the standard KRIA map). KEY=VAL only: make-includable and bash-sourceable,
+# no spaces around '=', no $-expansion.
 #
 # Discover the real values on the board:
 #   ls /dev/uio*                       # UIO node bound to the Core IRQ

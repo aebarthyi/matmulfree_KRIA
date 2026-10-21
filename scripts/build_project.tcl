@@ -1,21 +1,14 @@
-# scripts/build_project.tcl — headless Vivado project build for the t_matmul
-# bench design (CoreTop + AXI DMA + Zynq US+ PS on KR260).
-#
+# scripts/build_project.tcl — headless Vivado project build for the t_matmul bench design
+# (CoreTop + AXI DMA + Zynq US+ PS on KR260). Assumes Vivado 2025.2 + the KR260 board files.
 # Run from the repo root via build_all.sh, or directly:
-#   vivado -mode batch -source scripts/build_project.tcl
 #
-# Optional -tclargs (positional):
-#   vivado -mode batch -source scripts/build_project.tcl -tclargs <proj_dir> <ip_repo> <jobs>
+#   vivado -mode batch -source scripts/build_project.tcl [-tclargs <proj_dir> <ip_repo> <jobs>]
 #     proj_dir   Vivado project directory   (default: build/t_matmul)
 #     ip_repo    CoreTop IP repository       (default: generated/mmfree_2_7b)
 #     jobs       parallel jobs for synth/impl (default: 8)
 #
-# Produces:
-#   <proj_dir>/t_matmul.xpr           — the project
-#   build/t_matmul.xsa                — fixed hardware platform (bitstream included)
-#
-# Assumes Vivado 2025.2 (matches vivado/bd.tcl's version guard and IP pins) with
-# the KR260 board files installed.
+# Produces <proj_dir>/t_matmul.xpr, build/t_matmul.xsa (bitstream included), and per-build
+# reports/<tag>.{rpt,timing.rpt,paths.txt,endpoints.txt,congestion.rpt}.
 
 # ─── Locate repo root (this script lives in <repo>/scripts) ─────────────────
 set script_dir [file dirname [file normalize [info script]]]
@@ -63,8 +56,7 @@ if {[get_ipdefs -all "user.org:user:CoreTop:1.0"] eq ""} {
 }
 
 # ─── Build the block design by sourcing the exported bd.tcl ─────────────────
-# bd.tcl detects the already-open project and builds the BD into it (it only
-# creates a project of its own when none is open). It also validate+saves.
+# bd.tcl builds the BD into the already-open project, then validates + saves it.
 puts "==> Sourcing block design: $bd_tcl"
 source $bd_tcl
 
@@ -81,18 +73,11 @@ set_property top "${design_name}_wrapper" [current_fileset]
 update_compile_order -fileset sources_1
 
 # ─── Timing-closure levers (env-gated; default flow is untouched) ────────────
-# Pure synth/impl strategy knobs — they never change the RTL/architecture, only
-# how Vivado optimizes/places/routes it. All optional: unset => current behavior.
-# Used to push the batched maxN=8192 presets (B4/B6) past 250 MHz, where the
-# critical path is route-dominated high fanout (arm RAM -> the xDim*batch PE
-# accumulators). See scripts/build_all.sh for the env it exports per preset.
-#
-#   SYNTH_FLATTEN=full|rebuilt|none   cross-boundary optimization
-#   SYNTH_RETIMING=1                  register retiming (balance pipeline delay)
-#   SYNTH_DIRECTIVE=<dir>             synth_design -directive
-#   OPT_DIRECTIVE / PLACE_DIRECTIVE / PHYS_OPT_DIRECTIVE /
-#   ROUTE_DIRECTIVE / POST_ROUTE_PHYS_OPT_DIRECTIVE   per-step -directive
-#     (setting a *_PHYS_OPT_* directive also ENABLES that phys_opt pass)
+# Env-gated synth/impl knobs, usually set per preset through the manifest build_all.sh exports
+# (they never change the RTL; unset => default flow):
+#   SYNTH_FLATTEN=full|rebuilt|none   SYNTH_RETIMING=1   SYNTH_DIRECTIVE=<dir>
+#   IMPL_STRATEGY, OPT_DIRECTIVE / PLACE_DIRECTIVE / PHYS_OPT_DIRECTIVE / ROUTE_DIRECTIVE /
+#   POST_ROUTE_PHYS_OPT_DIRECTIVE (setting a *PHYS_OPT* directive also enables that pass)
 if {[info exists ::env(SYNTH_FLATTEN)]} {
     set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY $::env(SYNTH_FLATTEN) [get_runs synth_1]
     puts "==> synth flatten_hierarchy: $::env(SYNTH_FLATTEN)"
@@ -107,8 +92,7 @@ if {[info exists ::env(SYNTH_DIRECTIVE)]} {
 }
 
 # ─── Implementation strategy + per-step directive overrides ──────────────────
-# A named strategy applies first; explicit per-step directives below override
-# its individual steps (predictable composition).
+# The named strategy applies first; per-step directives then override its steps.
 if {[info exists ::env(IMPL_STRATEGY)]} {
     set_property strategy $::env(IMPL_STRATEGY) [get_runs impl_1]
     puts "==> impl_1 strategy: $::env(IMPL_STRATEGY)"
@@ -147,25 +131,17 @@ if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {
 set status [get_property STATUS [get_runs impl_1]]
 puts "==> impl_1 status: $status"
 
-# Confirm the bitstream actually landed.
+# Open the routed design for the reports and the timing gate below.
 open_run impl_1
 
-# Timing gate: a failing-WNS bitstream still gets written by Vivado, which was
-# harmless at 100 MHz but real risk at the 250 MHz PL_CLK_MHZ builds — fail
-# loudly instead of deploying a flaky bitstream. ALLOW_TIMING_FAIL=1 downgrades
-# this to a warning so a marginally-failing build still produces a bitstream for
-# empirical on-hardware testing (silicon often runs faster than the timing model
-# — use only for experiments, never for a trusted deploy).
+# Timing gate (applied after the reports): Vivado writes a failing-WNS bitstream anyway, so
+# fail loudly. ALLOW_TIMING_FAIL=1 downgrades it to a warning -- experiments only.
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
 puts "==> post-route WNS: $wns ns"
 
 # ─── Concise resource-utilization report, named by the CoreConfig params ─────
-# Written for EVERY build (including a timing-failing one — placed before the gate
-# below — so a parameter sweep still records the resource cost of every point).
-# The params come from the preset manifest env that build_all.sh's load_manifest
-# exports (MMFREE_AWIDTH, MMFREE_XDIM, …); each falls back to 'x' when this script
-# is run standalone without the manifest. Lands in reports/<tag>.rpt at the repo
-# root, one file per distinct CoreConfig geometry so a sweep collects them side by side.
+# Written for every build, including a timing-failing one, so a sweep records every point.
+# Params come from the manifest env that build_all.sh exports ('x' when run standalone).
 proc _rpt_env {k} { return [expr {[info exists ::env($k)] ? $::env($k) : "x"}] }
 set cfg_preset [expr {[info exists ::env(MMFREE_PRESET)] ? $::env(MMFREE_PRESET) : [file tail $ip_repo]}]
 set cfg_tag [format "%s_a%s_x%s_b%s_n%s_m%s_acc%s_acw%s_%sMHz" \
@@ -179,14 +155,8 @@ set rpt_file [file join $rpt_dir "$cfg_tag.rpt"]
 set fh [open $rpt_file w]
 puts $fh "# Resource utilization — preset $cfg_preset"
 puts $fh "# CoreConfig: aWidth=[_rpt_env MMFREE_AWIDTH] xDim=[_rpt_env MMFREE_XDIM] batch=[_rpt_env MMFREE_BATCH] maxN=[_rpt_env MMFREE_MAXN] maxM=[_rpt_env MMFREE_MAXM] maxAcc=[_rpt_env MMFREE_MAXACC] accWidth=[_rpt_env MMFREE_ACC_WIDTH] headroom=[_rpt_env MMFREE_ACC_HEADROOM] signed=[_rpt_env MMFREE_SIGNED]"
-# Requested vs CONSTRAINED clock. PL_CLK_MHZ is only a REQUEST: PL0_REF exists on
-# discrete rungs (300/250/200/166.67/142.86/100 on this part — see
-# scripts/probe_pl_clk.tcl) and the PS IP snaps anything else DOWN to the rung
-# below. Every setup path is timed against the snapped rate, so reporting the
-# request — which this script did until 2026-08-04 — made both the "Target clock"
-# line and the Est. Fmax derived from it wrong: e.g. PL_CLK_MHZ=230 builds were
-# constrained at 199.998 MHz, so a WNS of +0.118 ns meant Fmax 204.8, not 235.2.
-# Read the real constrained period off the clock object instead.
+# PL_CLK_MHZ is only a request: PL0_REF has discrete rungs (300/250/200/166.67/142.86/100, see
+# probe_pl_clk.tcl) and the PS IP snaps anything else DOWN, so report the constrained rate.
 set _clk [_rpt_env PL_CLK_MHZ]
 set _act ""
 set _clkobj [get_clocks -quiet clk_pl_0]
@@ -237,13 +207,8 @@ close $fh
 puts "==> resource report: $rpt_file"
 
 # ─── Timing-path detail: WHY it failed (or how close it came) ────────────────
-# Until 2026-08-03 the only timing artefact was the single WNS number above, so answering
-# "what is the critical path?" meant a full 40-minute rebuild. Two files per build now:
-#   <tag>.timing.rpt   full report_timing_summary + the 30 worst setup paths, full detail
-#   <tag>.paths.txt    one line per path: slack, logic/route split, levels, start -> end
-# The digest is the useful one: the logic-vs-route split says immediately whether a path is
-# fixable by pipelining (logic-dominated) or is a placement/congestion problem (route-
-# dominated), and the repeated start/end pairs show which structure is actually binding.
+#   <tag>.timing.rpt   full report_timing_summary + the 30 worst setup paths
+#   <tag>.paths.txt    one line per path: slack, logic/route split (pipelining vs placement), levels
 set tim_file [file join $rpt_dir "$cfg_tag.timing.rpt"]
 report_timing_summary -delay_type max -max_paths 10 -file $tim_file
 report_timing -setup -max_paths 30 -nworst 1 -path_type full_clock_expanded \
@@ -271,23 +236,10 @@ close $dh
 puts "==> path digest: $dig_file"
 
 # ─── Endpoint DISTRIBUTION, congestion, and (on failure) the routed DCP ─────
-# MEASURED TWICE that the 30 worst paths above are the wrong artefact to reason from.
-# At 300 MHz the reported worst path was core/wtGearbox — 54 of 40 000 endpoints, 0.1% —
-# while 74.2% of the failing population was one control net (core/state_reg) driving the
-# tileAccums capture enable. Fixing the headline path would have moved WNS and nothing
-# else. ALWAYS TAKE THE DISTRIBUTION, NOT THE HEADLINE PATH.
-#
-# Both times that distribution had to be reconstructed by hand from a checkpoint, and both
-# times the checkpoint was gone: build_all.sh uses ONE shared Vivado project dir, so the
-# next build clobbers impl_1/ (a 300 MHz routed DCP was lost to a 250 build two hours
-# later; the congestion numbers for mmfree_2_7b_max300 were lost the same way). Only
-# reports/<tag>.* survives a build, so the analysis has to be written HERE, while the
-# routed design is still in memory.
-#
-# Endpoints are bucketed into families: bit indices -> [*] and any _<digits> -> _* , which
-# collapses arr_1_16 -> arr_*_*, _replica_9 -> _replica_*, mem_reg_uram_4 -> mem_reg_uram_*.
-# The DRIVER is bucketed the same way, because "74% of them share one driver" is the
-# observation that picks the lever.
+# The worst PATH can belong to a tiny family while one driver dominates the failing population,
+# so record the endpoint distribution. It must be written here: the shared project dir is
+# clobbered by the next build and only reports/<tag>.* survives. Endpoints and their drivers
+# are bucketed into families (bit indices -> [*], _<digits> -> _*).
 set hist_file [file join $rpt_dir "$cfg_tag.endpoints.txt"]
 set _cap 5000
 set _paths [get_timing_paths -setup -max_paths $_cap -nworst 1 -sort_by slack]
@@ -327,9 +279,7 @@ foreach _row [lsort -integer -decreasing -index 0 $_rows] {
 close $_hh
 puts "==> endpoint distribution: $hist_file  ($_tot endpoints)"
 
-# Congestion — the other thing that has to be captured now or not at all. A design can be
-# path-clean and still unroutable at rate; level 5-6 here has meant "no path-level fix will
-# reach the next rung".
+# Congestion: a path-clean design can still be unroutable at rate.
 set cong_file [file join $rpt_dir "$cfg_tag.congestion.rpt"]
 if {[catch {report_design_analysis -congestion -complexity -file $cong_file} _cerr]} {
     puts "WARNING: congestion report unavailable ($_cerr)"
@@ -337,9 +287,7 @@ if {[catch {report_design_analysis -congestion -complexity -file $cong_file} _ce
     puts "==> congestion report: $cong_file"
 }
 
-# The routed checkpoint, so a FAILING build can be re-interrogated without a rebuild —
-# which is exactly the situation that has twice needed one. Gated: 104 MB a copy, and a
-# passing build is not the one anybody re-opens. ARCHIVE_DCP=1 forces it either way.
+# Archive the routed checkpoint for a FAILING build (~100 MB; ARCHIVE_DCP=1 forces it).
 if {$wns < 0 || ([info exists ::env(ARCHIVE_DCP)] && $::env(ARCHIVE_DCP) eq "1")} {
     set dcp_file [file join $rpt_dir "$cfg_tag.routed.dcp"]
     if {[catch {write_checkpoint -force $dcp_file} _derr]} {

@@ -1,16 +1,10 @@
 # board.conf — deploy target for the BUILD-SERVER Makefile (`make deploy`).
-#
-# Copy to ./board.conf and edit for your KRIA. The root Makefile -includes it (and
-# falls back to these defaults when it is absent). KEY=VAL only — make-includable and
-# bash-sourceable; no spaces around '=', literals only (no $-expansion).
-#
-# (Board-local device paths — CORE_PHYS, /dev/uio4, udmabuf nodes — now live in the
-# BUNDLE's own board.conf, sourced by transfer/Makefile on the board. See
-# scripts/board.conf.example, which ships as transfer/board.conf.example.)
+# Copy to ./board.conf; the root Makefile -includes it (these defaults apply when absent).
+# KEY=VAL only: make-includable and bash-sourceable, no spaces around '=', no $-expansion.
+# Board-local device paths live in the bundle's board.conf (scripts/board.conf.example).
 
 # user@host for `make deploy`.
 BOARD=ubuntu@kria
 
-# Remote dir that will CONTAIN transfer/ on the board. `make deploy` rsyncs the bundle
-# into $(BOARD_DEST)/transfer/, and the board works from there (`cd ~/transfer`).
+# Remote dir that will CONTAIN transfer/ (the board works from $(BOARD_DEST)/transfer/).
 BOARD_DEST=~

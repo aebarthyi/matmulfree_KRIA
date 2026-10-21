@@ -1,27 +1,17 @@
-# scripts/gen_overlay.tcl — generate the K26_Bench device-tree overlay (+ bitstream
-# + shell.json) from a Vivado-exported .xsa, ready for `xmutil loadapp`.
+# scripts/gen_overlay.tcl — generate the device-tree overlay (+ bitstream + shell.json) from a
+# Vivado-exported .xsa, ready for `xmutil loadapp`.
 #
-# Flow (mirrors the known-good manual process):
-#   1. xsct `createdts` generates pl.dtsi from the .xsa — this brings in the
-#      critical fragments a hand-written overlay misses:
-#        - &fpga_full  firmware-name        → fpga-manager actually programs the PL
-#        - clocking0 (xlnx,fclk)            → PL0_REF claimed, no clk_ignore_unused hack
-#        - afi0                             → PS↔PL AXI port-width config
-#        - CoreTop placeholder (generic-uio) + axi_dma node, with correct addrs/IRQs
-#   2. Patch firmware-name → core_bench.bit.bin.
-#   3. Append the u-dma-buf nodes, sized + counted from the preset manifest.
-#   4. Compile with dtc.
+#   xsct gen_overlay.tcl <xsa_file> [<out_dir>]     -> core_bench.bit / .dts / .dtbo / shell.json
 #
-# Usage:
-#   xsct gen_overlay.tcl <xsa_file> [<out_dir>]
+#   1. xsct `createdts` -> pl.dtsi: fpga_full firmware-name, clocking0 (PL0_REF), afi0 port
+#      widths, and the CoreTop + axi_dma nodes with correct addrs/IRQs
+#   2. patch firmware-name -> core_bench.bit.bin and bind CoreTop to generic-uio
+#   3. append the u-dma-buf nodes, sized + counted from the preset manifest
+#   4. compile with dtc
 #
 # Environment:
-#   DT_BRANCH   device-tree-xlnx git branch for createdts.
-#               Default: xlnx_rel_v2024.1 (proven against XSCT 2024.1/2025.x).
-#   DT_REPO     local clone of device-tree-xlnx (skips network access).
-#
-# Produces in <out_dir>:
-#   core_bench.bit / .dts / .dtbo / shell.json
+#   DT_BRANCH   device-tree-xlnx branch for createdts (default xlnx_rel_v2024.1)
+#   DT_REPO     local clone of device-tree-xlnx (skips network access)
 
 if {[llength $argv] < 1} {
     puts stderr "Usage: xsct gen_overlay.tcl <xsa_file> \[<out_dir>\]"
@@ -80,13 +70,8 @@ if {![regsub {compatible = "xlnx,CoreTop[^"]*";} $dts \
 }
 
 # ─── 3. Append u-dma-buf nodes (sizes + port count from the preset manifest) ──
-# Single source of truth: generated/<preset>/preset.env (CoreConfig → EmitCore).
-# build_all.sh exports NUM_DMA + UDMABUF_ACT/WT/OUT_SZ into the environment; a
-# standalone run can instead point MMFREE_MANIFEST at the preset.env file. Values
-# already in the environment win, so documented overrides (e.g. a bigger
-# UDMABUF_WT_SZ for the resident full-model runner) still hold. The hand-tuned
-# case tables / static udmabuf.dtsi.in fragment that used to live here (and
-# drifted from CoreConfig) are retired.
+# Sizes and port count come from the manifest env build_all.sh exports, or from
+# MMFREE_MANIFEST for a standalone run; values already in the environment win.
 proc load_manifest {path} {
     if {![file exists $path]} { return 0 }
     set fp [open $path r]
@@ -104,9 +89,8 @@ proc load_manifest {path} {
 }
 if {[info exists ::env(MMFREE_MANIFEST)]} { load_manifest $::env(MMFREE_MANIFEST) }
 
-# NUM_DMA = HP-port count: one act + one wt buffer per port. Sizes default to
-# the legacy single-port values only when neither the manifest nor the env set
-# them (a truly standalone invocation).
+# NUM_DMA = HP-port count (one act + one wt buffer per port). The size defaults below only
+# apply to a fully standalone run.
 set num_dma 1
 if {[info exists ::env(NUM_DMA)]} { set num_dma $::env(NUM_DMA) }
 set act_sz 0x00004000
@@ -119,10 +103,8 @@ set act_kib [expr {$act_sz / 1024}]
 set wt_kib  [expr {$wt_sz  / 1024}]
 set out_kib [expr {$out_sz / 1024}]
 
-# A helper so single- and multi-port nodes are emitted identically. NUM_DMA==1
-# uses the bare legacy names (udmabuf-act/wt/out) the board driver + bench
-# expect; NUM_DMA>1 uses suffixed act{i}/wt{i} + one shared udmabuf-out (output
-# stays on DMA0's S2MM). Port i's act buffer for i>=1 carries only zero padding.
+# NUM_DMA==1 uses the bare names (udmabuf-act/wt/out); NUM_DMA>1 uses act{i}/wt{i} plus one
+# shared udmabuf-out (output stays on DMA0's S2MM).
 proc udmabuf_node {label name sz kib} {
     return "    $label: $name {\n        compatible = \"ikwzm,u-dma-buf\";\n        size       = <[format 0x%08x $sz]>;   /* $kib KiB */\n    };\n\n"
 }

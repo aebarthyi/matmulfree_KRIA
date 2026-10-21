@@ -1,22 +1,10 @@
 /*
- * mmfree_runtime.h — Userspace runtime for the mmfree Core IP on KRIA.
+ * mmfree_runtime.h — userspace runtime for the mmfree Core IP on KRIA.
  *
- * Pulls together:
- *   - mmap of CoreTop's AXI4 register window (instruction MMIO + status + IRQ ack)
- *   - mmap of an AXI DMA IP for both s_axis (MM2S) and m_axis (S2MM)
- *   - udmabuf-backed contiguous physical buffers for activations / weights / outputs
- *   - UIO-based wait for Core's irq line
- *   - High-level mmfree_load / mmfree_compute / mmfree_store helpers that issue the
- *     instruction, kick the DMA, and wait for completion as one unit
- *
- * Assumes Ubuntu-on-KRIA or similar where:
- *   - /dev/udmabuf{N} provides contiguous physical buffers (from the udmabuf driver)
- *   - /dev/uio{N} is bound to Core's irq line (via uio_pdrv_genirq)
- *   - The Core and AXI DMA register windows are reachable through /dev/mem
- *
- * All accesses to MMIO must be 32-bit aligned for AXI DMA, but Core's INSTR register
- * is 128-bit. We use NEON vst1q on aarch64 so the single AXI beat is a single 128-bit
- * write (no cache-line tearing risk because of the volatile cast).
+ * Core + AXI DMA register windows are mmap'd through /dev/mem, DMA buffers come
+ * from u-dma-buf (/dev/udmabuf*), and Core completion is a UIO IRQ (uio_pdrv_genirq)
+ * or a status-word spin. The high-level ops issue the instruction, kick the DMAs
+ * and wait for completion as one unit.
  */
 
 #ifndef MMFREE_RUNTIME_H_
@@ -33,10 +21,8 @@ extern "C" {
 
 /* Systolic-array geometry. Must match the loaded bitstream's CoreConfig — a
  * mismatch makes the Core wait forever on s_axis/m_axis (caught only by the
- * completion timeout). The inputs (top half) are supplied by the caller; the
- * derived fields (bottom half) are filled by mmfree_geom_init. Everything that
- * used to be a compile-time -DBENCH_* constant now reads off this struct, so
- * one binary adapts to any array size without recompiling. */
+ * completion timeout). Inputs are set by the caller; derived fields by
+ * mmfree_geom_init. */
 typedef struct mmfree_geom {
     /* inputs (mirror CoreConfig) */
     uint32_t aWidth;            /* activation bit width */
@@ -44,7 +30,7 @@ typedef struct mmfree_geom {
     uint32_t maxAcc;            /* max accumulation cycles (bounds N) */
     uint32_t maxN;              /* max inner dim swept */
     uint32_t maxM;              /* max output dim swept */
-    uint32_t batch;             /* yDim — activation vectors per weight stream (CoreConfig.batchSize). 1 = unbatched. Must be <= xDim (see note). */
+    uint32_t batch;             /* CoreConfig.batchSize (yDim); 1 = unbatched; must be <= xDim */
     /* derived */
     uint32_t nLanes;            /* aWidth / 2 (ternary lanes per PE) */
     uint32_t outLanesPerTile;   /* xDim * nLanes = output cols per col-tile */
@@ -54,46 +40,32 @@ typedef struct mmfree_geom {
     uint32_t outLaneBytes;      /* outLaneWidth / 8 = bytes per output lane */
     uint32_t numPorts;          /* s_axis port count = min(4, ceil(bits/128)) — mirrors CoreConfig */
     uint32_t portBytes;         /* sAxisBytes / numPorts = bytes per port per beat */
-    uint32_t packed;            /* 1 => weights stream 1.6-bit (5 trits/byte), for a packedWeights bitstream. geom_init seeds 0; a caller running a packed bitstream sets it (like batch). Blob format MUST match. */
+    uint32_t packed;            /* 1 = 1.6-bit weight stream (packedWeights bitstream); geom_init seeds 0 */
 } mmfree_geom_t;
 
-/* Fill the derived fields of `g` from the five inputs. Returns 0 on success,
- * -1 if the geometry is unrepresentable (xDim*aWidth not a whole number of
- * bytes, or a zero dimension). Sets g->batch = 1; a caller running a batched
- * bitstream sets g->batch afterward. NOTE batch must be <= xDim: the s_axis
- * width is max(xDim,batch)*aWidth, so the numPorts/portBytes derived here from
- * xDim only stay correct exactly while batch <= xDim (the 4-port wall caps both
- * at 32 at aWidth=16 anyway). */
+/* Fill the derived fields of `g` from the five inputs; seeds batch=1, packed=0
+ * (callers set those afterward). Returns -1 if xDim*aWidth is not whole bytes or a
+ * dimension is zero. batch must stay <= xDim: numPorts/portBytes are derived from
+ * xDim, but the s_axis width is max(xDim,batch)*aWidth. */
 int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
                      uint32_t maxAcc, uint32_t maxN, uint32_t maxM);
 
-/* Per-port COMPUTE weight bytes for an (rows x cols) projection — the single
- * source of truth for the weight DMA length (mirror of mmfree_pack's
- * Geometry.port_blob_bytes). 2-bit: rows*col_tiles*portBytes. Packed (g->packed):
- * the 1.6-bit blob, trits packed 5/byte then padded to a whole wire beat so the
- * DMA moves exactly the beats the on-chip gearbox consumes (~0.8x the 2-bit size). */
+/* Per-port COMPUTE weight DMA length for a (rows x cols) projection; mirrors
+ * mmfree_pack's Geometry.port_blob_bytes. 2-bit: rows*col_tiles*portBytes. Packed:
+ * trits 5/byte, padded to a whole wire beat (exactly what the gearbox consumes). */
 uint32_t mmfree_wt_port_bytes(const mmfree_geom_t *g, uint32_t rows, uint32_t cols);
 
-/* Cross-check the resolved geometry `g` against a preset.env manifest emitted by
- * control.EmitCore (the single source of truth for the loaded bitstream). Catches
- * the classic footgun where the binary's geometry (compiled default or MMFREE_*
- * env) disagrees with the bitstream actually programmed into the PL — which
- * otherwise only surfaces as a Core wedge + completion timeout.
- *
- * `path` is a preset.env file; NULL/empty or unreadable → skipped (returns 0,
- * no check). Compares aWidth/xDim/maxAcc/maxN/maxM/batch/numPorts. Returns the
- * number of mismatched fields (0 = match), each WARNed to stderr. WARN-only by
- * default; set MMFREE_STRICT=1 in the environment to make any mismatch fatal,
- * in which case it returns -1.
- *
- * mmfree_geom_check_env reads the path from $MMFREE_MANIFEST. */
+/* Cross-check `g` against a preset.env manifest (control.EmitCore) for the loaded
+ * bitstream. NULL/empty/unreadable path skips the check (returns 0). Returns the
+ * number of mismatched fields, each WARNed to stderr; with MMFREE_STRICT=1 any
+ * mismatch returns -1. mmfree_geom_check_env takes the path from $MMFREE_MANIFEST. */
 int mmfree_geom_check_manifest(const mmfree_geom_t *g, const char *path);
 int mmfree_geom_check_env(const mmfree_geom_t *g);
 
 /* Max parallel DMAs/HP ports the input stream can be split across (HP0..HP3). */
 #define MMFREE_MAX_DMA 4
 
-/* Opaque handle. Caller treats as PoD. */
+/* Runtime handle (plain data). */
 typedef struct mmfree_ctx {
     volatile void *core_regs;   /* mmap'd Core AXI4 register base */
     volatile void *dma_regs[MMFREE_MAX_DMA]; /* mmap'd AXI DMA bases; [0] has S2MM, 1..N-1 are MM2S-only */
@@ -116,124 +88,92 @@ typedef struct mmfree_buf {
     int       sync_dev_fd;      /* sysfs sync_for_device (clean, pre-MM2S) */
 } mmfree_buf_t;
 
-/* ---------------------------------------------------------------------- */
-/* Setup / teardown                                                       */
-/* ---------------------------------------------------------------------- */
+/* ---- setup / teardown ---- */
 
-/* Open and mmap Core regs (via /dev/mem at `core_phys`, length core_size),
- * `num_dma` AXI DMA register windows (via /dev/mem at dma_phys[0..num_dma-1],
- * each dma_size long; DMA 0 must be the full MM2S+S2MM engine, 1..N-1 are
- * MM2S-only), and open the UIO device at `uio_dev` (e.g. "/dev/uio0"). On any
- * failure returns -errno and leaves ctx in a partially-populated state —
- * caller should still call mmfree_close to clean up. */
+/* mmap the Core regs and `num_dma` AXI DMA windows via /dev/mem (DMA 0 is the full
+ * MM2S+S2MM engine, 1..N-1 are MM2S-only), open `uio_dev`, and reset the DMAs.
+ * Seeds a default geometry; callers overwrite ctx->geom. On failure returns
+ * -errno with ctx partially populated — still call mmfree_close. */
 int  mmfree_open(mmfree_ctx_t *ctx,
                  uint64_t core_phys, size_t core_size,
                  const uint64_t *dma_phys, uint32_t num_dma, size_t dma_size,
                  const char *uio_dev);
 void mmfree_close(mmfree_ctx_t *ctx);
 
-/* Allocate a contiguous physical buffer via udmabuf. `udmabuf_dev` is the
- * path like "/dev/udmabuf0". The buffer's size is whatever the udmabuf was
- * created with — caller passes `size` to limit what mmfree maps.
- *
- * `cached`: 0 maps the buffer non-cacheable (Device memory, the legacy O_SYNC
- * behavior — CPU access is slow but needs no cache management). 1 maps it
- * write-back cacheable (fast CPU access) and requires the caller to bracket
- * every DMA with mmfree_buf_sync_for_device (before the engine reads) and
- * mmfree_buf_sync_for_cpu (after the engine writes). Only valid on non-coherent
- * ikwzm u-dma-buf nodes (dma_coherent=0). */
+/* Map a u-dma-buf node (e.g. "/dev/udmabuf-act0"); the mapping is clamped to the
+ * node's real size, so callers must check b->size. `cached`=0 maps it O_SYNC
+ * (Device memory: slow, no cache management, and glibc memset/memcpy can SIGBUS on
+ * it — use word stores). `cached`=1 maps it write-back cacheable and every DMA must
+ * be bracketed with mmfree_buf_sync_for_device (before the engine reads) and
+ * mmfree_buf_sync_for_cpu (after it writes); non-coherent nodes only. */
 int  mmfree_buf_open(mmfree_buf_t *b, const char *udmabuf_dev, size_t size, int cached);
 void mmfree_buf_close(mmfree_buf_t *b);
 
-/* Cache sync for a `cached` buffer over its first `nbytes` (rounded up to a
- * cache line, clamped to the buffer). No-op when the buffer is non-cached.
- *   _for_device: clean CPU caches so the engine reads what the CPU wrote.
- *   _for_cpu:    invalidate CPU caches so the CPU reads what the engine wrote. */
+/* Cache sync over the first `nbytes` of a cached buffer (no-op if non-cached).
+ * _for_device cleans (CPU writes -> DDR); _for_cpu invalidates (DDR -> CPU reads). */
 void mmfree_buf_sync_for_device(mmfree_buf_t *b, size_t nbytes);
 void mmfree_buf_sync_for_cpu(mmfree_buf_t *b, size_t nbytes);
 
-/* ---------------------------------------------------------------------- */
-/* Status / IRQ                                                           */
-/* ---------------------------------------------------------------------- */
+/* ---- status / IRQ ---- */
 
 static inline uint32_t mmfree_status(const mmfree_ctx_t *ctx) {
     return *(volatile uint32_t *)((char *)ctx->core_regs + MMFREE_REG_STATUS);
 }
 
-/* Block on Core IRQ (via uio read()), bounded by MMFREE_TIMEOUT_MS (default
- * 5000; 0 = wait forever). Returns 0 on irq, -ETIMEDOUT on timeout, negative
- * on other errors. After return, caller MUST also write irq_ack back to the
- * UIO fd to re-enable interrupts (uio_pdrv_genirq masks until the userspace
- * process acks). The runtime's mmfree_wait_done() does both. */
+/* Block on the Core IRQ via UIO read(), bounded by MMFREE_TIMEOUT_MS (ms, default
+ * 5000, 0 = forever). Returns 0, -ETIMEDOUT, or another negative error. The caller
+ * must then re-arm the UIO fd (uio_pdrv_genirq masks until acked);
+ * mmfree_wait_done() does that. */
 int  mmfree_wait_irq(mmfree_ctx_t *ctx);
 
-/* Print core status + both DMA channel states to stderr, with hints mapping
- * the fingerprint to a likely root cause. Called automatically on any
- * timeout / error inside the high-level ops; also useful standalone. */
+/* Print Core status + every DMA channel state to stderr with root-cause hints.
+ * Called automatically on timeout/error in the high-level ops. */
 void mmfree_dump_state(mmfree_ctx_t *ctx, const char *what);
 
-/* Ack the Core's internal IRQ register. Separate from the UIO ack. */
+/* Ack the Core's internal IRQ register (separate from the UIO re-arm). */
 static inline void mmfree_ack_irq(mmfree_ctx_t *ctx) {
     *(volatile uint32_t *)((char *)ctx->core_regs + MMFREE_REG_IRQ_ACK) = 1u;
 }
 
-/* ---------------------------------------------------------------------- */
-/* Instruction issue (low-level)                                          */
-/* ---------------------------------------------------------------------- */
+/* ---- instruction issue (low-level) ---- */
 
-/* Push a 128-bit instruction beat. Must be paired with the right DMA setup
- * BEFORE this is called (the DMA needs to be primed so it can supply or
- * consume beats as soon as Core moves into the active state). */
+/* Push a 128-bit instruction beat. Start the matching DMA(s) first, so beats can
+ * flow as soon as the Core goes active. */
 void mmfree_push_instr(mmfree_ctx_t *ctx, mmfree_instr_t inst);
 
-/* Wait for Core's IRQ + ack both UIO and Core. Returns the status word read
- * just before the ack, so the caller can check err / last_op fields. */
+/* Wait for completion (status spin, or UIO IRQ with MMFREE_POLL=0) and ack it.
+ * Returns the status word read before the ack, or 0xFFFFFFFF on timeout/error. */
 uint32_t mmfree_wait_done(mmfree_ctx_t *ctx);
 
-/* ---------------------------------------------------------------------- */
-/* High-level operations                                                  */
-/* ---------------------------------------------------------------------- */
+/* ---- high-level operations ---- */
 
-/* LOAD activations into Core's BRAM. `bufs` is an array of ctx->num_dma
- * buffers, one per s_axis port (port 0 = real activation slices, ports 1..N-1
- * = all-zero — the value sits in the low aWidth bits of the wide beat, which
- * is port 0's slice). `n_activations` is the inner-dim length N. Each port
- * pushes n_activations beats of geom.portBytes — every port MUST push the
- * same beat count or the CoreTop join deadlocks.
- *
- * Kicks all N MM2S engines first, then the LOAD_ACT instruction, then waits
- * for Core IRQ + all DMAs idle. */
+/* LOAD `n_activations` beats into the Core's activation BRAM. `bufs` has one
+ * buffer per port; activations live in port 0's slice (the low bits of the wide
+ * beat), ports 1..N-1 stream zeros. Every port must push the same beat count or
+ * the CoreTop join deadlocks. */
 int mmfree_load(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs, uint32_t n_activations);
 
-/* COMPUTE rows x cols matmul. `bufs` is an array of ctx->num_dma weight
- * buffers, one per s_axis port: port p carries bit-slice [p*128, (p+1)*128)
- * of each wide beat = ternary lanes [p*64, (p+1)*64), col-tile-major (see
- * bench.c — Core consumes [t=0,n=0..N-1], [t=1,n=0..N-1], ...). Per-port
- * bytes = rows * ceil(cols/outLanesPerTile) * geom.portBytes. */
+/* COMPUTE a rows x cols matmul. `bufs` has one weight buffer per port; port p
+ * carries bits [p*128, (p+1)*128) of each wide beat. Beats are col-tile-major:
+ * [t=0, n=0..N-1], [t=1, n=0..N-1], ... Length per port = mmfree_wt_port_bytes. */
 int mmfree_compute(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
                    uint32_t rows, uint32_t cols);
 
-/* As mmfree_compute, but each port's MM2S DMA starts `byte_offset` bytes into
- * its weight buffer — lets many projections share one resident weight udmabuf
- * (Phase C / libmmfree), each computed in place at its packed offset. The Core
- * addresses the weight stream via the DMA source register, so the offset is
- * applied there (and mirrored into the instruction ptr, which the Core ignores
- * for streaming ops). byte_offset=0 is identical to mmfree_compute. */
+/* As mmfree_compute, but each port's DMA starts `byte_offset` bytes into its
+ * weight buffer, so projections can sit resident in one shared udmabuf. The Core
+ * ignores the instruction ptr for streaming ops; only the DMA address matters. */
 int mmfree_compute_off(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
                        uint32_t rows, uint32_t cols, uint64_t byte_offset);
 
-/* As mmfree_compute_off, but stamps the active-row count `batch` into the
- * COMPUTE flags field (see mmfree_inst_compute_b). The engine drains only
- * `batch` of B rows, so a low-batch call on a high-B bitstream pays ~B1 cost.
- * batch==0 clamps to the bitstream's full batchSize (legacy behaviour, so
- * mmfree_compute_off is exactly mmfree_compute_off_b with batch=0). The weight
- * stream length is batch-count-independent, so `bytes` is unchanged. */
+/* As mmfree_compute_off, with the active-row count `batch` in the COMPUTE flags
+ * (see mmfree_inst_compute_b; 0 = full batchSize). The weight stream length does
+ * not depend on batch. */
 int mmfree_compute_off_b(mmfree_ctx_t *ctx, const mmfree_buf_t *bufs,
                          uint32_t rows, uint32_t cols, uint64_t byte_offset,
                          uint32_t batch);
 
-/* STORE n_outputs accumulated lanes back to `buf`. For K26_Bench with
- * outBeatLanes=1 + outLaneWidth=32: bytes = n_outputs * 4. */
+/* STORE `n_outputs` accumulator lanes to `buf` via DMA 0's S2MM
+ * (n_outputs * geom.outLaneBytes bytes). */
 int mmfree_store(mmfree_ctx_t *ctx, const mmfree_buf_t *buf, uint32_t n_outputs);
 
 #ifdef __cplusplus

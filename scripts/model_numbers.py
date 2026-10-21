@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""Analytical per-token cost + throughput ceiling for MMfreeLM models on the
-mmfree engine — the board-free companion to bench.c's per-token rollup.
+"""Analytical per-token cost + throughput ceiling for MMfreeLM models on the mmfree engine.
 
-The engine streams each ternary weight matrix once per token, so decode is
-bandwidth-bound: the weight traffic per token divided by the HP-port stream peak is
-the throughput ceiling. Byte counts come from mmfree_pack.geometry — the same
-function the packer and the runtime's COMPUTE DMA use — so they are tile-aware and
-follow the weight format instead of assuming one.
-
-Weight format defaults to the SHIPPED one: 1.6 bits/weight (5 trits/byte), which every
-deployable preset uses. `--no-packed` gives the legacy 2-bit numbers, which are ~25%
-higher traffic and therefore a ~20% lower ceiling.
+Decode streams every ternary weight matrix once per token, so it is bandwidth-bound: weight
+bytes per token / HP-port stream peak is the ceiling. Byte counts come from
+mmfree_pack.geometry (what the packer and runtime use), so they are tile-aware and follow the
+weight format: the shipped 1.6-bit packing by default, 2-bit with --no-packed.
 
 Usage:
     scripts/model_numbers.py                      # 370m/1.3b/2.7b at a16, 250 MHz, packed

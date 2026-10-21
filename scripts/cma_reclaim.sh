@@ -1,29 +1,14 @@
 #!/usr/bin/env bash
 # cma_reclaim.sh — free the CMA that PYNQ/XRT holds, so the big 2-bit presets can allocate.
 #
-# WHY. u-dma-buf allocates udmabuf-wt from CMA when the overlay binds, and each per-port slice
-# must be CONTIGUOUS. The board boots with cma=1000M, but a 2-bit 2.7B preset needs 624 MiB
-# (4 x 0x09c22000). Measured 2026-07-29: CmaTotal 1000 MiB, CmaFree 23 MiB, our own overlay
-# holding 499 MiB — so ~477 MiB is held by something that is NOT ours. That something is the
-# PYNQ/XRT stack: dfx-mgr loads a `pynq` overlay at boot, zocl binds to it
-# (fpga-full:zyxclmm_drm), and jupyter.service sits on top. We use NONE of it — this project's
-# path is xmutil overlay + u-dma-buf + UIO.
-#
-# Reclaiming ~477 MiB is ~4.8x the ~100 MiB actually short, so this is the cheap fix. Raising
-# cma= in boot.scr (see cma_boot_raise.sh) is the persistent alternative and is NOT needed just
-# to clear this shortfall.
-#
-# WHAT IT DOES NOT DO. It does not touch dfx-mgr.service — deploy_kria.sh drives the overlay
-# with `xmutil unloadapp/loadapp`, which talks to dfx-mgr, so stopping it would break every
-# deploy. Only the pynq *app*, jupyter, and the zocl module are touched.
-#
-# REVERSIBLE. Everything here comes back on reboot (dfx-mgr reloads pynq, jupyter is still
-# enabled). To undo without rebooting: sudo systemctl start jupyter.
-#
 #   cd ~/transfer && sudo ./cma_reclaim.sh              # reclaim, then report
 #   cd ~/transfer && sudo ./cma_reclaim.sh --report      # report only, change nothing
 #
-# Run this BEFORE sweep_all.sh, then let deploy_kria.sh load our overlay fresh.
+# udmabuf-wt comes from CMA at overlay bind, each per-port slice CONTIGUOUS; a 2-bit 2.7B preset
+# needs 624 MiB. The stock PYNQ/XRT stack (dfx-mgr's boot-time `pynq` overlay, zocl, jupyter)
+# holds ~477 MiB this project never uses. This stops jupyter, unloads the pynq app and removes
+# zocl; dfx-mgr stays up (xmutil needs it). All of it returns on reboot (or: systemctl start
+# jupyter). Run BEFORE a sweep. For a bigger reservation see cma_boot_raise.sh.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -45,25 +30,21 @@ echo "== before =="; report
 
 if [ "${1:-}" = "--report" ]; then exit 0; fi
 
-# 1. jupyter first — it imports pynq, and a live notebook can hold CMA buffers of its own.
-#    Stop only; leave it enabled so a reboot restores the board's stock behaviour.
+# 1. jupyter first (a live notebook can hold CMA of its own). Stop, don't disable.
 if systemctl is-active --quiet jupyter.service; then
     echo "== stopping jupyter.service (not disabling) =="
     systemctl stop jupyter.service || echo "  WARN: stop failed"
 fi
 
-# 2. Unload the pynq app. This is what zocl is bound to; unbinding is what actually returns
-#    the memory. Our own overlay is deliberately left alone — deploy_kria.sh does
-#    `xmutil unloadapp` + `loadapp` itself, so it will be reloaded cleanly right after.
+# 2. Unload the pynq app (what zocl is bound to). Our overlay is left alone; deploy_kria.sh
+#    reloads it.
 if [ -d /sys/kernel/config/device-tree/overlays/pynq ]; then
     echo "== unloading the pynq overlay =="
     xmutil unloadapp pynq >/dev/null 2>&1 || xmutil unloadapp >/dev/null 2>&1 || \
         echo "  WARN: xmutil unloadapp did not report success"
 fi
 
-# 3. zocl last: it only unloads once nothing holds it (refcnt 0), which is why the app has to
-#    go first. Best-effort — a nonzero refcnt here just means something still has it open, and
-#    the run can still proceed if step 2 freed enough.
+# 3. zocl last: it only unloads at refcnt 0. Best-effort.
 if lsmod | grep -q '^zocl'; then
     ref=$(cat /sys/module/zocl/refcnt 2>/dev/null || echo "?")
     echo "== removing zocl (refcnt=$ref) =="
@@ -73,8 +54,7 @@ fi
 
 echo "== after =="; report
 
-# Restate the goal in the same units the sweep's pre-flight uses, so it is obvious whether this
-# was enough without having to re-derive the arithmetic.
+# Restate the budget in the units the sweep's pre-flight uses.
 free_now=$(( $(grep -E '^CmaFree:' /proc/meminfo | awk '{print $2}') / 1024 ))
 held_now=$(cat /sys/class/u-dma-buf/udmabuf-wt*/size 2>/dev/null | awk '{s+=$1} END{printf "%d", s/1048576}')
 held_now=${held_now:-0}

@@ -1,21 +1,11 @@
 #!/usr/bin/env bash
-#
 # deploy_kria.sh — run ON the KRIA, from the root of the transfer/ bundle.
 #
-# Installs the core_bench overlay app where xmutil expects it, ensures the
-# PL clock isn't gated by the kernel, and (re)loads the app:
+#   sudo ./deploy_kria.sh <preset>        (or: sudo make deploy-hw PRESET=<preset>)
 #
-#   1. /lib/firmware/xilinx/core_bench/{core_bench.bit.bin,core_bench.dtbo,shell.json}
-#   2. add clk_ignore_unused to the kernel cmdline if missing (PL clock
-#      gating causes bus errors / hard hangs on PL MMIO — needs reboot once)
-#   3. xmutil unloadapp + loadapp core_bench
-#
-# The HW files for a given preset live in presets/<preset>/; the u-dma-buf driver
-# source is shared at udmabuf/. Both are resolved relative to this script's dir, so
-# the bundle is fully self-contained.
-#
-# Usage:  sudo ./deploy_kria.sh <preset>     (e.g. sudo ./deploy_kria.sh mmfree_2_7b)
-#         or via the bundle Makefile:  sudo make deploy-hw PRESET=<preset>
+# Installs presets/<preset>/ as the core_bench xmutil app, ensures clk_ignore_unused (needs one
+# reboot), builds + loads u-dma-buf from udmabuf/, reloads the overlay, sets fclk0 to the built
+# rate, and verifies the udmabuf node sizes against the manifest.
 
 set -euo pipefail
 
@@ -65,11 +55,8 @@ else
 fi
 
 # ─── 3. Ensure the u-dma-buf driver is loaded ────────────────────────────
-# Vendored as a submodule (external/udmabuf) and shipped in this transfer dir, so
-# the board needs no externally-installed module. Build + insmod it here if it
-# isn't already loaded; load it BEFORE the overlay so the driver binds the
-# ikwzm,u-dma-buf nodes the overlay adds. Building needs kernel headers
-# (linux-headers-$(uname -r)).
+# Load u-dma-buf BEFORE the overlay so it binds the nodes the overlay adds
+# (building it needs linux-headers-$(uname -r)).
 if lsmod | grep -qw u_dma_buf; then
     echo "==> u-dma-buf module already loaded"
 elif [ -f "$HERE/udmabuf/u-dma-buf.c" ]; then
@@ -95,18 +82,8 @@ else
 fi
 
 # ─── 4. Load the app ─────────────────────────────────────────────────────
-# CMA RELEASE IS THE FRAGILE STEP, so it is verified rather than assumed. u-dma-buf
-# allocates udmabuf-wt from CMA when the overlay BINDS and frees it when the overlay is
-# REMOVED — but the removal is not instantaneous, and unloadapp used to run with its output
-# and its exit status both discarded. Chaining presets then loaded the next (bigger) overlay
-# while the previous one's CMA was still held, and the failure surfaced far downstream as a
-# missing /dev/udmabuf-wtN, which reads like a driver or overlay bug rather than "the last
-# preset had not let go yet".
-#
-# So: unload, then WAIT for CmaFree to stop rising before loading. Ascending model order
-# (370M -> 1.3B -> 2.7B) is the worst case for this — each step needs a bigger contiguous
-# slice than the last, and CMA slices must be physically contiguous, so a late large
-# allocation can fail even when the total free figure looks sufficient.
+# Overlay removal frees udmabuf CMA asynchronously; loading the next (bigger) preset before it
+# settles fails later as a missing /dev/udmabuf-wtN. So wait for CmaFree to stop rising.
 cma_free_kib() { awk '/^CmaFree:/{print $2}' /proc/meminfo; }
 cma_before=$(cma_free_kib)
 echo "==> Unloading any current overlay (CmaFree ${cma_before:-?} kB before)"
@@ -127,39 +104,23 @@ cma_after=$(cma_free_kib)
 echo "==> CmaFree ${cma_before:-?} -> ${cma_after:-?} kB (reclaimed $(( (${cma_after:-0} - ${cma_before:-0}) / 1024 )) MiB)"
 
 xmutil loadapp "$APP"
-# Report what the udmabuf nodes ACTUALLY hold, not a CmaFree delta. CmaFree is not a
-# reliable measure of "what this overlay took": the CMA region doubles as backing for
-# MOVABLE allocations, so the kernel lends idle CMA pages to page cache and migrates them
-# back out on demand. Reading a 0.5-3 GB model.mmfree fills the region with page cache, and
-# the migration that frees it again happens CONCURRENTLY with the udmabuf allocation — so the
-# before/after difference mixes "allocated by us" with "reclaimed by the kernel" and can
-# report a fraction of the true size. (Measured 2026-08-03: a 624 MiB allocation showed as a
-# 199 MiB CmaFree delta while every node verified at its full size.)
+# Report what the udmabuf nodes actually hold: a CmaFree delta is unreliable because page
+# cache borrows CMA pages and is migrated out concurrently with the allocation.
 udma_total_mib=$(cat /sys/class/u-dma-buf/*/size 2>/dev/null | awk '{s+=$1} END{printf "%d", s/1048576}')
 echo "==> u-dma-buf now holds ${udma_total_mib:-0} MiB across $(ls /sys/class/u-dma-buf 2>/dev/null | wc -l) node(s); CmaFree $(cma_free_kib) kB"
 echo "    (CmaFree also moves with page cache borrowing the CMA region — the authoritative"
 echo "     check that this preset got its memory is the per-node verification below.)"
 
 # ─── 4b. Program the PL fabric clock to the built rate ───────────────────
-# fclk0 (PL0_REF) drives CoreTop directly, but an overlay reload does NOT
-# reprogram it — once an earlier overlay claimed it at some rate it stays pinned,
-# so a bitstream STA-closed for a higher clock silently runs at the stale rate
-# unless we set it here. PL_CLK_MHZ from the manifest is the rate the design was
-# built and timing-closed for. The PS PLL yields only discrete rates, so the
-# achieved value may snap to the nearest available — read it back and report it.
+# An overlay reload does NOT reprogram fclk0 (PL0_REF), so a stale rate would stick. Set it to
+# the built rate here and read back what was achieved (only discrete rates exist).
 FCLK=/sys/devices/platform/fclk0/set_rate
 if [ -f "$PRESET_DIR/preset.env" ]; then
     # shellcheck disable=SC1091
     . "$PRESET_DIR/preset.env"
 fi
-# The overlay itself records the rate: createdts emits the PL clock into the dtbo's
-# clocking0 node as `assigned-clock-rates`, in Hz, and the kernel programs it on load. That
-# makes the dtbo the AUTHORITATIVE record of what a built bundle runs at — it is derived
-# from the XSA, so it carries the snapped rate rather than the request. Checked here because
-# it can disagree with the manifest in BOTH directions, and both were seen in practice: a
-# manifest naming an off-rung rate the PS IP silently snapped down, and a bundle relabelled
-# to a new rate without being rebuilt. Trust the dtbo when they differ.
-# Needs dtc; skipped silently if the board has no dtc.
+# The dtbo's assigned-clock-rates (derived from the XSA) is the authoritative built rate. The
+# manifest can disagree either way (off-rung request, relabelled bundle): trust the dtbo. Needs dtc.
 DTBO_HZ=""
 if command -v dtc >/dev/null 2>&1 && [ -f "$PRESET_DIR/$APP.dtbo" ]; then
     DTBO_HZ=$(dtc -I dtb -O dts "$PRESET_DIR/$APP.dtbo" 2>/dev/null \
@@ -177,12 +138,8 @@ if [ -n "$DTBO_HZ" ] && [ -n "${PL_CLK_MHZ:-}" ]; then
     fi
 fi
 
-# PL_CLK_ACT_MHZ is the rate the bitstream was actually CONSTRAINED at, read off the clock
-# object by build_project.tcl and appended to the manifest by build_all.sh. Prefer it over
-# PL_CLK_MHZ, which is only the REQUEST: Vivado snaps an unreachable request DOWN to the rung
-# below (230 -> 199.998), so a manifest saying 230 describes a 200 MHz build. Confirmed on the
-# STA side by scripts/probe_pl_clk.tcl and on this board by the readback below — the rungs are
-# the same set either way: 300, 250, 200, 166.67, 142.86, 100.
+# PL_CLK_ACT_MHZ (appended by build_all.sh) is the rate actually constrained; PL_CLK_MHZ is
+# only the request, which Vivado snaps DOWN to a rung (230 -> 199.998).
 if [ -n "${PL_CLK_ACT_MHZ:-}" ]; then
     if [ "${PL_CLK_ACT_MHZ%%.*}" != "${PL_CLK_MHZ:-}" ]; then
         echo "==> manifest requested ${PL_CLK_MHZ:-?} MHz but the build was CONSTRAINED at" \
@@ -190,9 +147,8 @@ if [ -n "${PL_CLK_ACT_MHZ:-}" ]; then
     fi
     PL_CLK_MHZ="$PL_CLK_ACT_MHZ"
 fi
-# FCLK_MHZ=<n> overrides the manifest rate for this deploy (accepts a decimal). Used to
-# measure a build IN SPEC when its built rate is not itself reachable — e.g. FCLK_MHZ=200 to
-# sit on the rung below 250. Reachable rungs: 300, 250, 200, 166.67, 142.86, 100.
+# FCLK_MHZ=<n> overrides the rate for this deploy (decimal ok), e.g. FCLK_MHZ=200 to run a build
+# on the rung below. Rungs: 300, 250, 200, 166.67, 142.86, 100.
 if [ -n "${FCLK_MHZ:-}" ]; then
     PL_CLK_MHZ="$FCLK_MHZ"
     echo "==> fclk override: FCLK_MHZ=$FCLK_MHZ (manifest rate ignored for this deploy)"
@@ -202,23 +158,10 @@ if [ -w "$FCLK" ] && [ -n "${PL_CLK_MHZ:-}" ]; then
     want=$(awk -v m="$PL_CLK_MHZ" 'BEGIN{printf "%d", m * 1000000}')
     if echo "$want" > "$FCLK" 2>/dev/null; then
         got=$(cat "$FCLK" 2>/dev/null)
-        # PL0_REF is divided down from a fixed PLL, so only discrete rates exist. MEASURED on
-        # this board 2026-08-04 and independently confirmed on the STA side the same day by
-        # scripts/probe_pl_clk.tcl (which reads ACT_FREQMHZ back out of the PS IP): the rungs
-        # are 300, 250, 200, 166.67, 142.86, 100 MHz. (An earlier comment here guessed 1500/N
-        # = 250 / 214.29 / 187.5; that was WRONG -- there is no 214 rung. A 230 MHz build
-        # snapped down lands on 200 MHz, a 20% cut, not the 14% a 214.29 rung would imply.) A
-        # request for anything between two rungs lands on the HIGHER one, so a 230 MHz build
-        # is handed a 250 MHz fabric and runs ~8.7% past its STA closure. Walk the request
-        # DOWN until the achieved rate is at or below what the build was closed for.
-        #
-        # The step must reduce the REQUEST, not the achieved rate. The previous version did
-        # `next = got - 1MHz`, i.e. it asked for 249 MHz, which snaps straight back up to 250;
-        # the "no movement" guard then fired and it gave up after one iteration with tries=0.
-        # That is why every 230-labelled preset in the 2026-08-03 sweep still logged
-        # "achieved 249999998" with no snap-down. A multiplicative step on the request crosses
-        # the gap in one or two iterations (230 -> ask 218.5 -> get 214.29) and terminates
-        # because the request is strictly decreasing.
+        # Only discrete PL0_REF rungs exist (300, 250, 200, 166.67, 142.86, 100 MHz) and the driver
+        # rounds an in-between request UP, past STA closure. Walk the REQUEST down 5% per round
+        # (stepping from the achieved rate would snap straight back) until the achieved rate is
+        # at or below the built one.
         tries=0
         req=$want
         while [ -n "$got" ] && [ "$got" -gt $((want + want / 50)) ] && [ "$tries" -lt 8 ]; do
@@ -233,24 +176,12 @@ if [ -w "$FCLK" ] && [ -n "${PL_CLK_MHZ:-}" ]; then
         printf "==> fclk0 set to PL_CLK_MHZ=%s: requested %s Hz, achieved %s Hz%s\n" \
                "$PL_CLK_MHZ" "$want" "$got" \
                "$([ "$tries" -gt 0 ] && echo " (snapped down $tries rung(s) to stay at or below the built rate)")"
-        # Only a warning when we did NOT ask for it: after a deliberate snap-down, being below
-        # the built rate is the intended, timing-safe outcome, not a fault.
+        # Below the built rate is only a fault if we did not deliberately snap down.
         if [ -n "$got" ] && [ "$tries" -eq 0 ] && [ "$got" -lt $((want - want / 50)) ]; then
             echo "WARN: fclk0 achieved $got Hz is below the built $want Hz — the design" >&2
             echo "      will run slower than it was timed for (stale/clamped clock)." >&2
         fi
-        # The OTHER direction, and the worse one: an achieved rate ABOVE the built rate means
-        # the fabric is being clocked FASTER than the design was timing-closed for, so STA
-        # says nothing about it. This went unnoticed for a long time because only the "too
-        # slow" case was checked: every PL_CLK_MHZ=230 preset silently ran at 250 MHz — and
-        # 2.7B b4_dsp_s8_packed, closed at 230 with WNS +0.096, measures WNS -0.097 at 250.
-        # CAUSE: PL0_REF is a divided PLL output, so only discrete rates exist and 230 is not
-        # one of them. What the driver does with an unreachable request is undocumented and
-        # NOT a simple round-down -- measured here, 230 and 250 both land on 249999998 Hz.
-        # Consequence: "a number below 250" in PL_CLK_MHZ does not give you a slower fabric.
-        # The retry loop above tries to walk down to a reachable rate at or below the built
-        # one; if you see this warning it could not, so either close the build at the rate the
-        # board actually runs, or find the next reachable rung by experiment.
+        # Worse: above the built rate, the bitstream's post-route WNS does not apply.
         if [ -n "$got" ] && [ "$got" -gt $((want + want / 50)) ]; then
             echo "WARN: fclk0 achieved $got Hz EXCEEDS the built $want Hz — the fabric is" >&2
             echo "      running FASTER than this bitstream was timing-closed for, so its" >&2
@@ -268,9 +199,7 @@ else
 fi
 
 # ─── 5. Verify u-dma-buf nodes match the deployed preset manifest ─────────
-# Directly prevents the stale-overlay footgun (an old overlay's smaller udmabuf
-# silently truncating the new geometry's transfers). preset.env ships in the
-# transfer dir; the overlay's nodes must be at least the manifest's sizes.
+# Catches a stale overlay whose smaller udmabufs would silently truncate transfers.
 if [ -f "$PRESET_DIR/preset.env" ]; then
     # shellcheck disable=SC1091
     . "$PRESET_DIR/preset.env"

@@ -52,11 +52,8 @@ class ComputeMatmulCmd extends Bundle {
     val weightsPtr = UInt(40.W)
     val rows       = UInt(32.W)
     val cols       = UInt(32.W)
-    // Runtime active batch count, carried in the instruction's flags field.
-    // 0 → "full" (Core clamps to the built batchSize), so an existing host that
-    // leaves flags=0 is byte-behaviour-identical. A value 1..batchSize drains only
-    // that many batch rows — lets one high-B bitstream serve a b=1 decode without
-    // the wasted (B-1)-row drain.
+    // Runtime batch count from the instruction flags field: 1..batchSize drains only
+    // that many rows; 0 (or out of range) = the full built batchSize.
     val batch      = UInt(16.W)
 }
 

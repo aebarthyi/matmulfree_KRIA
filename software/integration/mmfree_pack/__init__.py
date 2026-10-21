@@ -1,8 +1,7 @@
 """mmfree_pack — offline weight packer for the KRIA ternary matmul engine.
 
-Phase B — converts MMfreeLM-370M BitLinear
-weights into the engine's col-tile-major 2-bit per-port layout + a manifest the
-C runtime (Phase C) loads into resident udmabufs.
+Converts MMfreeLM BitLinear weights into the engine's col-tile-major per-port
+layout (2-bit or 1.6-bit) plus a manifest the runner loads into resident udmabufs.
 """
 
 from .geometry import Geometry, A16, manifest_path

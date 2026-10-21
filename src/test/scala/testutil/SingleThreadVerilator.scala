@@ -4,22 +4,10 @@ import chisel3.simulator.scalatest.ChiselSim
 import svsim.{Backend, BackendSettingsModifications}
 import svsim.verilator.{Backend => VerilatorBackend}
 
-/** Mix-in (in place of `ChiselSim`) that pins each Verilator invocation to a
-  * single thread (`-j 1`).
-  *
-  * ChiselSim drives `verilator --build -j 0`, which sizes a per-process thread
-  * pool to the host core count. Mill fans the test suites out across roughly one
-  * worker per core, so a dozen-plus Verilator builds run at once, each wanting
-  * all cores. Under that oversubscription Verilator intermittently aborts a
-  * random build with:
-  *
-  *   %Error: Internal Error: attempted to destroy locked Thread Pool
-  *
-  * which surfaces as a flaky failure in whichever suite lost the race. Forcing
-  * `-j 1` removes the per-process thread pool entirely; inter-suite parallelism
-  * (Mill workers) still keeps the aggregate run reasonable. It does lengthen the
-  * full run somewhat (the larger designs verilate single-threaded), which is a
-  * worthwhile trade for a deterministic, non-flaky suite.
+/** Mix-in (in place of `ChiselSim`) that pins each Verilator build to one thread
+  * (`-j 1`). With Mill running many suites in parallel, ChiselSim's default `-j 0`
+  * oversubscribes the host and Verilator intermittently aborts with "attempted to
+  * destroy locked Thread Pool"; single-threaded builds make the suite deterministic.
   */
 trait SingleThreadVerilator extends ChiselSim { this: org.scalatest.TestSuite =>
   implicit override def backendSettingsModifications: BackendSettingsModifications = {

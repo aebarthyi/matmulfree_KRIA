@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # scripts/power_bench.sh — board-side power monitor around a benchmark workload.
 #
-# Staged into the bundle as transfer/power_bench.sh (by scripts/build_all.sh) and
-# invoked by the board Makefile's `bench`/`run` verbs. It samples the KRIA rail
-# power with xlnx_platformstats for EXACTLY the duration of the workload — the
-# sampler starts right before the command and is killed the instant it returns —
-# so the average/peak reflect the workload window and nothing else.
+# Staged into the bundle by build_all.sh; used by the board Makefile's bench/run verbs. Samples
+# rail power with xlnx_platformstats for exactly the workload window.
 #
 #   power_bench.sh <manifest> <mode> <batch> <cmd> [args...]
 #     manifest  preset.env (for the geometry tag in the log name; may be "-")
@@ -23,8 +20,7 @@
 #   <tag>.samples   raw timestamped xlnx_platformstats output (ground truth)
 #   <tag>.log       concise summary: elapsed + per-rail avg/peak power
 #
-# If xlnx_platformstats is not installed the workload still runs (with a warning) —
-# monitoring degrades gracefully so a board without the package isn't blocked.
+# Without xlnx_platformstats the workload still runs, unmonitored (with a warning).
 set -uo pipefail
 
 MANIFEST="${1:?usage: power_bench.sh <manifest> <mode> <batch> <cmd> [args...]}"; shift
@@ -63,9 +59,8 @@ LOG="$POWER_DIR/$TAG.log"
 : > "$RAW"
 
 # ─── start the sampler right before the workload ─────────────────────────────
-# A timestamped loop (rather than a single streaming invocation) keeps this
-# portable across xlnx_platformstats versions and tags every sample with a wall
-# clock, so the summary can bound the exact workload window.
+# A timestamped loop (not one streaming call) is portable across xlnx_platformstats versions
+# and lets the summary bound the exact workload window.
 sample_loop() {
     while :; do
         printf '@%s\n' "$(date +%s.%N)"

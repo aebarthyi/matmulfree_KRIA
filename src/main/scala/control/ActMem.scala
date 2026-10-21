@@ -4,45 +4,19 @@ import chisel3._
 import chisel3.util._
 
 /**
-  * Activation memory (1 write port, 1 read port, 1-cycle synchronous read) emitted as a
-  * BlackBox so it can carry the `ram_style` / `cascade_height` synthesis attributes that
-  * CIRCT cannot put on a `SyncReadMem` (its `AttributeAnnotation` only targets modules,
-  * wires and regs — the same reason `control.OutMemUltra` exists).
+  * Activation memory (1W/1R, 1-cycle synchronous read) as a BlackBox, so it can carry
+  * `ram_style` / `cascade_height`, which CIRCT cannot attach to a SyncReadMem (same
+  * reason OutMemUltra exists). At maxN=8192 the inferred memory chains eight RAMB36E2s
+  * through the hard output cascade (~3.2 ns of logic); cascade_height bounds that chain
+  * and resolves the rest in a fabric mux.
   *
-  * WHY: at maxN=8192 the inferred memory is the worst 250 MHz path on the 1.3B/2.7B B6
-  * engine. Vivado maps `SyncReadMem(8192, Vec(6, UInt(16.W)))` onto 1024x36 RAMB36E2
-  * blocks and chains eight of them through the hard output cascade, so a read costs
+  * Read semantics are exactly SyncReadMem.read: `rdata` = mem[raddr] one cycle later, no
+  * read enable (Core prefetches the address one row ahead). A same-cycle read/write
+  * collision is undefined, as with SyncReadMem, and unreachable (writes only in sLoad).
+  * Deliberately NOT pipelined: an extra read stage would break the one-row-ahead
+  * weight/activation pairing in Core's inQ.
   *
-  *     Prop_RAMB36E2_CLKBWRCLK_CASDOUTB    1.588 ns    (first block)
-  *     7 x Prop_RAMB36E2_CASDINB_CASDOUTB  0.247 ns    (the chain)
-  *     Prop_RAMB36E2_CASDINB_DOUTBDOUT     0.136 ns    (last block)
-  *     -------------------------------------------
-  *                                         3.206 ns    of LOGIC, before any routing
-  *
-  * against a 4.000 ns budget (measured: `k26_mmfree2_7b_a16_b6_dsp_s8` @250, WNS -0.376,
-  * 7 logic levels all RAMB36E2). Nothing in the Chisel is wrong — 96 bits x 8192 entries
-  * genuinely needs 24 blocks, and Vivado is free to arrange them as 3 wide x 8 deep. The
-  * fix is to bound the DEPTH chain: `cascade_height = 2` leaves one 0.247 ns hop and
-  * resolves the remaining four groups in a fabric mux (~96 LUT6 for a 4:1 on 96 bits),
-  * trading ~1.7 ns of logic for a mux plus its routing. `cascade_height = 1` removes the
-  * chain entirely at the cost of an 8:1 mux. The 370M engine (maxN=4096, a 4-deep chain)
-  * closes 250 MHz with no levers at all, which is the control: chain DEPTH is the
-  * variable here, not the batch width or the array.
-  *
-  * Read semantics are EXACTLY `SyncReadMem.read`: `rdata` is `mem[raddr]` delayed one
-  * cycle, unconditionally (no read enable — Core reads every cycle and picks the address
-  * a cycle ahead, see the `actRdAddr` prefetch). Write is synchronous on `wen`. A
-  * same-cycle read/write to one address is undefined, matching SyncReadMem's undefined
-  * collision behaviour — and unreachable anyway, since Core writes only in sLoad and the
-  * read result only matters in sCompute. So swapping this in is an IMPLEMENTATION change:
-  * identical cycle behaviour, identical results, different mapping.
-  *
-  * NOT pipelined, deliberately, unlike OutMemUltra. Adding a read-latency stage here
-  * would desynchronise the weight/activation pairing that `inQ` depends on (the enqueue
-  * side prefetches exactly one row ahead), and that pairing has a history of subtle
-  * off-by-one-beat bugs. An attribute change cannot introduce one.
-  *
-  * The module name encodes geometry + attributes so distinct instantiations get distinct
+  * The module name encodes geometry + attributes so distinct instances get distinct
   * inline SV (BlackBoxInline keys on the file/module name).
   */
 class ActMem(depth: Int, width: Int, ramStyle: String, cascadeHeight: Int)
@@ -65,8 +39,7 @@ class ActMem(depth: Int, width: Int, ramStyle: String, cascadeHeight: Int)
   override val desiredName =
     s"ActMem_${depth}x${width}_${ramStyle}${if (cascadeHeight > 0) s"_c$cascadeHeight" else ""}"
 
-  // cascade_height=0 means "say nothing and let Vivado choose", which is the inferred
-  // behaviour — so the attribute is omitted rather than emitted as 0 (0 is not legal).
+  // cascade_height=0 means "let Vivado choose": omit the attribute (0 is not legal).
   private val attrs =
     s"""ram_style = "$ramStyle"""" + (if (cascadeHeight > 0) s", cascade_height = $cascadeHeight" else "")
 

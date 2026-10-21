@@ -18,45 +18,18 @@ class SystolicArrayOutputBundle(val aWidth: Int, val xDim: Int, val yDim: Int, v
 }
 
 /**
-  * 2D systolic array of ternary-MAC PEs.
+  * 2D array of ternary-MAC PEs. yDim rows = batch items (one activation per row per
+  * cycle); xDim columns consume one full weight beat (xDim·nLanes weights) per cycle:
+  *     O[row][col·nLanes + lane] = sum_t W[t][col·nLanes + lane] * A[row][t]
+  * `weights_i` and `activation_i` must both be valid for the array to step; `nAcc`
+  * is consumed once in the initial three-way rendezvous.
   *
-  *   - yDim rows, each row holding one streaming activation per cycle. The row
-  *     index doubles as the batch dimension: row k accumulates a separate output
-  *     for batch item k.
-  *   - xDim columns; per cycle, the array consumes one full weight beat
-  *     (xDim·nLanes ternary weights). For each (row, col, lane), PE(row, col)'s
-  *     lane-l accumulator computes
-  *         sum_{t=0..nAcc-1} sign(weight_t[col][lane]) * activation_t[row]
-  *     which is exactly the batched matrix-vector product
-  *         O[row][col·nLanes + lane] = sum_t W[t][col·nLanes + lane] * A[row][t]
-  *
-  *   - Both `weights_i` and `activation_i` use a Decoupled handshake; in
-  *     `running_state` they must both be valid each cycle for the array to step.
-  *     `nAcc` is consumed once during the initial three-way rendezvous in idle.
-  *
-  * ── Column banking (`colBankSize`) ──────────────────────────────────────────
-  * The activation broadcasts to every column each cycle: act[row] drives xDim
-  * columns × nLanes PE inputs (≈256 loads at xDim=32, nLanes=8) — the route-bound,
-  * fanout-heavy net that dominates the 250 MHz critical path. `colBankSize` splits
-  * the columns into banks of that many
-  * columns and inserts ONE pipeline register between banks: bank `b` sees the
-  * whole input beat (weights + activation + valid + nAcc) delayed by `b` cycles.
-  *   - Within a bank the beat is still broadcast, so the activation fanout drops
-  *     from xDim to colBankSize columns (e.g. 32→8 = 4×).
-  *   - Delaying the WHOLE beat (not just the activation) keeps each bank's weights
-  *     aligned with the activation that reached it, so the accumulated result is
-  *     numerically IDENTICAL to the unbanked array — only retimed.
-  *   - Because every PE is an independent accumulator that HOLDS its result in
-  *     done_state, no output de-skew buffer is needed: bank b finishes at
-  *     nAcc+b, earlier banks simply hold, and the array raises `output.valid`
-  *     when the DEEPEST bank finishes. Cost: +(numBanks-1) cycles of latency per
-  *     op (negligible vs. nAcc) and a small per-bank beat-wide pipeline register.
-  *   - colBankSize <= 0 or >= xDim ⇒ a single bank = the original broadcast array
-  *     (no pipeline, bit-identical), which is the default so existing presets are
-  *     unchanged.
-  *
-  *   - Back-to-back: PE.scala leaves accumCounter/accumReg dirty on done→idle,
-  *     so callers must hard-reset between successive operations.
+  * Column banking (`colBankSize`): columns are split into banks and bank `b` sees the
+  * WHOLE input beat (weights, activation, valid, nAcc) delayed by `b` cycles, cutting
+  * the activation fanout from xDim to colBankSize columns. Delaying the whole beat keeps
+  * results numerically identical; PEs hold their results in done_state, so no output
+  * de-skew is needed and `output.valid` follows the deepest bank (+numBanks-1 cycles).
+  * colBankSize <= 0 or >= xDim is a single bank: the plain broadcast array.
   */
 class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int,
                     val signedAct: Boolean = false,
@@ -67,7 +40,7 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
     require(yDim >= 1, "yDim must be >= 1")
     require(colBankSize >= 0, s"colBankSize=$colBankSize must be >= 0 (0 = no banking)")
 
-    // Accumulator width = aWidth + headroom (see PE.scala). Auto (-1) = legacy log2Ceil(maxAcc).
+    // Accumulator width = aWidth + headroom (see PE.scala).
     val accWidth = aWidth + log2Ceil(maxAcc)
 
     val input  = IO(new SystolicArrayInputBundle(aWidth, maxAcc, xDim, yDim))
@@ -75,30 +48,21 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
 
     val nLanes = aWidth / 2
 
-    // Column banking: number of banks and each column's bank index (= its pipeline
-    // delay). A single bank (default) reproduces the original broadcast array.
+    // Number of banks and each column's bank index (= its pipeline delay).
     val numBanks: Int = if (colBankSize <= 0 || colBankSize >= xDim) 1
                         else (xDim + colBankSize - 1) / colBankSize
     def bankOf(col: Int): Int = if (numBanks == 1) 0 else math.min(col / colBankSize, numBanks - 1)
-    // Deepest bank finishes last; any of its PEs signals array completion. Column
-    // xDim-1 is always in the deepest bank; keep col 0 for the unbanked case so the
-    // emitted SV (and thus existing bitstreams) is unchanged.
+    // Completion comes from a deepest-bank PE (col xDim-1); unbanked keeps col 0 so
+    // its emitted SV is unchanged.
     private val doneCol = if (numBanks == 1) 0 else xDim - 1
 
     val arr = Seq.tabulate(yDim, xDim) { (_, _) => Module(new PE(aWidth, maxAcc, signedAct, useDspAccum)) }
 
     val nAccReg = Reg(UInt(log2Ceil(maxAcc).W))
 
-    // idle → running (accepting input) → draining (deep banks finishing, NO new
-    // input) → done. draining is entered only when banked (numBanks>1); the
-    // unbanked array goes running→done directly on bank 0's completion, exactly as
-    // before. The split matters because the input side (bank 0) finishes
-    // numBanks-1 cycles before the deepest bank: if the array kept accepting during
-    // that window, a streaming caller (Core) would feed the NEXT op's beats into
-    // the drain and lose them. running gates input-accept; done gates completion.
-    //
-    // Unbanked keeps a 3-state enum (no draining) so its FSM encoding — and hence
-    // existing bitstreams — is byte-identical to before.
+    // idle → running (accepting input) → draining (banked only: deeper banks finishing,
+    // NO new input, else a streaming caller's next-op beats would be swallowed) → done.
+    // Unbanked keeps a 3-state enum so its FSM encoding and emitted SV are unchanged.
     val idle_state :: running_state :: fsmRest = Enum(if (numBanks == 1) 3 else 4)
     val done_state      = fsmRest.last
     val draining_state  = if (numBanks == 1) done_state else fsmRest.head
@@ -115,20 +79,15 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
     val isLatching = (stateReg === idle_state) && startable
     val canStep    = input.weights_i.valid && input.activation_i.valid
 
-    // Bank 0 (col 0) is the input consumer: the moment it finishes it has swallowed
-    // all nAcc beats, so the array must STOP accepting that same cycle — otherwise
-    // (banked only) it eats one more beat before the registered running→draining
-    // transition lands, stealing the next op's first beat from a streaming caller.
-    // inputDone is combinational (bank 0's PE output.valid). Unbanked keeps the
-    // plain `running` gate so its SV is byte-identical (there Core's !outPending
-    // already suppresses the extra beat, since outPending == bank-0-done).
+    // Bank 0 has consumed all nAcc beats the cycle it finishes, so (banked) input must
+    // stop that same cycle, before the registered running→draining transition lands.
+    // Unbanked keeps the plain `running` gate (Core's !outPending covers that case).
     val inputDone     = arr(0)(0).output.valid
     val stillAccepting = if (numBanks == 1) (stateReg === running_state)
                          else (stateReg === running_state) && !inputDone
 
-    // External handshakes. In running, weights and activations gate each other so
-    // both fire together per cycle. nAcc rendezvous fires only at start. Banking
-    // does not change the boundary handshake — only the internal propagation.
+    // In running, weights and activations gate each other so both fire together;
+    // nAcc fires only at the start.
     input.nAcc.ready         := isLatching
     input.activation_i.ready := isLatching ||
                                 (stillAccepting && input.weights_i.valid)
@@ -136,11 +95,8 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
                                 (stillAccepting && input.activation_i.valid)
 
     // ── Per-bank input pipeline ──────────────────────────────────────────────
-    // Delay index d = bank index. d==0 is the live boundary beat (bank 0); d>=1 is
-    // a free-running register of d-1, so a beat injected at cycle t reaches bank d
-    // at t+d. valid resets to false (via the array's reset, incl. arrLocalReset)
-    // so the pipeline flushes between tiles; the wide data regs need no reset (the
-    // valid bit gates each PE's accumulation).
+    // Stage d feeds bank d: stage 0 is the live boundary beat, stage d a register of d-1.
+    // Only valid is reset (incl. by arrLocalReset); it gates every PE's accumulation.
     val stage0Valid   = isLatching || (stillAccepting && canStep)
     val stage0NAcc    = Mux(isLatching, input.nAcc.bits, nAccReg)
 
@@ -175,10 +131,7 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
     for (row <- 0 until yDim; col <- 0 until xDim; lane <- 0 until nLanes) {
         output.bits.accum(row)(col * nLanes + lane) := arr(row)(col).output.bits.accum(lane)
     }
-    // Banks run in lockstep internally; the deepest bank finishes last, so it
-    // gates completion. Earlier banks sit in done_state holding their results.
-    // The deepest bank finishes last, so it gates completion. (inputDone, bank 0's
-    // completion, is defined above where it also gates the input-accept phase.)
+    // The deepest bank finishes last and gates completion; earlier banks hold.
     val allDone   = arr(0)(doneCol).output.valid
     output.valid := allDone
 
@@ -190,9 +143,7 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
             }
         }
         is(running_state) {
-            // Bank 0 done ⇒ all input consumed. Unbanked: bank 0 IS the deepest,
-            // so go straight to done (byte-identical to the original FSM). Banked:
-            // stop accepting input and let the deeper banks drain.
+            // Bank 0 done ⇒ all input consumed. Unbanked, bank 0 is the deepest bank.
             when(inputDone) {
                 stateReg := (if (numBanks == 1) done_state else draining_state)
             }
@@ -203,9 +154,8 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
             }
         }
     }
-    // draining → done once the deepest bank finishes. Kept out of the switch (and
-    // absent entirely when unbanked) so the 3-state FSM stays byte-identical; the
-    // switch simply holds stateReg in draining until this fires.
+    // draining → done. Outside the switch (and absent when unbanked) so the unbanked
+    // FSM's emitted SV is unchanged.
     if (numBanks > 1) {
         when(stateReg === draining_state && allDone) {
             stateReg := done_state
