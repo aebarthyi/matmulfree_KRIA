@@ -87,7 +87,9 @@ it was.
 - Sampling: `--temp F`, `--top-k K`, `--seed N`, `--no-eos`.
 - Environment (via `ENV="K=V …"` on the board): `MMFREE_SPLIT_CHUNKS` (column-tile split
   count; `0` disables, `n` forces n), `MMFREE_RB_THREADS` (readback threads; `1` = serial),
-  `MMFREE_NO_PIPELINE=1` (serial projection sequencing), `MMFREE_CPU_BATCH`, plus the runtime
+  `MMFREE_PACK` (activation pack: `neon` default on aarch64, `tiled`, or `legacy`, whose cost
+  depends on page placement — A/B only), `MMFREE_NO_PIPELINE=1` (serial projection
+  sequencing), `MMFREE_CPU_BATCH`, plus the runtime
   knobs in `software/README.md`.
 
 ### Direct invocation

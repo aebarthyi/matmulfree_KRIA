@@ -111,19 +111,24 @@ def legend_band(fig, keys, extra=(), y=1.05, ncol=None):
     """Shared legend in a band above the panels, never on the data."""
     handles = [plt.Line2D([], [], color=COLOR[k], lw=2, marker='o', markersize=5,
                           markeredgecolor=SURFACE, label=LABEL[k]) for k in keys]
-    handles += list(extra)
+    # Keep the ring's key only if ring() drew one, so a clean data set shows no flag entry.
+    handles += [h for h in extra
+                if h.get_label() != FLAG_LABEL or getattr(fig, '_has_rings', False)]
     fig.legend(handles=handles, loc='upper left', bbox_to_anchor=(0.008, y),
                ncol=ncol or len(handles), frameon=False)
 
 
+FLAG_LABEL = 'not quotable (passes disagree >3%)'
+
+
 def flag_handle():
     return plt.Line2D([], [], color=CRITICAL, lw=0, marker='o', markerfacecolor='none',
-                      markeredgewidth=1.4, markersize=9,
-                      label='not quotable (passes disagree >3%)')
+                      markeredgewidth=1.4, markersize=9, label=FLAG_LABEL)
 
 
 def ring(ax, x, y):
     """Ring an unquotable cell in the reserved status colour."""
+    ax.figure._has_rings = True
     ax.plot([x], [y], marker='o', markersize=11, markerfacecolor='none',
             markeredgecolor=CRITICAL, markeredgewidth=1.4, zorder=6, clip_on=False)
 

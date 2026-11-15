@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define MMFREE_PACK_HAVE_NEON 1
+#endif
 
 #include "mmfree_lib.h"
 #include "mmfree_runtime.h"
@@ -55,6 +59,48 @@ static size_t rb_min_elems(void) {
         n = (v <= 0) ? 4096u : (size_t)v;
     }
     return n;
+}
+
+/* Activation pack path (pack_act_port0), read once and cached:
+ *   MMFREE_PACK=neon|tiled|legacy   (default: neon on aarch64, else tiled)
+ * legacy reads the b rows in lockstep, 2N bytes apart. At N=2048 that is exactly one page,
+ * so all b loads share a page offset and the A53's physically indexed 4-way L1D set is
+ * picked by PA[12] alone: more than 4 rows of one parity thrash, and the parity is the page
+ * allocator's draw per process. That was 1.3B's bimodal b=6..8 cells (the same b=8 scatter
+ * measured 90-442 us across fresh processes). tiled and neon read each row's tile start to
+ * finish, so placement cannot matter; neon also transposes 8 lanes at a time (~4x faster
+ * than legacy's best case). legacy is kept for in-session A/B only. */
+enum { PACK_LEGACY, PACK_TILED, PACK_NEON };
+#define PACK_TILE 32u              /* int16 per row per tile: one 64 B line */
+
+static int pack_sel = -1;          /* file scope so the host test can force each path */
+
+static int pack_mode(void) {
+    if (pack_sel < 0) {
+#ifdef MMFREE_PACK_HAVE_NEON
+        pack_sel = PACK_NEON;
+#else
+        pack_sel = PACK_TILED;
+#endif
+        const char *e = getenv("MMFREE_PACK");
+        if (e && *e) {
+            if (!strcmp(e, "legacy"))     pack_sel = PACK_LEGACY;
+            else if (!strcmp(e, "tiled")) pack_sel = PACK_TILED;
+            else if (strcmp(e, "neon"))
+                fprintf(stderr, "warning: ignoring MMFREE_PACK=%s (neon|tiled|legacy)\n", e);
+        }
+    }
+    return pack_sel;
+}
+
+/* neon needs a 16 B beat (8 int16 slots = one q register); anything else runs tiled. */
+static int pack_path(const mmfree_geom_t *g) {
+    const int m = pack_mode();
+    return (m == PACK_NEON && g->portBytes != 16u) ? PACK_TILED : m;
+}
+
+static const char *pack_name(int m) {
+    return m == PACK_NEON ? "neon 8x8" : m == PACK_TILED ? "tiled" : "legacy";
 }
 
 /* Open one resident udmabuf, distinguishing the three failures: missing (overlay
@@ -231,6 +277,11 @@ mmfree_lib_t *mmfree_lib_open(const mmfree_lib_cfg_t *cfg) {
     printf("  [built WITHOUT OpenMP — threading unavailable]");
 #endif
     printf("\n");
+    /* Same for the activation pack: legacy's cost depends on page placement. */
+    if (h->act[0].cached && h->ctx.geom.aWidth == 16u)
+        printf("# act pack: %s\n", pack_name(pack_path(&h->ctx.geom)));
+    else
+        printf("# act pack: per-beat (uncached ACT or aWidth != 16)\n");
     return h;
 
 fail:
@@ -353,9 +404,76 @@ static void readback_rows(mmfree_lib_t *h, const proj_t *pr, int32_t *acc, uint3
     readback_rows_at(h, pr, acc, b, pr->M, 0u);
 }
 
+/* Columns [n0, N) of the b rows into beats of `stride` int16 slots, one PACK_TILE-column
+ * tile at a time; within a tile each row's slice is read start to finish. */
+static void pack_rows_tiled(int16_t *a0w, const int16_t *x, uint32_t N, uint32_t b,
+                            uint32_t stride, uint32_t n0) {
+    for (; n0 < N; n0 += PACK_TILE) {
+        const uint32_t n1 = (n0 + PACK_TILE < N) ? n0 + PACK_TILE : N;
+        for (uint32_t r = 0; r < b; r++) {
+            const int16_t *src = x + (size_t)r * N;
+            int16_t *dst = a0w + r;
+            for (uint32_t n = n0; n < n1; n++)
+                dst[(size_t)n * stride] = src[n];
+        }
+    }
+}
+
+#ifdef MMFREE_PACK_HAVE_NEON
+static inline int16x8_t trn1_s64(int32x4_t a, int32x4_t b) {
+    return vreinterpretq_s16_s64(vtrn1q_s64(vreinterpretq_s64_s32(a), vreinterpretq_s64_s32(b)));
+}
+static inline int16x8_t trn2_s64(int32x4_t a, int32x4_t b) {
+    return vreinterpretq_s16_s64(vtrn2q_s64(vreinterpretq_s64_s32(a), vreinterpretq_s64_s32(b)));
+}
+
+/* v[i] <- column i of the 8x8 int16 matrix whose rows are v[0..7]. */
+static inline void transpose8x8_s16(int16x8_t v[8]) {
+    const int16x8_t t0 = vtrn1q_s16(v[0], v[1]), t1 = vtrn2q_s16(v[0], v[1]);
+    const int16x8_t t2 = vtrn1q_s16(v[2], v[3]), t3 = vtrn2q_s16(v[2], v[3]);
+    const int16x8_t t4 = vtrn1q_s16(v[4], v[5]), t5 = vtrn2q_s16(v[4], v[5]);
+    const int16x8_t t6 = vtrn1q_s16(v[6], v[7]), t7 = vtrn2q_s16(v[6], v[7]);
+#define S32(q) vreinterpretq_s32_s16(q)
+    const int32x4_t u0 = vtrn1q_s32(S32(t0), S32(t2)), u2 = vtrn2q_s32(S32(t0), S32(t2));
+    const int32x4_t u1 = vtrn1q_s32(S32(t1), S32(t3)), u3 = vtrn2q_s32(S32(t1), S32(t3));
+    const int32x4_t u4 = vtrn1q_s32(S32(t4), S32(t6)), u6 = vtrn2q_s32(S32(t4), S32(t6));
+    const int32x4_t u5 = vtrn1q_s32(S32(t5), S32(t7)), u7 = vtrn2q_s32(S32(t5), S32(t7));
+#undef S32
+    v[0] = trn1_s64(u0, u4); v[4] = trn2_s64(u0, u4);
+    v[1] = trn1_s64(u1, u5); v[5] = trn2_s64(u1, u5);
+    v[2] = trn1_s64(u2, u6); v[6] = trn2_s64(u2, u6);
+    v[3] = trn1_s64(u3, u7); v[7] = trn2_s64(u3, u7);
+}
+
+/* 16 B beats: 8 consecutive beats are the 8x8 transpose of 8 columns of the 8 rows. Each
+ * row's tile is first copied to a contiguous scratch (its source line read once, in order);
+ * scratch rows [b,8) stay zero, so those slots are written as zero. The N % PACK_TILE tail
+ * goes through the tiled path. */
+static void pack_rows_neon8(int16_t *a0w, const int16_t *x, uint32_t N, uint32_t b) {
+    int16_t tile[8][PACK_TILE] __attribute__((aligned(64)));
+    memset(tile, 0, sizeof(tile));
+    const uint32_t Nt = N & ~(PACK_TILE - 1u);
+    for (uint32_t n0 = 0; n0 < Nt; n0 += PACK_TILE) {
+        for (uint32_t r = 0; r < b; r++) {
+            const int16_t *s = x + (size_t)r * N + n0;
+            for (uint32_t k = 0; k < PACK_TILE; k += 8u)
+                vst1q_s16(&tile[r][k], vld1q_s16(s + k));
+        }
+        for (uint32_t k = 0; k < PACK_TILE; k += 8u) {
+            int16x8_t v[8];
+            for (uint32_t r = 0; r < 8u; r++) v[r] = vld1q_s16(&tile[r][k]);
+            transpose8x8_s16(v);
+            for (uint32_t i = 0; i < 8u; i++)
+                vst1q_s16(a0w + (size_t)(n0 + k + i) * 8u, v[i]);
+        }
+    }
+    pack_rows_tiled(a0w, x, N, b, 8u, Nt);
+}
+#endif
+
 /* Scatter b activation rows (x[r*N + n]) into port-0 ACT beats, row r at bytes
- * [r*abytes, (r+1)*abytes). Only the b active rows are written; rows [b,B) keep the
- * open-time zeros and are never read back. No cache sync — the caller does it. */
+ * [r*abytes, (r+1)*abytes). Rows [b,B) are never drained: legacy and tiled leave them
+ * as they were, neon writes zero. No cache sync — the caller does it. */
 static void pack_act_port0(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32_t b) {
     const mmfree_geom_t *g = &h->ctx.geom;
     const uint32_t abytes = g->aWidth / 8u;
@@ -364,6 +482,13 @@ static void pack_act_port0(mmfree_lib_t *h, const int16_t *x, uint32_t N, uint32
         /* Cached mapping (flushed by sync_for_device): plain stores are fine. */
         int16_t *a0w = (int16_t *)h->act[0].vaddr;
         const uint32_t stride = g->portBytes / 2u;   /* int16 slots per beat */
+        switch (pack_path(g)) {
+#ifdef MMFREE_PACK_HAVE_NEON
+        case PACK_NEON:  pack_rows_neon8(a0w, x, N, b);           return;
+#endif
+        case PACK_TILED: pack_rows_tiled(a0w, x, N, b, stride, 0u); return;
+        default:         break;
+        }
         for (uint32_t n = 0; n < N; n++) {
             int16_t *beat = a0w + (size_t)n * stride;
             for (uint32_t r = 0; r < b; r++)

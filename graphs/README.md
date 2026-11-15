@@ -11,8 +11,8 @@ PNG (200 dpi, review) and PDF (vector, report) land in `graphs/figures/`.
 
 | platform | source | notes |
 |---|---|---|
-| KRIA K26 engine + A53 | `reports/final_batched_20260825/{dataset,ops_*}.csv` | aggregator output (`scripts/final_dataset.py`): 5-pass medians, `flag`, tok/J net of idle |
-| Xeon W-2155 | same files | the **batched** CPU arm; `reports/final/` holds the older unbatched one |
+| KRIA K26 engine + A53 | `reports/final_neonpack_20261021/{dataset,ops_*}.csv` | aggregator output (`scripts/final_dataset.py`): 5-pass medians, `flag`, tok/J net of idle. Engine rows re-measured 2026-10-21 with the NEON activation pack; A53 rows carried over from 2026-08-16 |
+| Xeon W-2155 | same files | the **batched** CPU arm (2026-08-25); `reports/final/` holds the older unbatched one |
 | Jetson Orin Nano | `reports/jetson/mmfree*.csv` (throughput), `jetson_energy.csv` (power) | separate PyTorch harness, n=1, read directly |
 
 `GRAPHS_DATASET=<dir>` points the KRIA/Xeon side at another aggregation. Every number

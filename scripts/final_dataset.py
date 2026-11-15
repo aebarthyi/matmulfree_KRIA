@@ -52,15 +52,78 @@ def model_from_preset(p):
     return p
 
 
-def board_power(power_root):
-    """Board rail power from power_bench.sh summary lines -> (workload, idle).
+def idle_samples(samples_path):
+    """power_bench.sh raw .samples -> [(epoch_s, mW)], one per '@<epoch>' record."""
+    out, ts = [], None
+    for line in open(samples_path, errors='ignore'):
+        if line.startswith('@'):
+            ts = float(line[1:])
+            continue
+        m = re.match(r'SOM total power\s*:\s*([\d.]+)\s*mW', line)
+        if m and ts is not None:
+            out.append((ts, float(m.group(1))))
+            ts = None
+    return out
+
+
+def drop_idle_samples(idle_dir, idle_logs, drop):
+    """Recompute the idle mean from the raw samples, excluding the DECLARED epochs.
+
+    -> (idle_w, problems). Every declared epoch must match exactly one sample, and the
+    all-samples mean must reproduce the summary log's avg. Otherwise a stale flag carried onto
+    another set would quietly do nothing, or a parse slip would quietly move the denominator.
+    """
+    problems, means, hits = [], [], {e: [] for e in drop}
+    for log, logged_w in idle_logs:
+        raw = log[:-len('.log')] + '.samples'
+        if not os.path.exists(raw):
+            problems.append(f"--idle-drop-sample: {os.path.basename(raw)} missing — cannot drop "
+                            "individual samples from a summary log")
+            continue
+        s = idle_samples(raw)
+        if not s or abs(sum(w for _, w in s) / len(s) / 1000.0 - logged_w) > 0.0005:
+            problems.append(f"--idle-drop-sample: {os.path.basename(raw)} does not reproduce its "
+                            f"log's avg {logged_w:.4f} W — refusing to recompute from it")
+            continue
+        keep = []
+        for t, w in s:
+            if int(t) in hits:
+                hits[int(t)].append((os.path.basename(raw), t, w))
+            else:
+                keep.append(w)
+        if not keep:
+            problems.append(f"--idle-drop-sample would drop every sample of {os.path.basename(raw)}")
+            continue
+        means.append(sum(keep) / len(keep) / 1000.0)
+        print(f"kria idle: {os.path.basename(raw)}: n={len(keep)} of {len(s)} kept, "
+              f"{logged_w:.3f} W as logged -> {means[-1]:.3f} W", file=sys.stderr)
+    for e, h in sorted(hits.items()):
+        if len(h) != 1:
+            problems.append(f"--idle-drop-sample {e}: matches {len(h)} idle samples under "
+                            f"{idle_dir} (want exactly 1) — wrong set, or a stale flag?")
+            continue
+        f, t, w = h[0]
+        when = datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime('%H:%M:%S UTC')
+        print(f"kria idle: DROPPED sample @{t:.3f} ({when}, {w:.0f} mW) from {f} — declared "
+              "via --idle-drop-sample", file=sys.stderr)
+    if problems:
+        return None, problems
+    return sum(means) / len(means), []
+
+
+def board_power(power_root, drop=(), idle_max_w=None):
+    """Board rail power from power_bench.sh summary lines -> (workload, idle, problems).
 
     workload maps (power_dir, batch) -> mean SOM watts; idle is the mean SOM watts of the
     `_idle` logs in power/idle/, or None. Idle logs are matched on BOTH the _idle suffix (they
     also carry a _b<N>_ tag) and the directory being exactly idle/: archived baselines parked
     in power/idle_<x>/ are reported, never averaged into the denominator.
+
+    drop: epochs (int seconds) of idle samples to exclude, recomputed from the raw .samples.
+    idle_max_w: a baseline above it is a problem. A bitstream left resident after a sweep
+    (xmutil unloadapp does not clear the fabric) reads ~0.9 W over a fresh-boot idle.
     """
-    out, idle, archived = {}, [], {}
+    out, idle, archived, idle_logs, problems = {}, [], {}, [], []
     pat = re.compile(r'SOM total power\s+avg\s+([\d.]+)\s*mW')
     for log in glob.glob(os.path.join(power_root, '*', '*.log')):
         base = os.path.basename(log)
@@ -71,18 +134,32 @@ def board_power(power_root):
             continue
         watts = float(w.group(1)) / 1000.0
         if base.endswith('_idle.log'):
-            (idle if parent == 'idle' else archived.setdefault(parent, [])).append(watts)
+            if parent == 'idle':
+                idle.append(watts)
+                idle_logs.append((log, watts))
+            else:
+                archived.setdefault(parent, []).append(watts)
             continue
         m = re.search(r'_b(\d+)_n', base)
         if m:
             out[(parent, int(m.group(1)))] = watts
     idle_w = (sum(idle) / len(idle)) if idle else None
+    if drop:
+        if not idle_logs:
+            problems.append("--idle-drop-sample given but there is no power/idle/ baseline")
+        else:
+            idle_w, problems = drop_idle_samples(os.path.join(power_root, 'idle'), idle_logs, drop)
     for name, ws in sorted(archived.items()):
         w = sum(ws) / len(ws)
         delta = f", {100 * (w - idle_w) / idle_w:+.2f}% vs this run" if idle_w else ""
         print(f"note: archived idle baseline power/{name}/ = {w:.3f} W{delta} "
               f"— NOT averaged into the denominator", file=sys.stderr)
-    return out, idle_w
+    if idle_w is not None and idle_max_w is not None and idle_w > idle_max_w:
+        problems.append(f"kria idle baseline {idle_w:.3f} W > --idle-max-w {idle_max_w} W: a "
+                        "bitstream resident in the fabric (idle sampled after a sweep without a "
+                        "reboot?) would inflate every board tok/J. Re-sample from a fresh boot; "
+                        "raise --idle-max-w only if this really is the board's idle")
+    return out, idle_w, problems
 
 
 def fnum(r, key):
@@ -139,13 +216,17 @@ def metrics(r):
     )
 
 
-def read_board(board_root):
-    """Board CSVs -> list of raw per-pass records."""
+def read_board(board_root, idle_drop=(), idle_max_w=None):
+    """Board CSVs -> (list of raw per-pass records, idle-baseline problems)."""
     recs = []
-    pw, idle_w = board_power(os.path.join(board_root, 'power'))
+    pw, idle_w, idle_problems = board_power(os.path.join(board_root, 'power'),
+                                            idle_drop, idle_max_w)
     if not pw:
         print(f"WARN: no board power logs under {board_root}/power — did you pull them?", file=sys.stderr)
-    if idle_w is None:
+    if idle_w is None and idle_problems:
+        print("kria idle baseline: REFUSED (listed at the end) — kria tok/J falls back to TOTAL "
+              "draw and every kria row is flagged NO_IDLE until it is resolved", file=sys.stderr)
+    elif idle_w is None:
         print(f"WARN: no idle baseline under {board_root}/power/idle — tok/J will fall back "
               "to TOTAL draw for the kria rows, which is not comparable to the Xeon's "
               "net-of-idle. Re-run final_sweep_board.sh (it samples one per sweep).",
@@ -177,7 +258,7 @@ def read_board(board_root):
                 # ladder for every arm of this model (hw_batch is just the per-run batch).
                 hw_batch=int(r['hw_batch_max']) if r.get('hw_batch_max') else None,
                 streams_ok=r.get('streams_ok', ''), preset=preset))
-    return recs
+    return recs, idle_problems
 
 
 def xeon_fmt(bits):
@@ -396,6 +477,20 @@ def main():
                     help='batch ladder the KRIA A53 CPU arms were deliberately run at, '
                          'when shorter than the FPGA\'s. Declares the truncation (printed in the '
                          'log) instead of reporting missing rows; it does not fabricate them.')
+    ap.add_argument('--prompt-tokens', type=int, default=None, metavar='N',
+                    help='assert every row was measured with an N-token prompt. Without it the '
+                         'table must still carry ONE prompt length, whatever it is.')
+    ap.add_argument('--no-a53', action='store_true',
+                    help='declare the KRIA A53 CPU arms out of scope for this set: their rows '
+                         'are dropped and not expected, instead of reported ENTIRELY ABSENT.')
+    ap.add_argument('--idle-drop-sample', default=None, metavar='EPOCH[,EPOCH]',
+                    help='exclude these samples (the integer seconds of their @<epoch> line in '
+                         'power/idle/*.samples) from the board idle baseline, recomputed from '
+                         'the raw samples; each must match exactly one sample. For a sample '
+                         'with a known external cause (e.g. an ssh login), printed on every run.')
+    ap.add_argument('--idle-max-w', type=float, default=3.8, metavar='W',
+                    help='refuse a board idle baseline above this (default 3.8; fresh-boot idle '
+                         'reads 3.46-3.52). Higher means a bitstream left resident in the fabric.')
     a = ap.parse_args()
     cpu_ladder = None
     # `is not None`: an empty --cpu-ladder (e.g. an unset $CPU_BATCHES) is an error.
@@ -407,17 +502,51 @@ def main():
         if not cpu_ladder:
             ap.error('--cpu-ladder is empty; omit it to expect the full ladder')
 
-    recs = []
+    idle_drop = ()
+    if a.idle_drop_sample is not None:
+        try:
+            idle_drop = tuple(int(x) for x in a.idle_drop_sample.replace(',', ' ').split())
+        except ValueError:
+            ap.error(f'--idle-drop-sample wants integer epochs, got {a.idle_drop_sample!r}')
+        if not idle_drop:
+            ap.error('--idle-drop-sample is empty; omit it to keep every idle sample')
+
+    recs, idle_problems = [], []
     if os.path.isdir(a.board):
-        recs += read_board(a.board)
+        board_recs, idle_problems = read_board(a.board, idle_drop, a.idle_max_w)
+        recs += board_recs
     else:
         print(f"WARN: board dir {a.board} missing", file=sys.stderr)
     if os.path.isdir(a.xeon):
         recs += read_xeon(a.xeon)
     else:
         print(f"WARN: xeon dir {a.xeon} missing", file=sys.stderr)
+    if a.no_a53:
+        n0 = len(recs)
+        recs = [r for r in recs if not (r['platform'] == 'kria' and r['arm'] == 'cpu')]
+        print(f"kria/cpu (A53) arms: DECLARED out of scope (--no-a53) — dropped "
+              f"{n0 - len(recs)} per-pass rows", file=sys.stderr)
     if not recs:
         sys.exit("no input found — nothing to aggregate")
+
+    # Prefill (ttft/prefill_ms) scales with prompt length, so a table mixing lengths compares
+    # different workloads. Checked per PASS, before the median can hide a minority.
+    prompt_problems = []
+    by_arm = defaultdict(set)
+    for r in recs:
+        pt = r.get('prompt_tokens')
+        by_arm[(r['platform'], r['arm'])].add(int(pt) if pt is not None else None)
+    seen = set().union(*by_arm.values())
+    if a.prompt_tokens is not None:
+        for arm, v in sorted(by_arm.items()):
+            if v != {a.prompt_tokens}:
+                prompt_problems.append(f"{'/'.join(arm)}: prompt_tokens {sorted(v, key=str)}, "
+                                       f"expected {a.prompt_tokens} (--prompt-tokens)")
+    elif len(seen) > 1:
+        prompt_problems.append("table mixes prompt lengths: " + ", ".join(
+            f"{'/'.join(arm)}={sorted(v, key=str)}" for arm, v in sorted(by_arm.items())))
+    print(f"prompt tokens: {sorted(seen, key=str)}"
+          + ("" if prompt_problems else " on every row"), file=sys.stderr)
 
     rows, prof_rows = collapse(recs, a.spread_limit)
     for r in rows:
@@ -482,10 +611,11 @@ def main():
     if len(fpga_formats) > 1:
         print(f"fpga arm: DECLARED encodings {fpga_formats} — one bitstream each")
     want_cells = ([('kria', 'fpga', m, f) for m in want_models for f in fpga_formats] +
-                  [('kria', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')] +
+                  ([] if a.no_a53 else
+                   [('kria', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')]) +
                   [('xeon', 'cpu', m, f) for m in want_models for f in ('int8', '2bit', '1p6')])
     have = {(r['platform'], r['arm'], r['model'], r['weight_fmt']) for r in rows}
-    missing = list(ladder_problems)
+    missing = list(ladder_problems) + prompt_problems + idle_problems
     if cpu_ladder:
         print(f"kria/cpu arms: DECLARED short ladder b={sorted(cpu_ladder)} "
               f"(--cpu-ladder) — rows outside it were not measured, not lost")

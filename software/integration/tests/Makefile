@@ -2,6 +2,7 @@
 #   make            # everything
 #   make split      # column-tile split plan + readback scatter (C)
 #   make readback   # threaded vs serial readback (C)
+#   make pack       # activation pack, every path (C; neon only on aarch64 — run on the board)
 #   make packed     # 1.6-bit pack round-trip (Python)
 # The CPU packed-weight kernel tests live in the submodule: make -C ../../../matmulfreellmCPU test
 CC       ?= gcc
@@ -10,8 +11,8 @@ SW       := ../..
 INCS     := -I$(SW)/include -I../libmmfree
 BUILD    := build
 
-.PHONY: all split readback packed clean
-all: split readback packed
+.PHONY: all split readback pack packed clean
+all: split readback pack packed
 
 # The C tests #include mmfree_lib.c to reach its statics; mmfree_runtime.c satisfies
 # its references (never called).
@@ -32,6 +33,13 @@ readback: $(BUILD)/test_readback
 	$(BUILD)/test_readback
 	@echo "--- same shapes with the serial fallback forced ---"
 	MMFREE_RB_THREADS=1 $(BUILD)/test_readback
+
+$(BUILD)/test_pack_act: test_pack_act.c ../libmmfree/mmfree_lib.c $(SW)/bench/mmfree_runtime.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(INCS) test_pack_act.c $(SW)/bench/mmfree_runtime.c -o $@
+
+pack: $(BUILD)/test_pack_act
+	$(BUILD)/test_pack_act
 
 packed:
 	cd .. && PYTHONPATH=. python3 tests/test_packed_roundtrip.py

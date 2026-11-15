@@ -11,6 +11,8 @@
 #   BACKENDS   cpu (int8) | cpu-2bit | cpu-1p6      (default: all three)
 #   BATCHES    --serve values                       (default: 1 2 3 4 5 6)
 #   GEN/REPS/WARMUP  tokens / timed reps / warmup   (default: 64 / 3 / 1 — matches the board)
+#   PROMPT_IDS comma-separated prompt token ids, passed as --ids (default: the runner's fixed
+#              8-token pseudo-prompt). The CSV's prompt_tokens column records the length.
 #   OUT        output dir                           (default: reports/host_cpu/<date>)
 #   POWER_INTERVAL   RAPL sample period, seconds    (default: 0.2)
 #   MAX_LOAD   refuse to start above this 1-min load average (default: nproc/4; 0 disables)
@@ -19,6 +21,11 @@
 # placeholders (bench_batch.sh can't be reused: transfer.mk's `run` hardcodes sudo).
 # Refuses to start above MAX_LOAD: next to a Vivado build it would measure the contention.
 set -uo pipefail
+
+# /etc/profile.d/nec-ve.sh (NEC Vector Engine, installed 2026-09-03) puts the VE's own nproc,
+# lscpu, ps, free, mpstat... ahead of /usr/bin. They describe the VE card (8 cores), not this
+# host, and its ps aborts. Drop them for this script and everything it runs.
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/opt/nec/ve/' | paste -sd: -)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -31,6 +38,9 @@ GEN="${GEN:-64}"
 REPS="${REPS:-3}"
 WARMUP="${WARMUP:-1}"
 POWER_INTERVAL="${POWER_INTERVAL:-0.2}"
+PROMPT_IDS="${PROMPT_IDS:-}"
+ids_arg=()
+[ -n "$PROMPT_IDS" ] && ids_arg=(--ids "$PROMPT_IDS")
 OUT="${OUT:-$REPO_ROOT/reports/host_cpu/$(date +%Y-%m-%d)}"
 
 NPROC=$(nproc)
@@ -112,6 +122,7 @@ echo "#   omp    : OMP_NUM_THREADS=$OMP_THREADS (physical cores=$PHYS_CORES; npr
 echo "#   models : $MODELS"
 echo "#   backend: $BACKENDS"
 echo "#   batches: $BATCHES   gen=$GEN reps=$REPS warmup=$WARMUP"
+echo "#   prompt : $([ -n "$PROMPT_IDS" ] && echo "$(echo "$PROMPT_IDS" | tr ',' '\n' | wc -l) tokens (--ids)" || echo "runner default (8-token pseudo-prompt)")"
 echo "#   power  : $([ "$HAVE_POWER" = 1 ] && echo "RAPL package$([ -n "$RAPL_DRAM" ] && echo "+dram")" || echo "UNAVAILABLE")"
 echo "#   out    : $OUT"
 echo "############################################################"
@@ -171,7 +182,7 @@ for model in $MODELS; do
             env MMFREE_PRESET="host_$(hostname)" MMFREE_CLK_MHZ="-" MMFREE_BATCH="-" \
                 "$RUNNER" 0 0 - - - - \
                 --blob "$blob" --tokenizer "$tok" \
-                --backend "$backend" --serve "$b" --gen "$GEN" \
+                --backend "$backend" --serve "$b" --gen "$GEN" "${ids_arg[@]}" \
                 --warmup "$WARMUP" --reps "$REPS" --bench --profile --csv > "$log" 2>&1
             rc=$?
             t1=$(date +%s.%N); p1=$(rapl_uj "$RAPL_PKG"); d1=$(rapl_uj "$RAPL_DRAM")

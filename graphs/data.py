@@ -11,10 +11,12 @@ import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The batched-CPU re-sweep. Its KRIA rows are identical to reports/final/ (2026-08-16);
-# its Xeon rows are the fixed arm whose CPU backends batch (+32-43% at b=8 on 370M).
+# KRIA FPGA rows re-measured 2026-10-21 with the NEON activation pack (all six presets,
+# 5 passes; +3-19% over the 08-15/08-16 rows, and the 1.3B b=7 flag is gone). Xeon rows
+# are the batched 2026-08-25 arm and the A53 rows the 2026-08-16 ones, both unchanged.
+# reports/final_batched_20260825 is the previous set, for diffing.
 DATASET_DIR = os.environ.get(
-    'GRAPHS_DATASET', os.path.join(REPO, 'reports', 'final_batched_20260825'))
+    'GRAPHS_DATASET', os.path.join(REPO, 'reports', 'final_neonpack_20261021'))
 JETSON_DIR = os.path.join(REPO, 'reports', 'jetson')
 
 # Each platform's best encoding: 2-bit on both CPUs (int8 is NOT faster on the Xeon),

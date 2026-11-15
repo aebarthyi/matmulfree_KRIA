@@ -10,81 +10,81 @@ Decode tok/s (all streams). Ratios are KRIA engine ÷ the other platform.
 
 | model | KRIA 1.6-bit | KRIA 2-bit | Xeon 2-bit | Xeon 1.6-bit | Jetson 2-bit | KRIA ÷ Xeon (best) | KRIA ÷ Xeon (1.6-bit) | KRIA ÷ Jetson | Jetson peak |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 370M | 137.1 | 133.4 | 235.5 | 208.4 | 39.2 | 0.58x | 0.66x | 3.50x | 5666 @ b=1753 |
-| 1.3B | 66.3 | 69.9 | 104.9 | 64.5 | 39.1 | 0.63x | 1.03x | 1.70x | 1863 @ b=1398 |
-| 2.7B | 44.7 | 42.7 | 54.6 | 33.2 | 20.4 | 0.82x | 1.34x | 2.19x | 946 @ b=1115 |
+| 370M | 147.9 | 148.0 | 235.5 | 208.4 | 39.2 | 0.63x | 0.71x | 3.77x | 5666 @ b=1753 |
+| 1.3B | 79.1 | 77.3 | 104.9 | 64.5 | 39.1 | 0.75x | 1.23x | 2.02x | 1863 @ b=1398 |
+| 2.7B | 49.1 | 46.8 | 54.6 | 33.2 | 20.4 | 0.90x | 1.48x | 2.41x | 946 @ b=1115 |
 
 Energy efficiency (tok/J). Net = minus each platform's measured idle; total = wall of its power domain. The Jetson has total only, 2.7B only.
 
 | model | KRIA net | Xeon net | KRIA ÷ Xeon (net) | KRIA total | Xeon total | Jetson total | KRIA watts | Xeon watts | Jetson watts |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 370M | 66.79 | 2.33 | 29x | 24.67 | 2.065 | — | 5.56 | 114.1 | — |
-| 1.3B | 25.08 | 0.91 | 28x | 10.78 | 0.818 | — | 6.15 | 128.2 | — |
-| 2.7B | 14.92 | 0.46 | 32x | 6.88 | 0.417 | 0.92 | 6.50 | 130.9 | 15.4 |
+| 370M | 64.74 | 2.33 | 28x | 25.68 | 2.065 | — | 5.76 | 114.1 | — |
+| 1.3B | 27.42 | 0.91 | 30x | 12.44 | 0.818 | — | 6.36 | 128.2 | — |
+| 2.7B | 15.53 | 0.46 | 34x | 7.40 | 0.417 | 0.92 | 6.63 | 130.9 | 15.4 |
 
 The Jetson's tok/J comes from its separate power run, which is slower per step (14.1 tok/s at b=8 against 20.4 in the throughput table above).
 
-Source: reports/final_batched_20260825/dataset.csv (2026-08-25); reports/jetson/ (throughput 2026-08-15, power 2026-09-17). ⚠ = flagged unstable by the aggregator.
+Source: reports/final_neonpack_20261021/dataset.csv (2026-10-21); reports/jetson/ (throughput 2026-08-15, power 2026-09-17). ⚠ = flagged unstable by the aggregator.
 
 ## `fig1_throughput_ladder`
 
 **Headline:** At the batches the board can run, the engine sits between the GPU and the workstation, and closes on the workstation as the model grows
 
-Per-panel y-axis.  Each platform at its fastest encoding.  KRIA over the Xeon at b=8: 0.58x / 0.63x / 0.82x (370M / 1.3B / 2.7B); over the Jetson: 3.5x / 1.7x / 2.2x.  The Jetson is overhead-bound at these batches: its decode step is ~0.20 s from b=1 to b=8 on both 370M and 1.3B, so its line rises linearly with batch and is a floor, not a bound (see fig4).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Per-panel y-axis.  Each platform at its fastest encoding.  KRIA over the Xeon at b=8: 0.63x / 0.75x / 0.90x (370M / 1.3B / 2.7B); over the Jetson: 3.8x / 2.0x / 2.4x.  The Jetson is overhead-bound at these batches: its decode step is ~0.20 s from b=1 to b=8 on both 370M and 1.3B, so its line rises linearly with batch and is a floor, not a bound (see fig4).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig2_shared_encoding_ladders`
 
 **Headline:** On identical weights the engine leads the Xeon at b=8 on 1.6-bit at 1.3B and 2.7B, and on 2-bit at no model size
 
-Top row: 1.6-bit, the engine's shipped format, run by the KRIA and the Xeon. Bottom row: 2-bit, the only format all three platforms run; the engine's arm there is a matched control bitstream (packedWeights=false, nothing else changed).  KRIA over Xeon at b=8, same encoding: 1.6-bit 370M: 0.66x; 1.6-bit 1.3B: 1.03x (ahead from b=7); 1.6-bit 2.7B: 1.34x (ahead from b=5); 2-bit 370M: 0.57x; 2-bit 1.3B: 0.67x; 2-bit 2.7B: 0.78x.  The Jetson is overhead-bound at these batches: its decode step is ~0.20 s from b=1 to b=8 on both 370M and 1.3B, so its line rises linearly with batch and is a floor, not a bound (see fig4).  KRIA K26 @250 MHz, engine + A53 host  |  Xeon W-2155, 20 threads, batched CPU kernels  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Top row: 1.6-bit, the engine's shipped format, run by the KRIA and the Xeon. Bottom row: 2-bit, the only format all three platforms run; the engine's arm there is a matched control bitstream (packedWeights=false, nothing else changed).  KRIA over Xeon at b=8, same encoding: 1.6-bit 370M: 0.71x; 1.6-bit 1.3B: 1.23x (ahead from b=6); 1.6-bit 2.7B: 1.48x (ahead from b=4); 2-bit 370M: 0.63x; 2-bit 1.3B: 0.74x; 2-bit 2.7B: 0.86x.  The Jetson is overhead-bound at these batches: its decode step is ~0.20 s from b=1 to b=8 on both 370M and 1.3B, so its line rises linearly with batch and is a floor, not a bound (see fig4).  KRIA K26 @250 MHz, engine + A53 host  |  Xeon W-2155, 20 threads, batched CPU kernels  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig3_throughput_ratio`
 
-**Headline:** At b=8 the engine is 1.7-3.5x the Jetson and 0.58-0.82x the Xeon, closing on the Xeon with batch and model size
+**Headline:** At b=8 the engine is 2.0-3.8x the Jetson and 0.63-0.90x the Xeon, closing on the Xeon with batch and model size
 
-Equal batch on both sides; each platform at its fastest encoding (engine 1.6-bit, Xeon and Jetson 2-bit). Above 1x the KRIA engine is faster.  The Jetson is overhead-bound at these batches: its decode step is ~0.20 s from b=1 to b=8 on both 370M and 1.3B, so its line rises linearly with batch and is a floor, not a bound (see fig4).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Equal batch on both sides; each platform at its fastest encoding (engine 1.6-bit, Xeon and Jetson 2-bit). Above 1x the KRIA engine is faster.  The Jetson is overhead-bound at these batches: its decode step is ~0.20 s from b=1 to b=8 on both 370M and 1.3B, so its line rises linearly with batch and is a floor, not a bound (see fig4).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig4_throughput_full_range`
 
 **Headline:** Allowed its own batch, the Jetson outruns both — the board stops at b=8 by construction, the Xeon was only measured to b=8
 
-Log-log.  Jetson decode-only rate (batch / decode-step time) over its full measured range: 370M: 5666 tok/s at b=1753, passing the engine's b=8 rate by b=30; 1.3B: 1863 tok/s at b=1398, passing the engine's b=8 rate by b=15; 2.7B: 946 tok/s at b=1115, passing the engine's b=8 rate by b=19.  The Xeon was not measured above b=8, so its line ends there by omission, not by limit.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Log-log.  Jetson decode-only rate (batch / decode-step time) over its full measured range: 370M: 5666 tok/s at b=1753, passing the engine's b=8 rate by b=30; 1.3B: 1863 tok/s at b=1398, passing the engine's b=8 rate by b=19; 2.7B: 946 tok/s at b=1115, passing the engine's b=8 rate by b=24.  The Xeon was not measured above b=8, so its line ends there by omission, not by limit.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, PyTorch, 2-bit weights, n=1  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig5_efficiency_net`
 
-**Headline:** Energy efficiency is the engine's win: 28-32x the Xeon per joule at b=8
+**Headline:** Energy efficiency is the engine's win: 28-34x the Xeon per joule at b=8
 
-Log y.  NET OF IDLE on both (KRIA idle 3.504 W, board rails; Xeon idle 13.0-13.1 W, RAPL pkg+dram).  The two instruments draw different boundaries: the KRIA figure includes board regulators, the Xeon excludes PSU losses.  The Jetson has no idle sample, so it appears only on the total-power basis (fig6, fig7).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Log y.  NET OF IDLE on both (KRIA idle 3.474 W, board rails; Xeon idle 13.0-13.1 W, RAPL pkg+dram).  The two instruments draw different boundaries: the KRIA figure includes board regulators, the Xeon excludes PSU losses.  The Jetson has no idle sample, so it appears only on the total-power basis (fig6, fig7).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig6_efficiency_total_2p7b`
 
-**Headline:** At matched batch the board is 7x the Jetson per joule; allowed b>62, the Jetson passes it
+**Headline:** At matched batch the board is 8x the Jetson per joule; allowed b>62, the Jetson passes it
 
-TOTAL power on all three (the Jetson has no idle sample, so this is the only shared basis, and the one least favourable to the board).  All three on 2-bit weights; the board's shipped 1.6-bit arm reads 6.88 tok/J at b=8 against 6.79 for its 2-bit control.  Power boundaries differ: KRIA board rails, Xeon RAPL pkg+dram, Jetson tegrastats module rails.  Jetson caveats: n=1; power is a run average over prefill+decode, so the decode-only edge is an estimate once prefill dominates (prefill is 92% of the b=592 window); and this power run is slower per step than the throughput run in fig1-4 (0.547 vs 0.391 s at b=1), so its throughput does not reconcile with those figures.  KRIA K26 @250 MHz, engine + A53 host, 2-bit control bitstream  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit  |  Jetson Orin Nano, reports/jetson/jetson_energy.csv  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+TOTAL power on all three (the Jetson has no idle sample, so this is the only shared basis, and the one least favourable to the board).  All three on 2-bit weights; the board's shipped 1.6-bit arm reads 7.40 tok/J at b=8 against 7.28 for its 2-bit control.  Power boundaries differ: KRIA board rails, Xeon RAPL pkg+dram, Jetson tegrastats module rails.  Jetson caveats: n=1; power is a run average over prefill+decode, so the decode-only edge is an estimate once prefill dominates (prefill is 92% of the b=592 window); and this power run is slower per step than the throughput run in fig1-4 (0.547 vs 0.391 s at b=1), so its throughput does not reconcile with those figures.  KRIA K26 @250 MHz, engine + A53 host, 2-bit control bitstream  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit  |  Jetson Orin Nano, reports/jetson/jetson_energy.csv  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig7_throughput_vs_power`
 
-**Headline:** The Xeon draws 18-24x the board's power for its throughput; the Jetson only overtakes the board per joule far past b=8
+**Headline:** The Xeon draws 17-23x the board's power for its throughput; the Jetson only overtakes the board per joule far past b=8
 
-Log-log; diagonals are constant tokens per joule on TOTAL power (the only basis the Jetson has).  Filled markers are b=8; the Jetson has power for 2.7B only, from its slower power run (fig6 caveats apply).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, jetson_energy.csv  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Log-log; diagonals are constant tokens per joule on TOTAL power (the only basis the Jetson has).  Filled markers are b=8; the Jetson has power for 2.7B only, from its slower power run (fig6 caveats apply).  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  Jetson Orin Nano, jetson_energy.csv  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig8_phase_breakdown`
 
-**Headline:** Host work around the engine grows with batch, to 49-65% of BitLinear time at b=8
+**Headline:** Host work around the engine grows with batch, to 43-59% of BitLinear time at b=8
 
-Engine compute is the only phase the fabric owns; pack/store/readback/load are A53 work around it.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Engine compute is the only phase the fabric owns; pack/store/readback/load are A53 work around it.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig9_offload_speedup`
 
 **Headline:** The bigger the model, the more the engine is worth
 
-Same board, same host process; only the ternary matmul moves.  Engine 1.6-bit, A53 2-bit (each its fastest).  The A53 arms were measured at b=1..2 with the UNBATCHED runner, so their rate is flat in batch and the b=8 bars hold it at b=2; a batched A53 arm would shrink the b=8 bars.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Same board, same host process; only the ternary matmul moves.  Engine 1.6-bit, A53 2-bit (each its fastest).  The A53 arms were measured at b=1..2 with the UNBATCHED runner, so their rate is flat in batch and the b=8 bars hold it at b=2; a batched A53 arm would shrink the b=8 bars.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig10_engine_headroom`
 
 **Headline:** Removing every measured host phase would bring the engine level with the Xeon at 2.7B only
 
-Log y.  The band is a PROJECTION from the measured phase breakdown, not a run.  Lower edge: the four instrumented host phases (pack/store/readback/load) removed, all other host work kept.  Upper edge: the fabric's busy time alone (unreachable; assumes RMSNorm and the vector ops are free).  At b=8: 370M: floor 178 vs Xeon 236; 1.3B: floor 86 vs Xeon 105; 2.7B: floor 57 vs Xeon 55.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  5-pass medians, reports/final_batched_20260825/dataset.csv (2026-08-25)
+Log y.  The band is a PROJECTION from the measured phase breakdown, not a run.  Lower edge: the four instrumented host phases (pack/store/readback/load) removed, all other host work kept.  Upper edge: the fabric's busy time alone (unreachable; assumes RMSNorm and the vector ops are free).  At b=8: 370M: floor 184 vs Xeon 236; 1.3B: floor 97 vs Xeon 105; 2.7B: floor 60 vs Xeon 55.  KRIA K26 @250 MHz, engine + A53 host, 1.6-bit weights  |  Xeon W-2155, 20 threads, batched CPU kernels, 2-bit weights  |  5-pass medians, reports/final_neonpack_20261021/dataset.csv (2026-10-21)
 
 ## `fig11_jetson_quantisation`
 

@@ -11,6 +11,11 @@
 # This host is also the Vivado build server: do not build while this runs.
 set -uo pipefail
 
+# /etc/profile.d/nec-ve.sh (NEC Vector Engine, installed 2026-09-03) puts the VE's own nproc,
+# lscpu, ps, free, mpstat... ahead of /usr/bin. They describe the VE card (8 cores), not this
+# host, and its ps aborts. Drop them for this script and everything it runs.
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/opt/nec/ve/' | paste -sd: -)
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -30,6 +35,14 @@ gen_for() {   # gen_for <hf-id> -> tokens
 }
 REPS="${REPS:-3}"
 OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/reports/host_cpu/final}"
+# Prompt as comma-separated token ids (--ids). Empty = the runner's fixed 8-token pseudo-prompt.
+# Use the SAME ids as the board sweep (final_sweep_board.sh PROMPT_IDS) so prefill is identical.
+PROMPT_IDS="${PROMPT_IDS:-}"
+if [ -n "$PROMPT_IDS" ]; then
+    EXPECT_PROMPT=$(echo "$PROMPT_IDS" | tr ',' '\n' | grep -c .)
+else
+    EXPECT_PROMPT=8
+fi
 
 # Hard-refuse without RAPL: a "final" data set with empty power columns is not final.
 ok=0
@@ -115,13 +128,29 @@ EOF
 # ── Existing output must be on the SAME ladder ───────────────────────────────────────
 # Complete pass dirs are skipped, so a ladder change would leave passes on different ladders
 # while the thread-count winner is chosen across the whole ladder. Refuse instead.
-stale=""
+stale=""; stale_prompt=""
 while IFS= read -r f; do
     [ -n "$f" ] || continue
     got=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="batch") c=i; next} {print $c}' "$f" \
           | sort -n | uniq | tr '\n' ' ')
     [ "$(echo $got)" = "$(echo $BATCHES)" ] || stale="$stale $(dirname "${f#$OUT_ROOT/}")[$(echo $got)]"
+    # Complete passes are skipped below, so one at another prompt length would be kept silently.
+    pt=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="prompt_tokens") c=i; next} c{print $c}' "$f" \
+         | sort -u | tr '\n' ' ')
+    [ "$(echo $pt)" = "$EXPECT_PROMPT" ] || stale_prompt="$stale_prompt $(dirname "${f#$OUT_ROOT/}")[$(echo ${pt:-?})]"
 done < <(find "$OUT_ROOT" -name host_cpu_sweep.csv 2>/dev/null | sort)
+if [ -n "$stale_prompt" ]; then
+    cat >&2 <<EOF
+ERROR: $OUT_ROOT already holds runs at a DIFFERENT prompt length.
+
+  this run wants : $EXPECT_PROMPT prompt tokens
+  already there  :$stale_prompt
+
+Complete passes are skipped, so they would be kept and aggregated as if they were this run.
+Point OUT_ROOT at a fresh directory, e.g. OUT_ROOT=reports/host_cpu/final_seq$EXPECT_PROMPT
+EOF
+    exit 1
+fi
 if [ -n "$stale" ]; then
     cat >&2 <<EOF
 ERROR: $OUT_ROOT already holds runs on a DIFFERENT batch ladder.
@@ -151,6 +180,7 @@ echo "# Xeon final sweep: $PASSES passes x {$THREAD_SET} threads"
 echo "#   models   : $MODELS"
 echo "#   backends : $BACKENDS"
 echo "#   batches  : $BATCHES   reps=$REPS   gen: 370M=$(gen_for x-370M) 1.3B=$(gen_for x-1.3B) 2.7B=$(gen_for x-2.7B)"
+echo "#   prompt   : $EXPECT_PROMPT tokens$([ -n "$PROMPT_IDS" ] && echo " (--ids $PROMPT_IDS)" || echo " (runner default)")"
 echo "#   out      : $OUT_ROOT"
 echo "############################################################"
 
@@ -266,7 +296,7 @@ for model in $MODELS; do
             settle                  # our own tail: waits, then shrugs
             assert_box_quiet        # someone else's hog: waits for nothing, aborts
             OMP_THREADS="$th" MODELS="$model" BACKENDS="$BACKENDS" BATCHES="$BATCHES" \
-            GEN="$g" REPS="$REPS" OUT="$out" \
+            GEN="$g" REPS="$REPS" OUT="$out" PROMPT_IDS="$PROMPT_IDS" \
                 ./scripts/bench_host_cpu.sh || failed="$failed ${slug}/t${th}p${pass}"
         done
     done
