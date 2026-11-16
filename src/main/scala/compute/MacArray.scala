@@ -1,9 +1,9 @@
-package systolic
+package compute
 
 import chisel3._
 import chisel3.util._
 
-class SystolicArrayInputBundle(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int) extends Bundle {
+class MacArrayInputBundle(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int) extends Bundle {
     // One weight beat per cycle: xDim columns × nLanes lanes of ternary weights.
     val weights_i    = Flipped(Decoupled(Vec((aWidth / 2) * xDim, UInt(2.W))))
     // One activation beat per cycle: yDim activations (one per row / batch item).
@@ -12,14 +12,15 @@ class SystolicArrayInputBundle(val aWidth: Int, val maxAcc: Int, val xDim: Int, 
     val nAcc         = Flipped(Decoupled(UInt(log2Ceil(maxAcc).W)))
 }
 
-class SystolicArrayOutputBundle(val aWidth: Int, val xDim: Int, val yDim: Int, val accWidth: Int) extends Bundle {
+class MacArrayOutputBundle(val aWidth: Int, val xDim: Int, val yDim: Int, val accWidth: Int) extends Bundle {
     // Per row, one accumulator per (col, lane). All yDim rows are exposed.
     val accum = Vec(yDim, Vec((aWidth / 2) * xDim, UInt(accWidth.W)))
 }
 
 /**
-  * 2D array of ternary-MAC PEs. yDim rows = batch items (one activation per row per
-  * cycle); xDim columns consume one full weight beat (xDim·nLanes weights) per cycle:
+  * Broadcast MAC array: a yDim x xDim grid of ternary-MAC [[PE]]s. yDim rows = batch items
+  * (one activation per row per cycle); xDim columns consume one full weight beat
+  * (xDim·nLanes weights) per cycle:
   *     O[row][col·nLanes + lane] = sum_t W[t][col·nLanes + lane] * A[row][t]
   * `weights_i` and `activation_i` must both be valid for the array to step; `nAcc`
   * is consumed once in the initial three-way rendezvous.
@@ -30,10 +31,14 @@ class SystolicArrayOutputBundle(val aWidth: Int, val xDim: Int, val yDim: Int, v
   * results numerically identical; PEs hold their results in done_state, so no output
   * de-skew is needed and `output.valid` follows the deepest bank (+numBanks-1 cycles).
   * colBankSize <= 0 or >= xDim is a single bank: the plain broadcast array.
+  *
+  * Not systolic: there is no nearest-neighbour delay chain, every PE in a bank sees the
+  * same beat in the same cycle. (A genuinely systolic variant was built and measured on
+  * the `exploration` branch; it did not lift the 250 MHz ceiling.)
   */
-class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int,
-                    val signedAct: Boolean = false,
-                    val useDspAccum: Boolean = false, val colBankSize: Int = 0) extends Module {
+class MacArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: Int,
+               val signedAct: Boolean = false,
+               val useDspAccum: Boolean = false, val colBankSize: Int = 0) extends Module {
     require(aWidth >= 2 && aWidth % 2 == 0, "aWidth must be even and >= 2")
     require(maxAcc >= 2, "maxAcc must be >= 2")
     require(xDim >= 1, "xDim must be >= 1")
@@ -43,8 +48,13 @@ class SystolicArray(val aWidth: Int, val maxAcc: Int, val xDim: Int, val yDim: I
     // Accumulator width = aWidth + headroom (see PE.scala).
     val accWidth = aWidth + log2Ceil(maxAcc)
 
-    val input  = IO(new SystolicArrayInputBundle(aWidth, maxAcc, xDim, yDim))
-    val output = IO(Decoupled(new SystolicArrayOutputBundle(aWidth, xDim, yDim, accWidth)))
+    // The emitted SV module keeps its original name: the shipped bitstreams were built
+    // from SV carrying it, and scripts/clone_preset_hw.sh hashes the SV. Rename it only
+    // together with a rebuild of every shipped preset.
+    override def desiredName = "SystolicArray"
+
+    val input  = IO(new MacArrayInputBundle(aWidth, maxAcc, xDim, yDim))
+    val output = IO(Decoupled(new MacArrayOutputBundle(aWidth, xDim, yDim, accWidth)))
 
     val nLanes = aWidth / 2
 

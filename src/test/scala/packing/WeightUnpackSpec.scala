@@ -1,4 +1,4 @@
-package systolic
+package packing
 
 import scala.util.Random
 import chisel3._
@@ -17,7 +17,7 @@ class WeightUnpackSpec extends AnyFreeSpec with Matchers with SingleThreadVerila
       val n     = rng.nextInt(37)
       val codes = Seq.fill(n)(ternaryCodes(rng.nextInt(3)))
       val bytes = TernaryPack.packCodes(codes)
-      bytes.length mustBe TernaryPack.packedBytes(n)
+      bytes.length.toLong mustBe TernaryPack.packedBytes(n)
       bytes.foreach(b => (b >= 0 && b < 243) mustBe true)     // never an unused code
       val back = bytes.flatMap(TernaryPack.unpackByte)
       back.take(n) mustBe codes                                // padding-holds ignored

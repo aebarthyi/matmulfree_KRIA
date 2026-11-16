@@ -1,28 +1,9 @@
 package control
 
 import chisel3._
-import testutil.SingleThreadVerilator
+import testutil.{AxiMaster, InstructionEncoder, SingleThreadVerilator}
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
-
-object InstructionEncoder {
-  def encode(opcode: BigInt, ptr: BigInt, dim0: BigInt, dim1: BigInt, flags: BigInt = 0): BigInt = {
-    require(opcode >= 0 && opcode < (BigInt(1) << 8),  "opcode must fit in 8 bits")
-    require(ptr    >= 0 && ptr    < (BigInt(1) << 40), "ptr must fit in 40 bits")
-    require(dim0   >= 0 && dim0   < (BigInt(1) << 32), "dim0 must fit in 32 bits")
-    require(dim1   >= 0 && dim1   < (BigInt(1) << 32), "dim1 must fit in 32 bits")
-    require(flags  >= 0 && flags  < (BigInt(1) << 16), "flags must fit in 16 bits")
-    opcode |
-      (ptr  <<   8) |
-      (dim0 <<  48) |
-      (dim1 <<  80) |
-      (flags << 112)
-  }
-
-  val LOAD_ACT   = BigInt(0x01)
-  val COMPUTE_MM = BigInt(0x02)
-  val STORE_OUT  = BigInt(0x03)
-}
 
 class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
   import InstructionEncoder._
@@ -30,7 +11,6 @@ class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThr
   private val DATA_WIDTH = 128
   private val ADDR_WIDTH = 32
   private val ID_WIDTH   = 6
-  private val STRB_ALL   = (BigInt(1) << (DATA_WIDTH / 8)) - 1
 
   // AXI response codes
   private val OKAY   = 0
@@ -44,13 +24,7 @@ class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThr
 
   private def resetDut(dut: AxiInstructionHandler): Unit = {
     // De-assert all AXI master-driven signals before reset
-    dut.s_axi.awvalid.poke(false.B)
-    dut.s_axi.wvalid.poke(false.B)
-    dut.s_axi.bready.poke(false.B)
-    dut.s_axi.arvalid.poke(false.B)
-    dut.s_axi.rready.poke(false.B)
-    dut.s_axi.awid.poke(0.U)
-    dut.s_axi.arid.poke(0.U)
+    new AxiMaster(dut.s_axi, dut.clock).idle()
     dut.load.ready.poke(false.B)
     dut.compute.ready.poke(false.B)
     dut.store.ready.poke(false.B)
@@ -70,62 +44,7 @@ class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThr
       data:      BigInt,
       awlen:     Int = 0,
       maxCycles: Int = 50
-  ): Int = {
-    dut.s_axi.awid.poke(0.U)
-    dut.s_axi.awaddr.poke(addr.U)
-    dut.s_axi.awlen.poke(awlen.U)
-    dut.s_axi.awsize.poke(4.U)   // 16 bytes per beat (log2 128/8)
-    dut.s_axi.awburst.poke(1.U)  // INCR
-    dut.s_axi.awvalid.poke(true.B)
-
-    dut.s_axi.wdata.poke(data.U)
-    dut.s_axi.wstrb.poke(STRB_ALL.U)
-    dut.s_axi.wlast.poke(true.B)
-    dut.s_axi.wvalid.poke(true.B)
-
-    dut.s_axi.bready.poke(true.B)
-
-    var awAsserted = true
-    var wAsserted  = true
-    var bReady     = true
-    var done       = false
-    var resp       = 0
-    var cycles     = 0
-
-    while (!done && cycles < maxCycles) {
-      val awFires = awAsserted && dut.s_axi.awready.peek().litToBoolean
-      val wFires  = wAsserted  && dut.s_axi.wready.peek().litToBoolean
-      val bFires  = bReady     && dut.s_axi.bvalid.peek().litToBoolean
-
-      if (bFires) {
-        resp = dut.s_axi.bresp.peek().litValue.toInt
-        done = true
-      }
-
-      dut.clock.step()
-
-      if (awFires) {
-        dut.s_axi.awvalid.poke(false.B)
-        awAsserted = false
-      }
-      if (wFires) {
-        dut.s_axi.wvalid.poke(false.B)
-        wAsserted = false
-      }
-      if (bFires) {
-        dut.s_axi.bready.poke(false.B)
-        bReady = false
-      }
-      cycles += 1
-    }
-
-    require(done, s"axiWrite to 0x${addr.toString(16)} timed out")
-
-    dut.s_axi.awvalid.poke(false.B)
-    dut.s_axi.wvalid.poke(false.B)
-    dut.s_axi.bready.poke(false.B)
-    resp
-  }
+  ): Int = new AxiMaster(dut.s_axi, dut.clock).write(addr, data, awlen, maxCycles)
 
   /** Issue a single-beat AXI read transaction. Returns (rdata, rresp). */
   private def axiRead(
@@ -133,51 +52,7 @@ class AxiInstructionHandlerSpec extends AnyFreeSpec with Matchers with SingleThr
       addr:      BigInt,
       arlen:     Int = 0,
       maxCycles: Int = 50
-  ): (BigInt, Int) = {
-    dut.s_axi.arid.poke(0.U)
-    dut.s_axi.araddr.poke(addr.U)
-    dut.s_axi.arlen.poke(arlen.U)
-    dut.s_axi.arsize.poke(4.U)
-    dut.s_axi.arburst.poke(1.U)
-    dut.s_axi.arvalid.poke(true.B)
-    dut.s_axi.rready.poke(true.B)
-
-    var arAsserted = true
-    var rReady     = true
-    var done       = false
-    var data       = BigInt(0)
-    var resp       = 0
-    var cycles     = 0
-
-    while (!done && cycles < maxCycles) {
-      val arFires = arAsserted && dut.s_axi.arready.peek().litToBoolean
-      val rFires  = rReady     && dut.s_axi.rvalid.peek().litToBoolean
-
-      if (rFires) {
-        data = dut.s_axi.rdata.peek().litValue
-        resp = dut.s_axi.rresp.peek().litValue.toInt
-        done = true
-      }
-
-      dut.clock.step()
-
-      if (arFires) {
-        dut.s_axi.arvalid.poke(false.B)
-        arAsserted = false
-      }
-      if (rFires) {
-        dut.s_axi.rready.poke(false.B)
-        rReady = false
-      }
-      cycles += 1
-    }
-
-    require(done, s"axiRead from 0x${addr.toString(16)} timed out")
-
-    dut.s_axi.arvalid.poke(false.B)
-    dut.s_axi.rready.poke(false.B)
-    (data, resp)
-  }
+  ): (BigInt, Int) = new AxiMaster(dut.s_axi, dut.clock).read(addr, arlen, maxCycles)
 
   private def pulseDone(sig: Bool, dut: AxiInstructionHandler): Unit = {
     sig.poke(true.B)

@@ -1,6 +1,6 @@
 # matmulfree_KRIA
 
-A Chisel3 hardware implementation of a ternary-accumulating systolic array for matmulfree LLM inference, packaged as an AXI4 IP for the Xilinx Kria K26 SoM (KV260 / KR260), with a userspace driver, a CPU-vs-FPGA decode runner, and the measurement scripts behind the published numbers.
+A Chisel3 hardware implementation of a ternary-accumulating broadcast MAC array for matmulfree LLM inference, packaged as an AXI4 IP for the Xilinx Kria K26 SoM (KV260 / KR260), with a userspace driver, a CPU-vs-FPGA decode runner, and the measurement scripts behind the published numbers.
 
 > "Matmulfree" here means weights are restricted to the ternary set `{-1, 0, +1}`, so every multiply collapses to an add, subtract, or hold. The array needs no multipliers; the shipped presets map the lane accumulators onto DSP48E2 slices used as adders (`dspAccum`).
 
@@ -13,7 +13,7 @@ A Chisel3 hardware implementation of a ternary-accumulating systolic array for m
         │   AXI4 slave  ──► AxiInstructionHandler ──► Core FSM     │
         │   (s_axi)                                      │         │
         │                                                ▼         │
-        │   AXI-Stream  ──► [LOAD] ──► actBram ──► SystolicArray   │
+        │   AXI-Stream  ──► [LOAD] ──► actBram ──► MacArray        │
         │   (s_axis)        [COMPUTE] ──► weights ──►   ▲          │
         │                                               │ accum    │
         │   AXI-Stream  ◄──── outBram ◄── per-tile-pass │          │
@@ -28,9 +28,9 @@ The Core exposes three external interfaces:
 - **`s_axis`** — AXI4-Stream slave; time-multiplexed between **activations** during `LOAD_ACT` and **weights** during `COMPUTE_MM`. Activations land in on-chip BRAM and stay there; weights stream from DRAM each cycle (1.6-bit packed on the shipped presets, expanded on chip by `WeightUnpackGearbox`).
 - **`m_axis`** — AXI4-Stream master; emits accumulator lanes during `STORE_OUT`.
 
-The compute primitive is a `batchSize × xDim` grid of ternary-MAC PEs. Each PE holds `aWidth/2` lane-accumulators; per cycle it consumes `xDim·aWidth/2` ternary weights (broadcast across the batch dim) + one activation per batch row, producing `outLanesPerTile = xDim · aWidth/2` accumulators per array pass. The Core tiles the output column dimension `M` across multiple array passes, reading the same activation BRAM for each tile. Each `COMPUTE` carries the active row count, so one bitstream serves any batch `b ≤ batchSize`.
+The compute primitive is `MacArray`, a `batchSize × xDim` grid of ternary-MAC PEs. It is a broadcast array, not a systolic one: there is no nearest-neighbour delay chain, each weight beat and activation reach every PE directly (column banking delays the whole beat by one cycle per bank, nothing more), and the emitted SV module keeps its historical `SystolicArray` name so the shipped bitstreams still match their source. Each PE holds `aWidth/2` lane-accumulators; per cycle it consumes `xDim·aWidth/2` ternary weights (broadcast across the batch dim) + one activation per batch row, producing `outLanesPerTile = xDim · aWidth/2` accumulators per array pass. The Core tiles the output column dimension `M` across multiple array passes, reading the same activation BRAM for each tile. Each `COMPUTE` carries the active row count, so one bitstream serves any batch `b ≤ batchSize`.
 
-See `src/main/scala/control/CoreConfig.scala` for the full parameter set and the named presets.
+See `src/main/scala/core/CoreConfig.scala` for the full parameter set and `core/Presets.scala` for the named presets.
 
 ## Repository layout
 
@@ -40,14 +40,19 @@ Makefile             Build-server task runner (sim / build / stage / model / dep
 board.conf.example   Build-server deploy target (BOARD, BOARD_DEST); copy to board.conf.
 
 src/main/scala/
-  systolic/          PE.scala, SystolicArray.scala, WeightUnpack.scala (1.6-bit gearbox)
-  control/           Core.scala (FSM + BRAMs), CoreTop.scala (Vivado-facing wrapper),
-                     AxiInstructionHandler.scala (instruction MMIO),
-                     ActMem.scala / OutMem.scala (activation / output memories),
-                     CoreConfig.scala (parameters + presets + manifest emitters),
-                     EmitCore.scala (SystemVerilog + preset-manifest emission)
-src/test/scala/      systolic/{PE,SystolicArray,WeightUnpack}Spec,
-                     control/{Core,AxiInstructionHandler,BenchMirror,CoreConfig}Spec
+  core/              Core.scala (FSM + memories), CoreTop.scala (Vivado-facing wrapper),
+                     CoreConfig.scala (parameters + derived geometry), ModelArch.scala
+                     (checkpoint shapes), Presets.scala (the buildable registry),
+                     PresetManifest.scala (preset.env / preset.json), EmitCore.scala (entry point)
+  compute/           PE.scala, MacArray.scala (the broadcast ternary-MAC array)
+  packing/           TernaryPack.scala (1.6-bit format), WeightUnpackGearbox.scala (on-chip unpack)
+  memory/            ActMem.scala / OutMemUltra.scala (Vivado-attributed BlackBox RAMs)
+  control/           Isa.scala (opcodes, instruction word, register map),
+                     AxiInstructionHandler.scala (instruction MMIO + dispatch)
+  bus/               Axi4.scala / AxiStream.scala (interface bundles)
+src/test/scala/      core/{Core,BenchMirror,CoreConfig}Spec, compute/{PE,MacArray}Spec,
+                     packing/WeightUnpackSpec, control/AxiInstructionHandlerSpec,
+                     testutil/ (AXI drivers, instruction encoder, Verilator settings)
 
 software/            PS-side userspace stack (software/README.md)
   include/ bench/    register map + instruction encoder, AXI-DMA/udmabuf runtime, bench.c
@@ -197,7 +202,7 @@ make sim SPEC=CoreConfig       # one suite by name substring
 ./mill matmulfree_KRIA.test -z "CoreSpec"   # equivalent direct form
 ```
 
-Suites: `PESpec`, `SystolicArraySpec`, `WeightUnpackSpec`, `CoreSpec`,
+Suites: `PESpec`, `MacArraySpec`, `WeightUnpackSpec`, `CoreSpec`,
 `AxiInstructionHandlerSpec`, the `BenchMirror*Spec` family, and `CoreConfigSpec`. The first
 run is slow (Verilator compiles each DUT); later runs reuse the cache.
 
@@ -206,12 +211,12 @@ run is slow (Verilator compiles each DUT); later runs reuse the cache.
 `make build` does this as its first step, but you can run it standalone:
 
 ```bash
-./mill matmulfree_KRIA.runMain control.EmitCore mmfree_370m
+./mill matmulfree_KRIA.runMain core.EmitCore mmfree_370m
 # → generated/mmfree_370m/{CoreTop.sv, Core.sv, …, preset.env, preset.json}
 ```
 
 `main` carries exactly three deployable presets — one per released MMfreeLM checkpoint
-(`CoreConfig.scala`, registry `CoreConfig.deployable`):
+(`Presets.scala`, registry `Presets.deployable`):
 
 | Preset | Checkpoint | xDim | batch | aWidth | maxN | maxM | ports×width | m_axis | clk | tok/s @ b=8 |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -231,7 +236,7 @@ timing-closed for (`plClkMhz`); `deploy-hw` programs `fclk0` to it and reports t
 since an overlay reload alone leaves `fclk0` at whatever rate it had. All of these land in
 `preset.env`/`preset.json`.
 
-**2-bit control arm.** `CoreConfig.candidates` holds `mmfree_370m_2bit` / `mmfree_1_3b_2bit` /
+**2-bit control arm.** `Presets.candidates` holds `mmfree_370m_2bit` / `mmfree_1_3b_2bit` /
 `mmfree_2_7b_2bit`: the shipped presets with `packedWeights` off and nothing else changed, so
 each pair isolates the weight encoding. They build and clone the same way and read the 2-bit
 blob in `packed/`. Their udmabuf-wt is 1.25× larger (2.7B: 624 MiB over 4 ports), so on the
@@ -279,7 +284,7 @@ make gen  PRESET=mmfree_2_7b PROMPT="The capital of France is" GEN=40
 
 ```bash
 rm -rf generated/mmfree_1_3b                                        # EmitCore does not clean
-./mill matmulfree_KRIA.runMain control.EmitCore mmfree_1_3b generated/mmfree_1_3b
+./mill matmulfree_KRIA.runMain core.EmitCore mmfree_1_3b generated/mmfree_1_3b
 scripts/clone_preset_hw.sh mmfree_2_7b mmfree_1_3b                  # seconds, not ~40 min
 make model PRESET=mmfree_1_3b
 make deploy BOARD=ubuntu@kria
@@ -380,4 +385,4 @@ truncated A53 ladder with `--cpu-ladder` (matching `CPU_BATCHES`), and a 2-bit F
 - **`software/integration/README.md`** — MMfreeLM weight packer and the C engine API.
 - **`software/integration/fpga_runner/README.md`** — the CPU-vs-FPGA decode runner.
 - **`matmulfreellmCPU/README.md`** — the standalone CPU engine (build, provision, `--weights` packing modes).
-- **`src/main/scala/control/CoreConfig.scala`** — parameter definitions, derived widths, presets, the manifest emitters (`presetEnv`/`presetJson`), and the `forModel` / `forShape` smart constructors.
+- **`src/main/scala/core/CoreConfig.scala`** — parameter definitions, derived widths, and the `forModel` / `forShape` smart constructors; **`core/Presets.scala`** for the shipped stack and the registry, **`core/PresetManifest.scala`** for what lands in `preset.env` / `preset.json`.

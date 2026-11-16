@@ -1,4 +1,4 @@
-package systolic
+package compute
 
 import scala.util.Random
 import chisel3._

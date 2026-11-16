@@ -2,7 +2,7 @@
 #
 #   vivado -mode batch -source scripts/ooc_synth.tcl [-tclargs <config_name> [<part>]]
 #
-# Reads the emitted SV from generated/<config_name>/ (run control.EmitCore for that preset
+# Reads the emitted SV from generated/<config_name>/ (run core.EmitCore for that preset
 # first); the default part is the KRIA K26 SoM. Reports land in build/vivado-ooc/<config_name>/.
 
 set script_dir [file dirname [info script]]
@@ -17,7 +17,7 @@ if {[llength $argv] >= 2} { set part        [lindex $argv 1] }
 set gen_dir "$proj_root/generated/$config_name"
 if {![file isdirectory $gen_dir]} {
     puts "ERROR: $gen_dir not found — emit the preset first:"
-    puts "  ./mill matmulfree_KRIA.runMain control.EmitCore $config_name"
+    puts "  ./mill matmulfree_KRIA.runMain core.EmitCore $config_name"
     exit 1
 }
 set build_dir "$proj_root/build/vivado-ooc/$config_name"

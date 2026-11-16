@@ -43,8 +43,8 @@ identical weights at 1.3B and 2.7B, and its position improves with model size on
 
 | area | files | lines | what |
 |---|--:|--:|---|
-| RTL (`src/main/scala`) | 10 | 2903 | PE, array, weight gearbox, Core FSM, AXI handler, memories, config, emitter |
-| RTL tests (`src/test/scala`) | 8 | 3542 | ChiselSim/Verilator suites — more test than design |
+| RTL (`src/main/scala`) | 17 | 2207 | PE, array, weight gearbox, Core FSM, AXI handler, memories, config, emitter |
+| RTL tests (`src/test/scala`) | 10 | 3186 | ChiselSim/Verilator suites — more test than design |
 | PS runtime (`software/{include,bench}`) | 5 | 2050 | register/ISA headers, AXI-DMA driver, userspace runtime, bench sweep |
 | engine API + runner (`software/integration`) | 15 | 3889 | `libmmfree`, the `TernaryBackend` impls, the decode runner, the offline packer, host tests |
 | build/deploy/measure (`scripts`, `vivado`) | 27 | 6056 | Chisel→bitstream→overlay→bundle, board task runner, sweeps, aggregation |
@@ -92,7 +92,7 @@ build server has no PL:
 
 ## 3. The hardware: `CoreTop`
 
-### 3.1 Processing element — `src/main/scala/systolic/PE.scala:30`
+### 3.1 Processing element — `src/main/scala/compute/PE.scala:26`
 
 Parameterized by `aWidth` (activation width) and `maxAcc` (max accumulation cycles). One PE
 holds **`aWidth/2 = nLanes` independent lane accumulators**, each `aWidth + log2Ceil(maxAcc)`
@@ -121,7 +121,7 @@ Two handshake bugs are recorded in the source as *fixed*, and both are worth a l
 report on ready/valid discipline:
 
 1. **`input.ready` must stay high through the final accumulation beat**
-   (`PE.scala:94`). The original `!(counter === nAccReg)` form deasserted `ready` on the last
+   (`PE.scala:77`). The original `!(counter === nAccReg)` form deasserted `ready` on the last
    cycle and *consumed that beat's data without a handshake* — so a `tvalid` gap on exactly
    that cycle made the PE accumulate garbage, finish one beat early, and desynchronise the
    upstream DMA stream for the rest of the run. `PESpec` now pins the negative case ("valid
@@ -130,10 +130,11 @@ report on ready/valid discipline:
    no external reset. (`Core` still pulses a local array reset between column tiles — see
    §3.3 — because the *array* has more state than the PE.)
 
-### 3.2 The array — `src/main/scala/systolic/SystolicArray.scala:61`
+### 3.2 The array — `src/main/scala/compute/MacArray.scala:39`
 
-`yDim × xDim` grid. **It is a broadcast MAC array, not a true systolic array** — the name is
-historical and the source says so explicitly. Weights and activations are broadcast to every
+`yDim × xDim` grid. **It is a broadcast MAC array, not a true systolic array** — hence
+`MacArray` (renamed from `SystolicArray` 2026-11-15; the emitted SV module keeps the old name
+so the shipped bitstreams still match their source). Weights and activations are broadcast to every
 PE in the same cycle; there is no nearest-neighbour delay chain. (A genuinely systolic variant
 *was* built and measured; see §5.)
 
@@ -166,7 +167,7 @@ cycles:
 - cost is `numBanks − 1` cycles per operation (negligible against `nAcc` = 1024…8192) plus a
   per-bank beat-wide register.
 
-Banking forced a fourth FSM state, `draining` (`SystolicArray.scala:102`), and the reason is
+Banking forced a fourth FSM state, `draining` (`MacArray.scala:78`), and the reason is
 a subtle streaming hazard: bank 0 is the input consumer, so **the moment bank 0 finishes the
 array has swallowed all `nAcc` beats and must stop accepting that same cycle**, or it eats
 the next operation's first beat while the deeper banks drain. Hence `stillAccepting` is gated
@@ -174,9 +175,9 @@ on a *combinational* `inputDone` (bank 0's `output.valid`) rather than on the re
 transition. The unbanked path deliberately keeps a 3-state FSM so its emitted SV — and
 therefore existing bitstreams — stays byte-identical.
 
-### 3.3 The Core — `src/main/scala/control/Core.scala:63`
+### 3.3 The Core — `src/main/scala/core/Core.scala:40`
 
-#### Instruction set (`AxiInstructionHandler.scala`)
+#### Instruction set (`control/Isa.scala`, decoded by `AxiInstructionHandler.scala`)
 
 One 128-bit beat, written to a single MMIO register. LSB-first:
 
@@ -206,13 +207,13 @@ the full `batchSize`, which is why a legacy host is byte-behaviour-identical.
 #### Top-level FSM and dataflow
 
 `sIdle → sLoad | sCompute | sStore → sIdle`, with `sCompute` running a nested
-`cInit → cStream → cReset → cDone` per output column tile (`Core.scala:261`, `:264`).
+`cInit → cStream → cReset → cDone` per output column tile (`Core.scala:149`, `:150`).
 
 ```
 LOAD_ACT     s_axis ──▶ actBram[0..N)          (activations resident; N beats)
 COMPUTE_MM   per column tile t of ceil(M/256):
                s_axis (weights) ─┐
-                                 ├─▶ inQ ─(armSlice)─▶ SystolicArray  ── N cycles
+                                 ├─▶ inQ ─(armSlice)─▶ MacArray       ── N cycles
                actBram[n] ───────┘                            │ capture
                                                               ▼
                tileAccums ──(drain engine, parallel with tile t+1)──▶ outBram
@@ -230,7 +231,7 @@ Three properties matter for the report:
    re-COMPUTE without intervening LOAD reuses the prior activations"), and the host exploits
    it for column-tile splitting (§6.4).
 3. **The drain is hidden.** The capture into `tileAccums` kicks a drain engine
-   (`Core.scala:567`) that writes `batchSize × outSubBeats` beat-wide rows into `outBram`
+   (`Core.scala:419`) that writes `batchSize × outSubBeats` beat-wide rows into `outBram`
    while the *next* column tile is streaming — so for any real shape (`N ≥ B·outSubBeats`)
    the entire output write costs nothing.
 
@@ -240,10 +241,10 @@ Every one of these was added to close 250 MHz, and each is documented with the p
 
 | structure | line | what it terminates |
 |---|---|---|
-| `inQ` (2-deep `Queue`, flushable) | `:214` | `actBram` read → 256-way activation broadcast → PE accumulate. Carries **(weight beat, activation) PAIRS**, with the enqueue side owning the row counter, so pairing survives queue buffering across tile boundaries. Flushed in `sIdle` so a host streaming extra weight beats cannot poison the next COMPUTE. |
-| `armSlice` (1-deep, `pipe=true`, B>1 only) | `:239` | `inQ`'s distributed-RAM read → PE accumulate, which lengthens as the PE grid doubles with batch. Uniform 1-cycle delay on every beat, functionally transparent. B=1 keeps the validated direct path. |
-| `outQ` (2-deep) | `:256` | `outBram` read → DMA S2MM skid buffer. **Never flushed** — it keeps draining after the FSM returns to `sIdle`, and the runtime waits for S2MM idle rather than just the IRQ, so in-flight tail beats are covered. |
-| `cmpRowsM1` / `activeIsLast` registers | `:305` | The live compare `activeIdx === cmpRows-1` put a wide subtract+compare in the cone feeding the **actBram read-address enable** — the route-dominated 6-LUT path that walled the 250 MHz builds. Precomputing both shortens the enqueue path to reg→mux→BRAM. |
+| `inQ` (2-deep `Queue`, flushable) | `:109` | `actBram` read → 256-way activation broadcast → PE accumulate. Carries **(weight beat, activation) PAIRS**, with the enqueue side owning the row counter, so pairing survives queue buffering across tile boundaries. Flushed in `sIdle` so a host streaming extra weight beats cannot poison the next COMPUTE. |
+| `armSlice` (1-deep, `pipe=true`, B>1 only) | `:124` | `inQ`'s distributed-RAM read → PE accumulate, which lengthens as the PE grid doubles with batch. Uniform 1-cycle delay on every beat, functionally transparent. B=1 keeps the validated direct path. |
+| `outQ` (2-deep) | `:141` | `outBram` read → DMA S2MM skid buffer. **Never flushed** — it keeps draining after the FSM returns to `sIdle`, and the runtime waits for S2MM idle rather than just the IRQ, so in-flight tail beats are covered. |
+| `cmpRowsM1` / `activeIsLast` registers | `:199` | The live compare `activeIdx === cmpRows-1` put a wide subtract+compare in the cone feeding the **actBram read-address enable** — the route-dominated 6-LUT path that walled the 250 MHz builds. Precomputing both shortens the enqueue path to reg→mux→BRAM. |
 
 #### Output-column tiling and the address-folding trick
 
@@ -266,7 +267,7 @@ CIRCT's `AttributeAnnotation` can only target modules, wires and regs — never 
 that reason alone; both have *identical* read semantics and latency to the inferred form, so
 they are **mapping changes, not design changes**.
 
-- **`ActMem`** (`control/ActMem.scala`) — activation memory, 1 write / 1 read port, 1-cycle
+- **`ActMem`** (`memory/ActMem.scala`) — activation memory, 1 write / 1 read port, 1-cycle
   unconditional synchronous read, carrying `ram_style` + `cascade_height`. It exists because
   at `maxN=8192` Vivado maps the memory onto 1024×36 RAMB36E2 blocks and chains **eight**
   of them through the hard output cascade: `1.588 + 7×0.247 + 0.136 = 3.206 ns` of pure
@@ -276,7 +277,7 @@ they are **mapping changes, not design changes**.
   weight/activation pairing `inQ` depends on, and that pairing has a history of off-by-one-beat
   bugs. `maxN=4096` is a 4-deep chain and closes 250 with no attribute at all — which is the
   control proving chain *depth* is the variable, not batch or array size.
-- **`OutMemUltra`** (`control/OutMem.scala`) — URAM output memory with pipelined read *and*
+- **`OutMemUltra`** (`memory/OutMemUltra.scala`) — URAM output memory with pipelined read *and*
   write. Three findings are recorded in it, and they are the most transferable
   FPGA-engineering content in the repo:
   - **Vivado will not absorb read-pipeline registers into a URAM cascade, whatever you
@@ -298,7 +299,7 @@ they are **mapping changes, not design changes**.
     address (`drainBatchCtr · numColTiles + …`) into a 64000-row URAM was the 250 MHz critical
     path at B≥6 (post-route WNS −0.74 ns, congestion-free). The latency is free — the drain
     writes during COMPUTE and the read happens in a later STORE — but `Core` must extend the
-    drain-completion gate by `writeLat` (`drainFlush`, `Core.scala:336`) so a STORE issued off
+    drain-completion gate by `writeLat` (`drainFlush`, `Core.scala:217`) so a STORE issued off
     the IRQ still sees the last write landed.
 
   ⚠️ **Every character of the emitted SV is load-bearing**: `scripts/clone_preset_hw.sh`
@@ -306,7 +307,7 @@ they are **mapping changes, not design changes**.
   comment line inside those strings makes a legitimate clone get refused. The vestigial-looking
   `_pbanked` module-name tag is retained for the same reason.
 
-### 3.4 1.6-bit weight packing — `systolic/WeightUnpack.scala`
+### 3.4 1.6-bit weight packing — `packing/`
 
 Ternary carries `log2 3 = 1.585` bits; the PE code space uses 2. Since `3^5 = 243 ≤ 256`,
 **five trits fit in one byte** as base-3 digits — 1.600 bits/trit, 99.1% of the information
@@ -319,9 +320,9 @@ digit 0 → PE code 0 (hold) | digit 1 → 1 (add) | digit 2 → 3 (subtract)
 
 Values 243..255 are unreachable and the packer must never emit them; hardware treats them as
 holds. Unpack is a **256-entry ROM of 10-bit words** (5 codes × 2 bits), so it is one LUT
-lookup per byte with no arithmetic (`TernaryPack.lutWords`, `WeightUnpack.scala:55`).
+lookup per byte with no arithmetic (`TernaryPack.lutWords`, `TernaryPack.scala:46`).
 
-The interesting part is the **`WeightUnpackGearbox`** (`:75`), because 5 does not divide
+The interesting part is the **`WeightUnpackGearbox`** (`WeightUnpackGearbox.scala:14`), because 5 does not divide
 `outLanes`. Each input beat contributes `inBytes × 5` trits and each output beat needs
 `outLanes`, so an elastic trit buffer regroups whatever arrives into full weight beats and
 carries the fractional remainder across input beats. Capacity is `outLanes + inTrits`, which
@@ -337,7 +338,7 @@ width, port count or the enqueue handshake. `packedWeights` is a **compile-time 
 parameter** (the gearbox only exists when it is set), so a packed bitstream requires a packed
 blob; the runner hard-errors on a mismatch rather than streaming garbage (§6.6).
 
-### 3.5 `CoreTop` — the Vivado-facing wrapper (`control/CoreTop.scala`)
+### 3.5 `CoreTop` — the Vivado-facing wrapper (`core/CoreTop.scala`)
 
 A `RawModule` that exposes `aclk`, active-low `aresetn`, `s_axi_*`, `s_axis*`, `m_axis_*`,
 `irq` — the names Vivado's packager auto-recognises as AXI4 / AXI-Stream. It inverts
@@ -355,17 +356,19 @@ tvalid = AND of all ports        tdata = Cat(ports.reverse)   // port 0 = LSBs
 tready[i] = core.tready AND (all OTHER ports valid)           // no port may run ahead
 ```
 
-`N == 1` is kept as a literal separate pass-through so single-port presets emit
-byte-identical SV. `BenchMirrorSpec` covers the join with **staggered port valids** —
+`N == 1` is a plain pass-through (it emits the same SV as the earlier field-by-field form, so
+single-port presets are unchanged). `BenchMirrorSpec` covers the join with **staggered port valids** —
 because the failure mode is silently losing beats, not deadlocking.
 
 ---
 
 ## 4. Parameterization: `CoreConfig` as the single source of truth
 
-`control/CoreConfig.scala` (853 lines, over half of it recorded reasoning) is a case class
-holding every `Core`/`CoreTop` parameter, all derived widths, the named presets, and — the
-architecturally important part — **the manifest emitters**.
+`core/CoreConfig.scala` is a case class holding every `Core`/`CoreTop` parameter and all
+derived widths; `Core` and `CoreTop` take it whole, so nothing re-derives a width. Around it:
+`core/ModelArch.scala` (checkpoint shapes), `core/Presets.scala` (the shipped stack and the
+registry) and — the architecturally important part — **the manifest emitters** in
+`core/PresetManifest.scala`.
 
 ### 4.1 The manifest
 
@@ -414,7 +417,7 @@ saturate its ports, and 1.6-bit packing is what buys headroom against that ceili
 
 ### 4.3 The three deployable presets
 
-`CoreConfigs.deployable` is exactly three, one per released checkpoint, and `CoreConfigSpec`
+`Presets.deployable` is exactly three, one per released checkpoint, and `CoreConfigSpec`
 asserts that ("the deployable set is exactly the three released checkpoints"). All three are
 **B8 + dspAccum + colBankSize=4 + 1.6-bit packed weights + 128-bit m_axis @ 250 MHz + banked
 output memory**.
@@ -444,17 +447,19 @@ the DTS. `CoreConfigSpec` pins the RTL identity independently.
 build. `CoreConfigSpec` asserts they always travel together ("the maxN=8192 presets carry
 both 250 MHz timing levers, not one").
 
-**`forModel` is the constructor to use, and `.copy` is a trap.** `residentWtBytes` is a
-constructor field that `forModel` recomputes from the model shapes *and the packing*, summing
-the exact per-projection 1.6-bit blob size (5 trits/byte, each padded to a whole wire beat).
-`.copy(packedWeights = false)` flips the flag and leaves the byte count at the **packed**
-value, emitting a `UDMABUF_WT_SZ` that under-allocates against a 1.25× larger 2-bit blob. The
-first version of the 2-bit control presets did exactly that, and the `CoreConfigSpec` check
-"the 2-bit candidates size udmabuf-wt 1.25x their packed twins" is what caught it.
+**`residentWtBytes` is derived, so `.copy` is safe.** It used to be a constructor field that
+`forModel` computed from the model shapes *and the packing*; `.copy(packedWeights = false)`
+flipped the flag and left the byte count at the **packed** value, emitting a `UDMABUF_WT_SZ`
+that under-allocated against a 1.25× larger 2-bit blob. The first version of the 2-bit control
+presets did exactly that, and the `CoreConfigSpec` check "the 2-bit candidates size udmabuf-wt
+1.25x their packed twins" is what caught it. Since 2026-11-15 a model preset carries its
+`ModelArch` and `residentWtBytes` is computed from it and `packedWeights` (the exact
+per-projection 1.6-bit blob, 5 trits/byte, each padded to a whole wire beat), so the 2-bit
+twins are plain `.copy(packedWeights = false)` of the shipped presets.
 
 ### 4.4 The 2-bit control arm
 
-`CoreConfigs.candidates` holds `mmfree_{370m,1_3b,2_7b}_2bit`: each shipped preset with
+`Presets.candidates` holds `mmfree_{370m,1_3b,2_7b}_2bit`: each shipped preset with
 `packedWeights` flipped and **nothing else touched**, so the pair isolates the weight format.
 They exist because the report compares encodings across platforms and the CPU engine has all
 three formats while the FPGA had only 1.6-bit — **2-bit is the one format every platform
@@ -567,7 +572,7 @@ Four layers, each with a narrow contract, bottom to top.
 ### 6.1 `software/include/mmfree_core.h` — the ISA mirror
 
 Register offsets, opcodes, error codes, the status bit layout, and `mmfree_encode()` — a
-header-only mirror of `AxiInstructionHandler.scala`, so the C encoding and the Chisel decoder
+header-only mirror of `control/Isa.scala`, so the C encoding and the Chisel decoder
 cannot drift. Instructions are written as a **single 128-bit MMIO store** (NEON `vst1q` on
 aarch64) so the AXI slave sees one beat.
 
@@ -826,13 +831,13 @@ of a *tolerance*, and it is the property every other check leans on.
 | `make gate` (`--backend both`) | board | Engine == CPU reduction, **bit-exact, every projection, every decode step**. Passes: 1160 / 1160 / 1544 invocations, **0 element diffs** on all three presets (2026-08-15) and all three 2-bit twins (2026-08-16). | Nothing about batching layout — it compares per row. |
 | `make streams` (`--distinct-prompts`) | board | **Row independence**: B streams from B different prompts, each vs its OWN single-stream reference. Reports `ROW PERMUTATION` explicitly. | — (this is the check that closes the gap below) |
 | sweep `streams_ok` column | board | Batched decode == single-stream, no stream dropped. | **Permutation.** Every stream gets the same prompt and sampling is greedy, so the streams are identical by construction and the check is invariant under a row swap. It cannot see the drain writing row 2 into stream 5. |
-| `CoreSpec` (939 lines) | sim | Numeric equivalence against a reference matmul over 5 random seeds, per-tile independence, packed == 2-bit path, **gearbox flush between back-to-back COMPUTEs**, split-chunk COMPUTEs on one LOAD == the whole projection, runtime `batch=1` drains only row 0, LOAD at full BRAM depth, banked-memory bank selection, every `(ram_style, cascade_height)` variant. | Real timing, real DDR, temperature. |
-| `PESpec` (681) | sim | Every weight code, wrap-around, all `aWidth` variants, and the **negative** handshake case ("valid gap on the final accumulation cycle stalls — no phantom beat"). | |
-| `SystolicArraySpec` (332) | sim | Batched matvec, handshake gating in idle and running, randomized ops across `(aWidth, xDim, yDim)` **and `colBankSize`/`numBanks`**. | |
-| `BenchMirrorSpec` (605) | sim | The **host packing loop** matches a reference matmul — including a deliberate **regression guard that row-major (yesterday's bug) does NOT match**, negative-accumulator wrap, a non-pow2 inner dim, per-row non-contamination, and **staggered port valids on the N-way join**. | |
+| `CoreSpec` (742 lines) | sim | Numeric equivalence against a reference matmul over 5 random seeds, per-tile independence, packed == 2-bit path, **gearbox flush between back-to-back COMPUTEs**, split-chunk COMPUTEs on one LOAD == the whole projection, runtime `batch=1` drains only row 0, LOAD at full BRAM depth, banked-memory bank selection, every `(ram_style, cascade_height)` variant. | Real timing, real DDR, temperature. |
+| `PESpec` (666) | sim | Every weight code, wrap-around, all `aWidth` variants, and the **negative** handshake case ("valid gap on the final accumulation cycle stalls — no phantom beat"). | |
+| `MacArraySpec` (323) | sim | Batched matvec, handshake gating in idle and running, randomized ops across `(aWidth, xDim, yDim)` **and `colBankSize`/`numBanks`**. | |
+| `BenchMirrorSpec` (503) | sim | The **host packing loop** matches a reference matmul — including a deliberate **regression guard that row-major (yesterday's bug) does NOT match**, negative-accumulator wrap, a non-pow2 inner dim, per-row non-contamination, and **staggered port valids on the N-way join**. | |
 | `WeightUnpackSpec` (96) | sim | `TernaryPack` round-trip, ROM words == `unpackByte`, gearbox streaming **and under backpressure**, at two geometries. | |
-| `AxiInstructionHandlerSpec` (455) | sim | Dispatch per opcode, DECERR/SLVERR cases, status semantics, IRQ raise/ack, back-to-back sequencing. | |
-| `CoreConfigSpec` (396) | sim | The registry *is* exactly the three + three candidates; each 2-bit twin differs only in format; **udmabuf-wt ratio 1.25×**; every preset carries the full stack incl. `dspAccum`; identical geometry across sizes; every projection tile-aligned; 1.3B/2.7B RTL identity; `plClkMhz` on a rung; the two `maxN=8192` levers travel together. | |
+| `AxiInstructionHandlerSpec` (313) | sim | Dispatch per opcode, DECERR/SLVERR cases, status semantics, IRQ raise/ack, back-to-back sequencing. | |
+| `CoreConfigSpec` (375) | sim | The registry *is* exactly the three + three candidates; each 2-bit twin differs only in format; **udmabuf-wt ratio 1.25×**; every preset carries the full stack incl. `dspAccum`; identical geometry across sizes; every projection tile-aligned; 1.3B/2.7B RTL identity; `plClkMhz` on a rung; the two `maxN=8192` levers travel together. | |
 | `test_packed_roundtrip.py` | host | Packer byte layout **byte-identical to `bench.c`'s pack loop**. | |
 | `test_split_chunks.c`, `test_readback.c` | host | Split plans tile a projection exactly; threaded readback == serial. | |
 
@@ -1052,7 +1057,8 @@ Ordered by how much time each has cost, per the recorded notes.
    `software/` or `scripts/`.
 3. **`plClkMhz` off a rung is a mislabel, not a slower clock** (§4.5), and `fclk0` persists
    across overlay reloads, so a stale rate is not evidence the overlay is up.
-4. **`.copy(packedWeights = …)` leaves `residentWtBytes` wrong** — use `forModel` (§4.3).
+4. ~~**`.copy(packedWeights = …)` leaves `residentWtBytes` wrong**~~ — fixed by construction
+   2026-11-15: it is derived from the preset's `ModelArch` now (§4.3).
 5. **Blob/bitstream format mismatch is silent garbage** without the `weight_format` guard; the
    1.25× larger 2-bit `udmabuf-wt` (2.7B: 500 → 624 MiB over 4 ports) fits the 1536 MiB CMA but
    **not** an older `cma=1000M` boot arg, and the overlay carries the size, so a cloned or

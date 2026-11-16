@@ -37,7 +37,7 @@ def main(argv=None) -> int:
     ap.add_argument("--awidth", type=int, default=16, help="activation bit width (a16 engine = 16)")
     ap.add_argument("--xdim", type=int, default=32, help="systolic array columns (a16 engine = 32)")
     ap.add_argument("--manifest", default=None,
-                    help="preset.json/.env from control.EmitCore — geometry is read "
+                    help="preset.json/.env from core.EmitCore — geometry is read "
                          "from it (overrides --awidth/--xdim). Defaults to $MMFREE_MANIFEST.")
     ap.add_argument("--packed", action="store_true",
                     help="emit 1.6-bit (5 trits/byte) weights for a packedWeights "

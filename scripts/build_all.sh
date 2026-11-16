@@ -37,7 +37,7 @@ PRESET="${PRESET:-mmfree_2_7b}"
 DESIGN="t_matmul"
 
 # ─── Preset manifest = single source of truth ───────────────────────────────
-# generated/<preset>/preset.env (emitted by control.EmitCore, step 1) is the single source of
+# generated/<preset>/preset.env (emitted by core.EmitCore, step 1) is the single source of
 # truth for geometry. load_manifest sets each KEY only if it is not already in the
 # environment, so overrides win, e.g.  PL_CLK_MHZ=100 ./scripts/build_all.sh
 load_manifest() {
@@ -160,7 +160,7 @@ if [ "$PACKAGE_ONLY" = "1" ]; then
 else
     if [ "$SKIP_SV" = "0" ]; then
         echo; echo "==> [1/6] Emitting SystemVerilog + preset manifest ($PRESET) via mill"
-        ./mill matmulfree_KRIA.runMain control.EmitCore "$PRESET" "generated/$PRESET"
+        ./mill matmulfree_KRIA.runMain core.EmitCore "$PRESET" "generated/$PRESET"
     else
         echo; echo "==> [1/6] Skipping SV regeneration (SKIP_SV=1)"
     fi

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-TRITS_PER_BYTE = 5      # 1.6-bit packing: 3^5 = 243 <= 256 (see packer / WeightUnpack.scala)
+TRITS_PER_BYTE = 5      # 1.6-bit packing: 3^5 = 243 <= 256 (see packer / TernaryPack.scala)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -52,7 +52,7 @@ class Geometry:
 
     @classmethod
     def from_manifest(cls, path: str) -> "Geometry":
-        """Derive geometry from a preset.json manifest (control.EmitCore), so the
+        """Derive geometry from a preset.json manifest (core.EmitCore), so the
         packed blob matches the loaded bitstream without hand-passing aWidth/xDim."""
         with open(path) as f:
             m = json.load(f)

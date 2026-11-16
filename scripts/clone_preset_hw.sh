@@ -10,7 +10,7 @@
 # The clone's timing record is SRC's reports/<SRC>_*.rpt (it is the same bitstream file).
 #
 # Usage:
-#   ./mill matmulfree_KRIA.runMain control.EmitCore <DST> generated/<DST>   # manifest + SV
+#   ./mill matmulfree_KRIA.runMain core.EmitCore <DST> generated/<DST>   # manifest + SV
 #   ./scripts/clone_preset_hw.sh <SRC> <DST>
 
 set -euo pipefail
@@ -35,7 +35,7 @@ for f in "$SRC_HW/$APP.bit.bin" "$SRC_HW/$APP.dtbo" "$SRC_HW/shell.json"; do
     [ -f "$f" ] || { echo "ERROR: $f missing — build SRC first (make build PRESET=$SRC)." >&2; exit 1; }
 done
 for f in "$SRC_GEN/preset.env" "$DST_GEN/preset.env"; do
-    [ -f "$f" ] || { echo "ERROR: $f missing — run 'control.EmitCore' for that preset." >&2; exit 1; }
+    [ -f "$f" ] || { echo "ERROR: $f missing — run 'core.EmitCore' for that preset." >&2; exit 1; }
 done
 command -v dtc >/dev/null || { echo "ERROR: 'dtc' not on PATH (source the Vitis settings)." >&2; exit 1; }
 

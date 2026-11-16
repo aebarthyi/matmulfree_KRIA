@@ -6,7 +6,7 @@ PS-side userspace stack for the matmulfree ternary-matmul Core IP.
 
 | path | role |
 |---|---|
-| `include/mmfree_core.h` | register map, opcode/error constants, status-word layout, 128-bit instruction encoders. Mirrors `src/main/scala/control/AxiInstructionHandler.scala`. **Treat as the source of truth for any PS-side driver.** |
+| `include/mmfree_core.h` | register map, opcode/error constants, status-word layout, 128-bit instruction encoders. Mirrors `src/main/scala/control/Isa.scala`. **Treat as the source of truth for any PS-side driver.** |
 | `include/mmfree_dma.h` | minimal direct-register Xilinx AXI DMA driver (simple mode, MM2S + S2MM) |
 | `include/mmfree_runtime.h`, `bench/mmfree_runtime.c` | userspace runtime: maps the Core + DMA register windows via `/dev/mem`, the u-dma-buf buffers and the UIO IRQ, and issues LOAD / COMPUTE / STORE as one unit each |
 | `bench/bench.c` | synthetic per-projection sweep (`make bench` on the board) |

@@ -55,7 +55,7 @@ int mmfree_geom_init(mmfree_geom_t *g, uint32_t aWidth, uint32_t xDim,
  * trits 5/byte, padded to a whole wire beat (exactly what the gearbox consumes). */
 uint32_t mmfree_wt_port_bytes(const mmfree_geom_t *g, uint32_t rows, uint32_t cols);
 
-/* Cross-check `g` against a preset.env manifest (control.EmitCore) for the loaded
+/* Cross-check `g` against a preset.env manifest (core.EmitCore) for the loaded
  * bitstream. NULL/empty/unreadable path skips the check (returns 0). Returns the
  * number of mismatched fields, each WARNed to stderr; with MMFREE_STRICT=1 any
  * mismatch returns -1. mmfree_geom_check_env takes the path from $MMFREE_MANIFEST. */

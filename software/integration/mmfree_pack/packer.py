@@ -45,11 +45,11 @@ def codes_to_2bit(codes_MN: np.ndarray) -> np.ndarray:
     return (wt & 0x3).astype(np.uint8)
 
 
-# ---- 1.6-bit packing (5 trits/byte), mirrors systolic.TernaryPack ----
+# ---- 1.6-bit packing (5 trits/byte), mirrors packing.TernaryPack ----
 # For packedWeights=true bitstreams (on-chip WeightUnpackGearbox): five trits per
 # byte in base 3 (3^5 = 243 <= 256).
 #
-# Digit convention (packer and hardware MUST agree — see WeightUnpack.scala):
+# Digit convention (packer and hardware MUST agree — see packing/TernaryPack.scala):
 #   logical trit  ->  base-3 digit  ->  PE code
 #        0 (hold)          0               0
 #       +1 (add)           1               1

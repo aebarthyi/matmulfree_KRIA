@@ -1,4 +1,4 @@
-package systolic
+package compute
 
 import chisel3._
 import chisel3.util._
@@ -16,12 +16,13 @@ class PEOutputBundle(val aWidth: Int, val accWidth: Int) extends Bundle {
 }
 
 /**
-  * Ternary-MAC PE: each of aWidth/2 lanes adds (code 1), subtracts (code 3) or holds
-  * (code 0) the activation into its accumulator for nAcc handshaked beats.
+  * Ternary-MAC PE, the cell of [[MacArray]]: each of aWidth/2 lanes adds (code 1),
+  * subtracts (code 3) or holds (code 0) the activation into its accumulator for nAcc
+  * handshaked beats.
   *
   * `signedAct` sign-extends the activation into the accumulator (two's complement);
   * false zero-extends. The two agree for non-negative activations.
-*/
+  */
 class PE(val aWidth: Int, val maxAcc: Int, val signedAct: Boolean = false,
          val useDspAccum: Boolean = false) extends Module {
   require(maxAcc >= 2, "PE requires maxAcc >= 2 (hardware counter limitation)")

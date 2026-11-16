@@ -1,4 +1,4 @@
-package systolic
+package compute
 
 import scala.util.Random
 import chisel3._
@@ -8,7 +8,7 @@ import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
 /**
-  * Reference model for SystolicArray.
+  * Reference model for MacArray.
   *
   * Each row k computes the batched matrix-vector product:
   *   out[k][col·nLanes + lane] = sum_{t=0..nAcc-1} sign(W[t][col·nLanes+lane]) * A[t][k]
@@ -16,7 +16,7 @@ import org.scalatest.matchers.must.Matchers
   * with ternary weights: 1 → +activation, 3 → -activation, anything else → 0.
   * Result is reduced modulo 2^(log2Ceil(maxAcc)+aWidth) to mirror PE's unsigned wrap.
   */
-object SystolicArrayModel {
+object MacArrayModel {
   val WEIGHT_ADD  = 1
   val WEIGHT_SUB  = 3
   val WEIGHT_HOLD = 0
@@ -62,17 +62,17 @@ object SystolicArrayModel {
   }
 }
 
-class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
+class MacArraySpec extends AnyFreeSpec with Matchers with SingleThreadVerilator {
 
-  private def pokeWeights(dut: SystolicArray, w: Seq[Int]): Unit = {
+  private def pokeWeights(dut: MacArray, w: Seq[Int]): Unit = {
     w.zipWithIndex.foreach { case (v, i) => dut.input.weights_i.bits(i).poke(v.U) }
   }
 
-  private def pokeActivations(dut: SystolicArray, a: Seq[Int]): Unit = {
+  private def pokeActivations(dut: MacArray, a: Seq[Int]): Unit = {
     a.zipWithIndex.foreach { case (v, i) => dut.input.activation_i.bits(i).poke(v.U) }
   }
 
-  private def resetDut(dut: SystolicArray): Unit = {
+  private def resetDut(dut: MacArray): Unit = {
     dut.input.weights_i.valid.poke(false.B)
     dut.input.activation_i.valid.poke(false.B)
     dut.input.nAcc.valid.poke(false.B)
@@ -84,11 +84,11 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
   }
 
   /**
-    * Drive a complete SystolicArray operation. Both weights and activations stream
+    * Drive a complete MacArray operation. Both weights and activations stream
     * one beat per cycle; both must rendezvous on the first cycle with nAcc.
     */
   private def runAndCheck(
-      dut: SystolicArray,
+      dut: MacArray,
       aWidth: Int,
       maxAcc: Int,
       xDim: Int,
@@ -98,7 +98,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
   ): Unit = {
     val nAcc = weights.length
     require(activations.length == nAcc, "activations length must match weights length")
-    val expected = SystolicArrayModel.compute(aWidth, maxAcc, xDim, yDim, weights, activations)
+    val expected = MacArrayModel.compute(aWidth, maxAcc, xDim, yDim, weights, activations)
 
     dut.input.weights_i.valid.poke(true.B)
     dut.input.activation_i.valid.poke(true.B)
@@ -130,7 +130,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
 
   // ── Deterministic functional tests ──
 
-  "SystolicArray(aWidth=8, maxAcc=64, xDim=2, yDim=2) functional tests" - {
+  "MacArray(aWidth=8, maxAcc=64, xDim=2, yDim=2) functional tests" - {
     val aWidth = 8
     val maxAcc = 64
     val xDim   = 2
@@ -139,7 +139,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     val flatW  = xDim * nLanes
 
     "all +1 weights, constant activation per row gives row*nAcc on every lane" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         val nAcc        = 5
         val weights     = Seq.fill(nAcc)(Seq.fill(flatW)(1))
@@ -150,7 +150,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
 
     "all -1 weights wraps unsigned" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         val nAcc        = 4
         val weights     = Seq.fill(nAcc)(Seq.fill(flatW)(3))
@@ -160,7 +160,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
 
     "all-hold weights produce zero on every lane and every row" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         val nAcc        = 4
         val weights     = Seq.fill(nAcc)(Seq.fill(flatW)(0))
@@ -170,7 +170,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
 
     "varying activations per cycle compute true batched matvec" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         val nAcc        = 4
         val weights     = Seq.fill(nAcc)(Seq.fill(flatW)(1))           // all +1 → sum activations
@@ -181,7 +181,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
 
     "mixed weights per lane × column" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         val nAcc        = 4
         val pattern     = Seq(1, 3, 0, 1, 3, 1, 0, 3)  // length flatW = 8
@@ -194,7 +194,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
 
   // ── Handshake protocol ──
 
-  "SystolicArray handshake" - {
+  "MacArray handshake" - {
     val aWidth = 8
     val maxAcc = 32
     val xDim   = 2
@@ -203,7 +203,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     val flatW  = xDim * nLanes
 
     "in idle: missing any one valid keeps all readys low" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         // Drive activations + nAcc but not weights
         dut.input.activation_i.valid.poke(true.B)
@@ -217,7 +217,7 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     }
 
     "in running: weights and activations gate each other" in {
-      simulate(new SystolicArray(aWidth, maxAcc, xDim, yDim)) { dut =>
+      simulate(new MacArray(aWidth, maxAcc, xDim, yDim)) { dut =>
         resetDut(dut)
         // Three-way rendezvous to enter running.
         dut.input.weights_i.valid.poke(true.B)
@@ -238,10 +238,10 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
 
   // ── Randomized model comparison ──
 
-  "SystolicArray random model comparison" - {
+  "MacArray random model comparison" - {
     Seq((8, 64, 2, 2), (4, 32, 3, 4), (8, 128, 4, 2)).foreach { case (aw, mA, xD, yD) =>
       s"random ops on (aWidth=$aw, xDim=$xD, yDim=$yD)" in {
-        simulate(new SystolicArray(aw, mA, xD, yD)) { dut =>
+        simulate(new MacArray(aw, mA, xD, yD)) { dut =>
           val rng    = new Random(0xCAFE + xD * 31 + yD)
           val nLanes = aw / 2
           val flatW  = xD * nLanes
@@ -263,12 +263,12 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
   /** Like runAndCheck, but tolerates the per-bank pipeline latency: after the last
     * beat it polls output.valid for up to `maxSkew` cycles before checking. */
   private def runAndCheckBanked(
-      dut: SystolicArray,
+      dut: MacArray,
       aWidth: Int, maxAcc: Int, xDim: Int, yDim: Int,
       weights: Seq[Seq[Int]], activations: Seq[Seq[Int]], maxSkew: Int
   ): Unit = {
     val nAcc     = weights.length
-    val expected = SystolicArrayModel.compute(aWidth, maxAcc, xDim, yDim, weights, activations)
+    val expected = MacArrayModel.compute(aWidth, maxAcc, xDim, yDim, weights, activations)
 
     dut.input.weights_i.valid.poke(true.B)
     dut.input.activation_i.valid.poke(true.B)
@@ -299,14 +299,14 @@ class SystolicArraySpec extends AnyFreeSpec with Matchers with SingleThreadVeril
     dut.clock.step()
   }
 
-  "SystolicArray column banking matches broadcast" - {
+  "MacArray column banking matches broadcast" - {
     // (aWidth, maxAcc, xDim, yDim, colBankSize) — bank sizes that both divide and
     // do NOT divide xDim, to exercise the partial deepest bank.
     Seq((8, 64, 4, 2, 2), (4, 64, 6, 3, 2), (8, 64, 5, 2, 2), (8, 128, 8, 2, 3)).foreach {
       case (aw, mA, xD, yD, bank) =>
         val numBanks = (xD + bank - 1) / bank
         s"random ops on (aWidth=$aw, xDim=$xD, yDim=$yD, colBankSize=$bank, numBanks=$numBanks)" in {
-          simulate(new SystolicArray(aw, mA, xD, yD, colBankSize = bank)) { dut =>
+          simulate(new MacArray(aw, mA, xD, yD, colBankSize = bank)) { dut =>
             val rng   = new Random(0xBEEF + xD * 31 + yD + bank)
             val flatW = xD * (aw / 2)
             for (_ <- 0 until 8) {

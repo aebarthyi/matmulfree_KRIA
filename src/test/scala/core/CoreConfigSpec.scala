@@ -1,4 +1,4 @@
-package control
+package core
 
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
@@ -6,9 +6,9 @@ import org.scalatest.matchers.must.Matchers
 class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
   // The three deployable presets, by the name the board flow uses.
-  private val m370 = CoreConfig.MMFree_370M
-  private val m1_3 = CoreConfig.MMFree_1_3B
-  private val m2_7 = CoreConfig.MMFree_2_7B
+  private val m370 = Presets.MMFree_370M
+  private val m1_3 = Presets.MMFree_1_3B
+  private val m2_7 = Presets.MMFree_2_7B
 
   "CoreConfig.forShape" - {
     "rounds maxN up to the next power of 2" in {
@@ -60,39 +60,37 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "the deployable set is exactly the three released checkpoints" in {
-      CoreConfig.deployable.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
+      Presets.deployable.keySet mustBe Set("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b")
     }
 
     // Candidates must never shadow a shipped preset, and every name must reach byName.
     "the buildable registry is the deployable set plus the open candidates" in {
-      CoreConfig.candidates.keySet.intersect(CoreConfig.deployable.keySet) mustBe empty
-      CoreConfig.presets mustBe (CoreConfig.deployable ++ CoreConfig.candidates)
-      (CoreConfig.deployable.keys ++ CoreConfig.candidates.keys)
-        .foreach { n => CoreConfig.byName(n) mustBe CoreConfig.presets(n) }
+      Presets.candidates.keySet.intersect(Presets.deployable.keySet) mustBe empty
+      Presets.all mustBe (Presets.deployable ++ Presets.candidates)
+      (Presets.deployable.keys ++ Presets.candidates.keys)
+        .foreach { n => Presets.byName(n) mustBe Presets.all(n) }
     }
 
     // A 2-bit control must isolate the weight format; any other drift is a confound.
     "each 2-bit candidate differs from its shipped twin in the weight format alone" in {
       Seq("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b").foreach { base =>
-        val shipped = CoreConfig.deployable(base)
-        val control = CoreConfig.candidates(s"${base}_2bit")
+        val shipped = Presets.deployable(base)
+        val control = Presets.candidates(s"${base}_2bit")
         withClue(s"$base: ") {
           shipped.packedWeights mustBe true
           control.packedWeights mustBe false
-          // Separate forModel calls, so this catches typos in the duplicated shapes.
-          // residentWtBytes is supposed to differ; it is checked below.
-          control mustBe shipped.copy(packedWeights   = false,
-                                      residentWtBytes = control.residentWtBytes)
+          // residentWtBytes is derived from packedWeights, so the twin is an exact copy.
+          control mustBe shipped.copy(packedWeights = false)
         }
       }
     }
 
-    // 2 bits/trit vs 1.6 => udmabuf-wt must grow ~1.25x. Guards the
-    // `.copy(packedWeights = false)` trap, which leaves residentWtBytes at the packed value.
+    // 2 bits/trit vs 1.6 => udmabuf-wt must grow ~1.25x. Guards residentWtBytes tracking
+    // packedWeights: a stale packed size here under-allocates the 2-bit overlay.
     "the 2-bit candidates size udmabuf-wt 1.25x their packed twins" in {
       Seq("mmfree_370m", "mmfree_1_3b", "mmfree_2_7b").foreach { base =>
-        val packedWt  = CoreConfig.deployable(base).udmabufWtBytes.toDouble
-        val controlWt = CoreConfig.candidates(s"${base}_2bit").udmabufWtBytes.toDouble
+        val packedWt  = Presets.deployable(base).udmabufWtBytes.toDouble
+        val controlWt = Presets.candidates(s"${base}_2bit").udmabufWtBytes.toDouble
         withClue(s"$base: packed=$packedWt control=$controlWt ratio=${controlWt / packedWt} ") {
           (controlWt / packedWt) must be >= 1.20
           (controlWt / packedWt) must be <= 1.30
@@ -103,16 +101,16 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     // outCascadeHeight is part of OutMemUltra's module name, so 1.3B and 2.7B must agree
     // or scripts/clone_preset_hw.sh refuses the 1.3B clone.
     "every deployable preset keeps the shipped output-memory cascade" in {
-      CoreConfig.deployable.foreach { case (n, c) =>
+      Presets.deployable.foreach { case (n, c) =>
         withClue(n) { c.outCascadeHeight mustBe 1 }
       }
-      CoreConfig.deployable("mmfree_1_3b").outCascadeHeight mustBe
-        CoreConfig.deployable("mmfree_2_7b").outCascadeHeight
+      Presets.deployable("mmfree_1_3b").outCascadeHeight mustBe
+        Presets.deployable("mmfree_2_7b").outCascadeHeight
     }
 
     // B8 fits only with the lane accumulators in DSP48s; without dspAccum it hits the LUT wall.
     "every deployable preset carries dspAccum, the condition that makes B8 fit at all" in {
-      CoreConfig.deployable.foreach { case (n, c) =>
+      Presets.deployable.foreach { case (n, c) =>
         withClue(n) {
           c.batchSize   mustBe 8
           c.dspAccum    mustBe true
@@ -124,7 +122,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
     // Losing any of these on a shipped preset is a regression, not a variant.
     "every deployable preset carries the full optimization stack" in {
-      CoreConfig.deployable.foreach { case (name, c) =>
+      Presets.deployable.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
           c.batchSize      mustBe 8
           c.outBeatLanes   mustBe 4
@@ -136,7 +134,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "the a16 / 4-HP-port engine geometry is identical across all three sizes" in {
-      CoreConfig.deployable.foreach { case (name, c) =>
+      Presets.deployable.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
           c.aWidth          mustBe 16
           c.xDim            mustBe 32
@@ -159,7 +157,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
         m2_7 -> (2560, 6912, 32000)
       )
       arch.foreach { case (c, (h, inter, vocab)) =>
-        withClue(s"preset shapes=${c.shapesHint}") {
+        withClue(s"preset shapes=${c.defaultShapes}") {
           val projs = Seq(
             (h, h),            // i/f/g/o_proj
             (h, 2 * inter),    // fused gate_up
@@ -187,12 +185,11 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
     // What lets scripts/clone_preset_hw.sh build the 1.3B bundle from the 2.7B bitstream.
     "1.3B and 2.7B emit identical RTL and differ only in deployment metadata" in {
-      // shapesHint / modelName / residentWtBytes are manifest fields (bench sweep, target
-      // checkpoint, udmabuf-wt sizing) and never reach the Core — normalize them out.
-      m1_3.copy(shapesHint = "", modelName = "", residentWtBytes = 0) mustBe
-        m2_7.copy(shapesHint = "", modelName = "", residentWtBytes = 0)
-      m1_3.shapesHint mustBe "1.3b"
-      m2_7.shapesHint mustBe "2.7b"
+      // `model` only feeds manifest fields (bench sweep, target checkpoint, udmabuf-wt
+      // sizing) and never reaches the Core — normalize it out.
+      m1_3.copy(model = None) mustBe m2_7.copy(model = None)
+      m1_3.defaultShapes mustBe "1.3b"
+      m2_7.defaultShapes mustBe "2.7b"
       m1_3.modelName  mustBe "ridger/MMfreeLM-1.3B"
       m2_7.modelName  mustBe "ridger/MMfreeLM-2.7B"
       // …but the resident weight set (-> UDMABUF_WT_SZ) DOES scale with model size, so the
@@ -210,7 +207,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
     "each preset carries its default bench sweep in the manifest" in {
       def shapes(c: CoreConfig, n: String) =
-        c.presetEnv(n).linesIterator.find(_.startsWith("MMFREE_SHAPES=")).get
+        PresetManifest.env(n, c).linesIterator.find(_.startsWith("MMFREE_SHAPES=")).get
       shapes(m370, "mmfree_370m") mustBe "MMFREE_SHAPES=370m"
       shapes(m1_3, "mmfree_1_3b") mustBe "MMFREE_SHAPES=1.3b"
       shapes(m2_7, "mmfree_2_7b") mustBe "MMFREE_SHAPES=2.7b"
@@ -240,7 +237,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "every named preset targets a reachable PL0_REF rung" in {
-      CoreConfig.presets.foreach { case (name, c) =>
+      Presets.all.foreach { case (name, c) =>
         withClue(s"$name asks for ${c.plClkMhz} MHz") {
           CoreConfig.plClkRungs must contain(c.plClkMhz)
         }
@@ -258,7 +255,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     // The two paths these fix fail by nearly the same margin at maxN=8192; one alone gains nothing.
     "the maxN=8192 presets carry both 250 MHz timing levers, not one" in {
       Seq(m1_3, m2_7).foreach { c =>
-        withClue(s"${c.shapesHint}") {
+        withClue(s"${c.defaultShapes}") {
           c.maxN             mustBe 8192
           c.dspAccum         mustBe true
           c.colBankSize      mustBe 4        // path 2: the route-bound broadcast net
@@ -276,9 +273,29 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
   }
 
+  "ModelArch" - {
+    // Independent closed form of the per-token weight count (4 square projections, the
+    // fused gate_up and down_proj per layer, plus lm_head).
+    "projections cover every layer plus lm_head" in {
+      Seq(ModelArch.MMfreeLM_370M, ModelArch.MMfreeLM_1_3B, ModelArch.MMfreeLM_2_7B).foreach { a =>
+        withClue(a.hfId) {
+          a.projections.length mustBe 6 * a.layers + 1
+          val h = a.hidden.toLong; val i = a.intermediate.toLong
+          a.weightElems mustBe (4 * h * h + h * 2 * i + i * h) * a.layers + h * a.vocab
+        }
+      }
+    }
+
+    "a bench-only config carries no model and no resident weight set" in {
+      CoreConfig.Tiny.model mustBe None
+      CoreConfig.Tiny.modelName mustBe ""
+      CoreConfig.Tiny.residentWtBytes mustBe 0L
+    }
+  }
+
   "Derived widths" - {
     "m_axis beat width is a power of two for every preset" in {
-      CoreConfig.presets.foreach { case (name, c) =>
+      Presets.all.foreach { case (name, c) =>
         val ok = (c.outBeatWidth & (c.outBeatWidth - 1)) == 0
         withClue(s"preset '$name' has non-pow2 outBeatWidth=${c.outBeatWidth}") {
           ok mustBe true
@@ -296,7 +313,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
   "Preset manifest (preset.env / preset.json)" - {
     // Parse the flat KEY=VAL env into a map for assertions.
     def envMap(c: CoreConfig, name: String): Map[String, String] =
-      c.presetEnv(name).linesIterator
+      PresetManifest.env(name, c).linesIterator
         .filterNot(l => l.trim.isEmpty || l.trim.startsWith("#"))
         .map { l => val i = l.indexOf('='); l.substring(0, i) -> l.substring(i + 1) }
         .toMap
@@ -319,7 +336,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "env udmabuf sizes equal the JSON byte counts for every preset" in {
-      CoreConfig.presets.foreach { case (name, c) =>
+      Presets.all.foreach { case (name, c) =>
         val e = envMap(c, name)
         withClue(s"preset '$name'") {
           java.lang.Long.decode(e("UDMABUF_ACT_SZ")) mustBe c.udmabufActBytes
@@ -330,7 +347,7 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
     }
 
     "udmabuf defaults are never smaller than the runtime's worst-case transfer" in {
-      CoreConfig.presets.foreach { case (name, c) =>
+      Presets.all.foreach { case (name, c) =>
         withClue(s"preset '$name'") {
           // act: maxN beats * portBytes; wt: that * col tiles; out: batch drain.
           c.udmabufActBytes must be >= c.maxN.toLong * c.portBytes
@@ -343,13 +360,13 @@ class CoreConfigSpec extends AnyFreeSpec with Matchers {
 
   "byName" - {
     "is case-insensitive" in {
-      CoreConfig.byName("MMFree_2_7B") mustBe m2_7
-      CoreConfig.byName("mmfree_370m") mustBe m370
+      Presets.byName("MMFree_2_7B") mustBe m2_7
+      Presets.byName("mmfree_370m") mustBe m370
     }
 
     "throws on unknown names with a helpful message" in {
       val ex = intercept[IllegalArgumentException] {
-        CoreConfig.byName("does-not-exist")
+        Presets.byName("does-not-exist")
       }
       ex.getMessage must include("does-not-exist")
       ex.getMessage must include("mmfree_2_7b")

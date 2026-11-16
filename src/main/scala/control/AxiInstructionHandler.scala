@@ -2,135 +2,7 @@ package control
 
 import chisel3._
 import chisel3.util._
-
-object Opcode {
-    val NOP        = 0x00.U(8.W)
-    val LOAD_ACT   = 0x01.U(8.W)
-    val COMPUTE_MM = 0x02.U(8.W)
-    val STORE_OUT  = 0x03.U(8.W)
-}
-
-object ErrorCode {
-    val NONE           = 0x00.U(8.W)
-    val INVALID_OPCODE = 0x01.U(8.W)
-}
-
-/**
-  * Decoded instruction fields from a 128-bit beat (LSB-first):
-  *   [7:0]    opcode
-  *   [47:8]   ptr      (40-bit physical / bus address)
-  *   [79:48]  dim0
-  *   [111:80] dim1
-  *   [127:112] flags
-  */
-class Instruction extends Bundle {
-    val opcode = UInt(8.W)
-    val ptr    = UInt(40.W)
-    val dim0   = UInt(32.W)
-    val dim1   = UInt(32.W)
-    val flags  = UInt(16.W)
-}
-
-object Instruction {
-    def decode(raw: UInt): Instruction = {
-        val inst = Wire(new Instruction)
-        inst.opcode := raw(7, 0)
-        inst.ptr    := raw(47, 8)
-        inst.dim0   := raw(79, 48)
-        inst.dim1   := raw(111, 80)
-        inst.flags  := raw(127, 112)
-        inst
-    }
-}
-
-class LoadActivationsCmd extends Bundle {
-    val ptr = UInt(40.W)
-    val len = UInt(32.W)
-}
-
-class ComputeMatmulCmd extends Bundle {
-    val weightsPtr = UInt(40.W)
-    val rows       = UInt(32.W)
-    val cols       = UInt(32.W)
-    // Runtime batch count from the instruction flags field: 1..batchSize drains only
-    // that many rows; 0 (or out of range) = the full built batchSize.
-    val batch      = UInt(16.W)
-}
-
-class StoreOutputCmd extends Bundle {
-    val ptr = UInt(40.W)
-    val len = UInt(32.W)
-}
-
-class StatusReg extends Bundle {
-    val irqPending = Bool()
-    val errorCode  = UInt(8.W)
-    val lastOpcode = UInt(8.W)
-    val busy       = Bool()
-}
-
-/**
-  * AXI4-Full slave port. Flat bundle so Chisel emits Vivado-recognized port names
-  * of the form `<io>_awaddr`, `<io>_wdata`, etc. Naming the parent IO `s_axi` yields
-  * `s_axi_awaddr`, `s_axi_wdata`, ... matching the standard slave interface contract.
-  */
-class AxiSlaveIO(val addrWidth: Int, val dataWidth: Int, val idWidth: Int) extends Bundle {
-    require(dataWidth % 8 == 0, "dataWidth must be a multiple of 8")
-    val strbWidth = dataWidth / 8
-
-    // Write address channel
-    val awid     = Input(UInt(idWidth.W))
-    val awaddr   = Input(UInt(addrWidth.W))
-    val awlen    = Input(UInt(8.W))
-    val awsize   = Input(UInt(3.W))
-    val awburst  = Input(UInt(2.W))
-    val awvalid  = Input(Bool())
-    val awready  = Output(Bool())
-
-    // Write data channel
-    val wdata    = Input(UInt(dataWidth.W))
-    val wstrb    = Input(UInt(strbWidth.W))
-    val wlast    = Input(Bool())
-    val wvalid   = Input(Bool())
-    val wready   = Output(Bool())
-
-    // Write response channel
-    val bid      = Output(UInt(idWidth.W))
-    val bresp    = Output(UInt(2.W))
-    val bvalid   = Output(Bool())
-    val bready   = Input(Bool())
-
-    // Read address channel
-    val arid     = Input(UInt(idWidth.W))
-    val araddr   = Input(UInt(addrWidth.W))
-    val arlen    = Input(UInt(8.W))
-    val arsize   = Input(UInt(3.W))
-    val arburst  = Input(UInt(2.W))
-    val arvalid  = Input(Bool())
-    val arready  = Output(Bool())
-
-    // Read data channel
-    val rid      = Output(UInt(idWidth.W))
-    val rdata    = Output(UInt(dataWidth.W))
-    val rresp    = Output(UInt(2.W))
-    val rlast    = Output(Bool())
-    val rvalid   = Output(Bool())
-    val rready   = Input(Bool())
-}
-
-object AxiResp {
-    val OKAY   = "b00".U(2.W)
-    val EXOKAY = "b01".U(2.W)
-    val SLVERR = "b10".U(2.W)
-    val DECERR = "b11".U(2.W)
-}
-
-/** Register-map offsets (12-bit aperture). All registers are 16-byte aligned. */
-object RegMap {
-    val INSTR_WRITE = 0x000  // write: push 128-bit instruction beat
-    val STATUS_READ = 0x010  // read:  packed 32-bit status word
-    val IRQ_ACK     = 0x020  // write: any value clears irqPending
-}
+import bus.{AxiResp, AxiSlaveIO}
 
 /**
   * AXI4-Full slave instruction handler.
@@ -139,6 +11,8 @@ object RegMap {
   * to RegMap.INSTR_WRITE; the handler decodes the opcode and dispatches a Decoupled
   * command to the matching engine. On engine done it raises `irq`; the PS reads the
   * status word at RegMap.STATUS_READ and write-acks IRQ at RegMap.IRQ_ACK.
+  *
+  * The instruction word, opcodes, command bundles and register map live in Isa.scala.
   *
   * Only single-beat AXI transactions are supported (AWLEN/ARLEN must be 0); multi-beat
   * accesses return SLVERR. Writing INSTR_WRITE while a prior instruction is still

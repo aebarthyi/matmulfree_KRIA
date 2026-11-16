@@ -1,28 +1,16 @@
-package control
+package core
 
 import chisel3._
 import chisel3.util._
-import systolic.SystolicArray
-import systolic.WeightUnpackGearbox
-
-/** AXI4-Stream slave (input side). Flat bundle so Vivado IP packager infers `s_axis_*`. */
-class AxisSlaveIO(val dataWidth: Int) extends Bundle {
-    val tdata  = Input(UInt(dataWidth.W))
-    val tvalid = Input(Bool())
-    val tready = Output(Bool())
-    val tlast  = Input(Bool())
-}
-
-/** AXI4-Stream master (output side). Names map to `m_axis_*`. */
-class AxisMasterIO(val dataWidth: Int) extends Bundle {
-    val tdata  = Output(UInt(dataWidth.W))
-    val tvalid = Output(Bool())
-    val tready = Input(Bool())
-    val tlast  = Output(Bool())
-}
+import bus.{AxiSlaveIO, AxisMasterIO, AxisSlaveIO}
+import compute.MacArray
+import control.AxiInstructionHandler
+import memory.{ActMem, OutMemUltra}
+import packing.WeightUnpackGearbox
 
 /**
-  * Top-level ternary matmul Core.
+  * Top-level ternary matmul Core, parameterized entirely by a [[CoreConfig]] (every width
+  * used below is derived there).
   *
   *   - `s_axi`   : AXI4 slave for instruction MMIO (→ [[AxiInstructionHandler]])
   *   - `s_axis`  : AXI4-S slave; carries activations (LOAD_ACT) or weights (COMPUTE_MM)
@@ -30,11 +18,12 @@ class AxisMasterIO(val dataWidth: Int) extends Bundle {
   *                 `outBeatLanes` lanes, independent of the per-tile output width.
   *   - `irq`     : level-high interrupt on instruction completion.
   *
-  * **Compute model.** Weights are broadcast to all yDim (= batch) rows; each row
-  * streams its own activation, and PEs accumulate `sum_n W[n][col] * A[batch][n]`.
-  * Per COMPUTE_MM: rows = N = inner dim (≤ maxN ≤ maxAcc, no inner-dim tiling);
-  * cols = M, tiled by `outLanesPerTile = xDim * nLanes`. Each col tile streams N
-  * cycles, then drains into outBram overlapped with the next tile's stream.
+  * **Compute model.** Weights are broadcast to all yDim (= batch) rows of the
+  * [[MacArray]]; each row streams its own activation, and PEs accumulate
+  * `sum_n W[n][col] * A[batch][n]`. Per COMPUTE_MM: rows = N = inner dim
+  * (≤ maxN ≤ maxAcc, no inner-dim tiling); cols = M, tiled by
+  * `outLanesPerTile = xDim * nLanes`. Each col tile streams N cycles, then drains into
+  * outBram overlapped with the next tile's stream.
   *
   * **Storage.**
   *   - `actBram`: maxN entries x (batchSize · aWidth); entry n = inner-dim slice n
@@ -44,59 +33,12 @@ class AxisMasterIO(val dataWidth: Int) extends Bundle {
   *      (batchIdx · numColTiles + colTileIdx) · outSubBeats + subBeatIdx.
   *
   * The array is hard-reset (arrLocalReset) between col-tile passes.
+  *
+  * Internal signal names (`arr`, `inQ`, `armSlice`, ...) are what the emitted SV and the
+  * Vivado timing reports call these paths; renaming one changes the shipped RTL.
   */
-class Core(
-    val aWidth:       Int = 8,
-    val maxAcc:       Int = 4096,
-    val xDim:         Int = 8,
-    val batchSize:    Int = 1,    // yDim = batchSize; 1 PE row per batch item
-    val maxN:         Int = 4096, // max inner dim (activation length per batch)
-    val maxM:         Int = 1024, // max output cols
-    val outBeatLanes: Int = 0,    // 0 → auto (= outLanesPerTile, no chunking)
-    val axiAddrWidth: Int = 32,
-    val axiDataWidth: Int = 128,
-    val axiIdWidth:   Int = 6,
-    val signedAct:    Boolean = false, // sign-extend activations (real BitLinear / HGRN int16)
-    // The remaining parameters are documented on CoreConfig.
-    val dspAccum:        Boolean = false,
-    val colBankSize:     Int = 0,
-    val packedWeights:   Boolean = false,
-    val actRamStyle:     String = "",
-    val actCascadeHeight: Int = 0,
-    val outCascadeHeight: Int = 4,
-    val outBankDepth:     Int = 0
-) extends Module {
-    require(aWidth >= 2 && aWidth % 2 == 0,        "aWidth must be even and >= 2")
-    require(maxAcc >= 2,                           "maxAcc must be >= 2")
-    require(xDim >= 1 && batchSize >= 1,           "xDim and batchSize must be >= 1")
-    require(maxN <= maxAcc,                        s"maxN=$maxN must be <= maxAcc=$maxAcc (no inner-dim tiling yet)")
-    require(maxN >= 1,                             "maxN must be >= 1")
-    require(maxM >= 1,                             "maxM must be >= 1")
-
-    val yDim            = batchSize
-    val nLanes          = aWidth / 2
-    val outLanesPerTile = xDim * nLanes
-    // Accumulator data width = aWidth + worst-case growth headroom.
-    val accHeadroom     = log2Ceil(maxAcc)
-    val tileAccWidth    = aWidth + accHeadroom
-    val numColTilesMax  = (maxM + outLanesPerTile - 1) / outLanesPerTile
-    val outAccWidth     = tileAccWidth
-    val outLaneWidth    = 1 << log2Ceil(outAccWidth)
-
-    require(maxM % outLanesPerTile == 0,
-        s"maxM=$maxM must be a multiple of outLanesPerTile=$outLanesPerTile (= xDim*nLanes)")
-
-    // Output chunking. outBeatLanes=0 → no chunking (one beat per col tile).
-    val effOutBeatLanes = if (outBeatLanes == 0) outLanesPerTile else outBeatLanes
-    require(effOutBeatLanes >= 1 && outLanesPerTile % effOutBeatLanes == 0,
-        s"outBeatLanes=$outBeatLanes must divide outLanesPerTile=$outLanesPerTile")
-    val outSubBeats = outLanesPerTile / effOutBeatLanes
-
-    val axisDataWidth = math.max(xDim, batchSize) * aWidth
-    val outBeatWidth  = effOutBeatLanes * outLaneWidth
-
-    val outBramDepth = batchSize * numColTilesMax
-    val outBramRows  = outBramDepth * outSubBeats
+class Core(val cfg: CoreConfig) extends Module {
+    import cfg._
 
     // ─── IO ───────────────────────────────────────────────────────────────────
     val s_axi  = IO(new AxiSlaveIO(axiAddrWidth, axiDataWidth, axiIdWidth))
@@ -106,13 +48,13 @@ class Core(
 
     // ─── Instruction handler ──────────────────────────────────────────────────
     val handler = Module(new AxiInstructionHandler(axiAddrWidth, axiDataWidth, axiIdWidth))
-    Core.connectAxiSlave(outer = s_axi, inner = handler.s_axi)
+    handler.s_axi <> s_axi
     irq := handler.irq
 
-    // ─── Systolic array, with a Core-local reset pulsed between col tiles ────
+    // ─── MAC array, with a Core-local reset pulsed between col tiles ─────────
     val arrLocalReset = WireDefault(false.B)
     val arr = withReset(this.reset.asBool || arrLocalReset) {
-        Module(new SystolicArray(aWidth, maxAcc, xDim, yDim, signedAct, dspAccum, colBankSize))
+        Module(new MacArray(aWidth, maxAcc, xDim, yDim, signedAct, dspAccum, colBankSize))
     }
     val arrInput  = arr.input
     val arrOutput = arr.output
@@ -171,8 +113,6 @@ class Core(
 
     // Optional 1.6-bit weight unpacker between s_axis and the inQ enqueue: regroups densely
     // packed bytes into outLanesPerTile-wide 2-bit weight beats.
-    require(!packedWeights || axisDataWidth % 8 == 0,
-        s"packedWeights needs a byte-aligned s_axis (axisDataWidth=$axisDataWidth)")
     val wtGearbox =
         if (packedWeights) Some(Module(new WeightUnpackGearbox(axisDataWidth, outLanesPerTile)))
         else None
@@ -250,7 +190,6 @@ class Core(
 
     // COMPUTE
     val cmpRows         = Reg(UInt(log2Ceil(maxN + 1).W))         // N
-    val cmpCols         = Reg(UInt(log2Ceil(maxM + 1).W))         // M
     val numColTiles     = Reg(UInt(log2Ceil(numColTilesMax + 1).W))
     val colTileCtr      = RegInit(0.U(log2Ceil(numColTilesMax + 1).W))
     val activeIdx       = RegInit(0.U(log2Ceil(maxN + 1).W))      // enq-side stream row (wraps at cmpRows per col tile)
@@ -331,7 +270,6 @@ class Core(
         }.elsewhen(handler.compute.fire) {
             cmpRows     := handler.compute.bits.rows
             cmpRowsM1   := handler.compute.bits.rows - 1.U
-            cmpCols     := handler.compute.bits.cols
             numColTiles := (handler.compute.bits.cols + (outLanesPerTile - 1).U) / outLanesPerTile.U
             // Clamp the requested batch to [1, batchSize]; 0 (legacy) → full batchSize.
             val reqBatch = handler.compute.bits.batch
@@ -550,40 +488,3 @@ class Core(
         }
     }
 }
-
-object Core {
-    /** Field-by-field AXI4 slave passthrough (both bundles describe slave-side view). */
-    def connectAxiSlave(outer: AxiSlaveIO, inner: AxiSlaveIO): Unit = {
-        inner.awid    := outer.awid
-        inner.awaddr  := outer.awaddr
-        inner.awlen   := outer.awlen
-        inner.awsize  := outer.awsize
-        inner.awburst := outer.awburst
-        inner.awvalid := outer.awvalid
-        inner.wdata   := outer.wdata
-        inner.wstrb   := outer.wstrb
-        inner.wlast   := outer.wlast
-        inner.wvalid  := outer.wvalid
-        inner.bready  := outer.bready
-        inner.arid    := outer.arid
-        inner.araddr  := outer.araddr
-        inner.arlen   := outer.arlen
-        inner.arsize  := outer.arsize
-        inner.arburst := outer.arburst
-        inner.arvalid := outer.arvalid
-        inner.rready  := outer.rready
-        outer.awready := inner.awready
-        outer.wready  := inner.wready
-        outer.bid     := inner.bid
-        outer.bresp   := inner.bresp
-        outer.bvalid  := inner.bvalid
-        outer.arready := inner.arready
-        outer.rid     := inner.rid
-        outer.rdata   := inner.rdata
-        outer.rresp   := inner.rresp
-        outer.rlast   := inner.rlast
-        outer.rvalid  := inner.rvalid
-    }
-}
-
-

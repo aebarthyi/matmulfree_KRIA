@@ -1,9 +1,9 @@
-package control
+package core
 
 import scala.util.Random
 import chisel3._
 import chisel3.util.log2Ceil
-import testutil.SingleThreadVerilator
+import testutil.{AxiMaster, AxisSink, InstructionEncoder, SimWait, SingleThreadVerilator}
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.must.Matchers
 
@@ -50,7 +50,6 @@ abstract class BenchMirrorSpecBase(
   private val ADDR_WIDTH = 32
   private val DATA_WIDTH = 128
   private val ID_WIDTH   = 6
-  private val STRB_ALL   = (BigInt(1) << (DATA_WIDTH / 8)) - 1
 
   private val OFF_INSTR   = BigInt(0x000)
   private val OFF_IRQ_ACK = BigInt(0x020)
@@ -58,7 +57,7 @@ abstract class BenchMirrorSpecBase(
 
   // ───────────────────────── Setup ─────────────────────────
 
-  private def mkTop = new CoreTop(
+  private def mkTop = new CoreTop(CoreConfig(
     aWidth       = aWidth,
     maxAcc       = maxAcc,
     xDim         = xDim,
@@ -70,7 +69,7 @@ abstract class BenchMirrorSpecBase(
     axiDataWidth = DATA_WIDTH,
     axiIdWidth   = ID_WIDTH,
     signedAct    = signedAct
-  )
+  ))
 
   /** Activation generator: unsigned 0..15 (legacy presets), or a signed range
     * that exercises sign-extension (negative values set the activation's high
@@ -79,13 +78,7 @@ abstract class BenchMirrorSpecBase(
     if (signedAct) rng.nextInt(4096) - 2048 else rng.nextInt(16)
 
   private def resetDut(dut: CoreTop): Unit = {
-    dut.s_axi.awvalid.poke(false.B)
-    dut.s_axi.wvalid.poke(false.B)
-    dut.s_axi.bready.poke(false.B)
-    dut.s_axi.arvalid.poke(false.B)
-    dut.s_axi.rready.poke(false.B)
-    dut.s_axi.awid.poke(0.U)
-    dut.s_axi.arid.poke(0.U)
+    new AxiMaster(dut.s_axi, dut.aclk).idle()
     dut.sAxisPorts.foreach { p =>
       p.tvalid.poke(false.B)
       p.tdata.poke(0.U)
@@ -100,38 +93,8 @@ abstract class BenchMirrorSpecBase(
 
   // ───────────────────────── AXI4 helpers ─────────────────────────
 
-  private def axiWrite(dut: CoreTop, addr: BigInt, data: BigInt, maxCycles: Int = 50): Int = {
-    dut.s_axi.awid.poke(0.U)
-    dut.s_axi.awaddr.poke(addr.U)
-    dut.s_axi.awlen.poke(0.U)
-    dut.s_axi.awsize.poke(4.U)
-    dut.s_axi.awburst.poke(1.U)
-    dut.s_axi.awvalid.poke(true.B)
-    dut.s_axi.wdata.poke(data.U)
-    dut.s_axi.wstrb.poke(STRB_ALL.U)
-    dut.s_axi.wlast.poke(true.B)
-    dut.s_axi.wvalid.poke(true.B)
-    dut.s_axi.bready.poke(true.B)
-
-    var awA = true; var wA = true; var bR = true
-    var resp = 0; var done = false; var cycles = 0
-    while (!done && cycles < maxCycles) {
-      val awF = awA && dut.s_axi.awready.peek().litToBoolean
-      val wF  = wA  && dut.s_axi.wready.peek().litToBoolean
-      val bF  = bR  && dut.s_axi.bvalid.peek().litToBoolean
-      if (bF) { resp = dut.s_axi.bresp.peek().litValue.toInt; done = true }
-      dut.aclk.step()
-      if (awF) { dut.s_axi.awvalid.poke(false.B); awA = false }
-      if (wF)  { dut.s_axi.wvalid.poke(false.B);  wA  = false }
-      if (bF)  { dut.s_axi.bready.poke(false.B);  bR  = false }
-      cycles += 1
-    }
-    require(done, s"axiWrite to 0x${addr.toString(16)} timed out")
-    dut.s_axi.awvalid.poke(false.B)
-    dut.s_axi.wvalid.poke(false.B)
-    dut.s_axi.bready.poke(false.B)
-    resp
-  }
+  private def axiWrite(dut: CoreTop, addr: BigInt, data: BigInt, maxCycles: Int = 50): Int =
+    new AxiMaster(dut.s_axi, dut.aclk).write(addr, data, maxCycles = maxCycles)
 
   // ───────────────────────── AXI-Stream helpers ─────────────────────────
 
@@ -166,27 +129,11 @@ abstract class BenchMirrorSpecBase(
     require(idx == beats.length, s"s_axis push: only $idx/${beats.length} beats accepted")
   }
 
-  private def pullAxisBeats(dut: CoreTop, count: Int, maxCycles: Int = 4000): Seq[BigInt] = {
-    dut.m_axis.tready.poke(true.B)
-    val beats  = scala.collection.mutable.ArrayBuffer.empty[BigInt]
-    var cycles = 0
-    while (beats.length < count && cycles < maxCycles) {
-      if (dut.m_axis.tvalid.peek().litToBoolean) {
-        beats += dut.m_axis.tdata.peek().litValue
-      }
-      dut.aclk.step()
-      cycles += 1
-    }
-    dut.m_axis.tready.poke(false.B)
-    require(beats.length == count, s"m_axis pull: got ${beats.length}/$count beats")
-    beats.toSeq
-  }
+  private def pullAxisBeats(dut: CoreTop, count: Int, maxCycles: Int = 4000): Seq[BigInt] =
+    AxisSink.pull(dut.m_axis, dut.aclk, count, maxCycles)
 
-  private def waitForIrq(dut: CoreTop, maxCycles: Int = 8000): Unit = {
-    var c = 0
-    while (!dut.irq.peek().litToBoolean && c < maxCycles) { dut.aclk.step(); c += 1 }
-    require(dut.irq.peek().litToBoolean, s"IRQ never asserted within $maxCycles cycles")
-  }
+  private def waitForIrq(dut: CoreTop, maxCycles: Int = 8000): Unit =
+    SimWait.untilHigh(dut.irq, dut.aclk, maxCycles, "IRQ")
 
   private def ackIrq(dut: CoreTop): Unit = {
     axiWrite(dut, OFF_IRQ_ACK, BigInt(1)) mustBe OKAY
